@@ -1,0 +1,28 @@
+default_job = "run"
+
+[jobs.check]
+command = ["cargo", "check", "--color", "always", "--all-targets", "--all-features"]
+need_stdout = false
+watch = ["src"]
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--color", "always", "--all-targets", "--all-features", "--", "-D", "warnings"]
+need_stdout = false
+watch = ["src"]
+
+[jobs.test]
+command = ["cargo", "test", "--color", "always", "--all-targets", "--all-features"]
+need_stdout = true
+watch = ["src"]
+
+[jobs.run]
+command = ["cargo", "run", "--color", "always"]
+need_stdout = true
+allow_hierarchical_nav = true
+watch = ["src"]
+on_change_strategy = "kill_then_restart"
+
+[keybindings]
+c = "job:clippy"
+t = "job:test"
+r = "job:run"
