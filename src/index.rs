@@ -77,7 +77,6 @@ pub async fn index_directory(
 
     for path in &deleted_paths {
         db::delete_note(conn, path).await?;
-        fts.delete(path).await?;
         tracing::info!(path, "deleted from index");
     }
 
@@ -110,12 +109,15 @@ pub async fn index_directory(
             embedding_offset += file.chunks.len();
 
             db::upsert_note(conn, &file.path, &file.content_hash, &file_chunks).await?;
-            fts.upsert(&file.path, &file.chunks).await?;
 
             let action = if file.is_new { "indexed" } else { "updated" };
             tracing::info!(path = file.path, action);
         }
     }
+
+    // Rebuild FTS from authoritative DB state
+    let all_chunks = db::all_chunks(conn).await?;
+    fts.rebuild(all_chunks).await?;
 
     let added = pending.iter().filter(|f| f.is_new).count();
     let updated = pending.len() - added;
@@ -143,8 +145,10 @@ pub async fn index_single_file(
     let content = tokio::fs::read_to_string(abs_path).await?;
     let file_hash = hash::content_hash(&content);
 
-    let existing = db::all_note_hashes(conn).await?;
-    if existing.get(&rel_path).is_some_and(|h| *h == file_hash) {
+    if db::note_hash(conn, &rel_path)
+        .await?
+        .is_some_and(|h| h == file_hash)
+    {
         return Ok(());
     }
 
@@ -152,10 +156,12 @@ pub async fn index_single_file(
     let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
     let embeddings = client.embed_documents(&chunk_refs).await?;
 
-    let chunk_texts: Vec<String> = chunks.clone();
     let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
     db::upsert_note(conn, &rel_path, &file_hash, &paired).await?;
-    fts.upsert(&rel_path, &chunk_texts).await?;
+    let fts_chunks: Vec<String> = paired.into_iter().map(|(text, _)| text).collect();
+    if let Err(e) = fts.upsert(&rel_path, &fts_chunks).await {
+        tracing::warn!(path = rel_path, error = %e, "FTS upsert failed, run reindex to reconcile");
+    }
 
     tracing::info!(path = rel_path, "indexed");
     Ok(())
