@@ -143,10 +143,10 @@ impl FtsIndex {
             let snippet_generator =
                 SnippetGenerator::create(&searcher, &parsed_query, content_field)?;
 
-            let mut seen = std::collections::HashMap::new();
+            let mut seen = std::collections::HashSet::new();
             let mut results = Vec::new();
 
-            for (score, doc_address) in top_docs {
+            for (_, doc_address) in top_docs {
                 let doc: TantivyDocument = searcher.doc(doc_address)?;
 
                 let path = doc
@@ -155,7 +155,7 @@ impl FtsIndex {
                     .unwrap_or_default()
                     .to_owned();
 
-                if seen.contains_key(&path) {
+                if seen.contains(&path) {
                     continue;
                 }
 
@@ -173,7 +173,7 @@ impl FtsIndex {
                     fragment.to_owned()
                 };
 
-                seen.insert(path.clone(), score);
+                seen.insert(path.clone());
                 results.push(FtsResult {
                     path,
                     snippet: snippet_text,
@@ -196,6 +196,7 @@ impl FtsIndex {
 
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.blocking_lock();
+            guard.delete_all_documents()?;
 
             for (path, content) in &chunks {
                 let mut doc = TantivyDocument::new();
@@ -441,6 +442,31 @@ mod tests {
         let results = index.search("databases", 10).await.expect("search failed");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "alpha.md");
+    }
+
+    #[tokio::test]
+    async fn rebuild_clears_existing_documents() {
+        let (_dir, index) = temp_index();
+        index
+            .upsert("old.md", &["old content about databases".to_owned()])
+            .await
+            .expect("upsert failed");
+
+        let chunks = vec![(
+            "new.md".to_owned(),
+            "new content about networking".to_owned(),
+        )];
+        index.rebuild(chunks).await.expect("rebuild failed");
+
+        let old_results = index.search("databases", 10).await.expect("search failed");
+        assert!(
+            old_results.is_empty(),
+            "old documents should be cleared by rebuild"
+        );
+
+        let new_results = index.search("networking", 10).await.expect("search failed");
+        assert_eq!(new_results.len(), 1);
+        assert_eq!(new_results[0].path, "new.md");
     }
 
     #[tokio::test]
