@@ -34,8 +34,14 @@ impl Config {
         cli_notes_dir: Option<PathBuf>,
         cli_weights: CliWeights,
     ) -> anyhow::Result<Self> {
-        let file_config = load_file_config()?;
+        Self::resolve_with(cli_notes_dir, cli_weights, load_file_config()?)
+    }
 
+    fn resolve_with(
+        cli_notes_dir: Option<PathBuf>,
+        cli_weights: CliWeights,
+        file_config: FileConfig,
+    ) -> anyhow::Result<Self> {
         let notes_dir = cli_notes_dir
             .or_else(|| std::env::var("ZK_NOTEBOOK_DIR").ok().map(PathBuf::from))
             .or(file_config.notes_dir)
@@ -112,9 +118,119 @@ fn load_file_config() -> anyhow::Result<FileConfig> {
         Err(e) => {
             return Err(
                 anyhow::Error::from(e).context(format!("reading config: {}", path.display()))
-            )
+            );
         }
     };
 
     toml::from_str(&content).context(format!("parsing config: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_weights_override_file_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let file_config = FileConfig {
+            w_semantic: Some(2.0),
+            w_fts: Some(3.0),
+            w_filename: Some(4.0),
+            notes_dir: Some(dir.path().to_owned()),
+            ..Default::default()
+        };
+
+        let cli_weights = CliWeights {
+            semantic: Some(10.0),
+            fts: None,
+            filename: None,
+        };
+
+        let config = Config::resolve_with(None, cli_weights, file_config).expect("resolve");
+        assert!((config.weights.semantic - 10.0).abs() < f64::EPSILON);
+        assert!((config.weights.fts - 3.0).abs() < f64::EPSILON);
+        assert!((config.weights.filename - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn file_config_overrides_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let file_config = FileConfig {
+            w_semantic: Some(9.0),
+            w_fts: Some(8.0),
+            w_filename: Some(7.0),
+            notes_dir: Some(dir.path().to_owned()),
+            ..Default::default()
+        };
+
+        let cli_weights = CliWeights {
+            semantic: None,
+            fts: None,
+            filename: None,
+        };
+
+        let config = Config::resolve_with(None, cli_weights, file_config).expect("resolve");
+        assert!((config.weights.semantic - 9.0).abs() < f64::EPSILON);
+        assert!((config.weights.fts - 8.0).abs() < f64::EPSILON);
+        assert!((config.weights.filename - 7.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn defaults_used_when_no_overrides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let file_config = FileConfig {
+            notes_dir: Some(dir.path().to_owned()),
+            ..Default::default()
+        };
+
+        let cli_weights = CliWeights {
+            semantic: None,
+            fts: None,
+            filename: None,
+        };
+
+        let config = Config::resolve_with(None, cli_weights, file_config).expect("resolve");
+        let defaults = RrfWeights::default();
+        assert!((config.weights.semantic - defaults.semantic).abs() < f64::EPSILON);
+        assert!((config.weights.fts - defaults.fts).abs() < f64::EPSILON);
+        assert!((config.weights.filename - defaults.filename).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn nonexistent_notes_dir_is_an_error() {
+        let bad_dir = PathBuf::from("/nonexistent/path/that/should/not/exist");
+        let cli_weights = CliWeights {
+            semantic: None,
+            fts: None,
+            filename: None,
+        };
+
+        let result = Config::resolve_with(Some(bad_dir), cli_weights, FileConfig::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_notes_dir_overrides_file_config() {
+        let cli_dir = tempfile::tempdir().expect("tempdir");
+        let file_dir = tempfile::tempdir().expect("tempdir");
+
+        let file_config = FileConfig {
+            notes_dir: Some(file_dir.path().to_owned()),
+            ..Default::default()
+        };
+
+        let cli_weights = CliWeights {
+            semantic: None,
+            fts: None,
+            filename: None,
+        };
+
+        let config =
+            Config::resolve_with(Some(cli_dir.path().to_owned()), cli_weights, file_config)
+                .expect("resolve");
+        assert_eq!(config.notes_dir, cli_dir.path());
+    }
 }
