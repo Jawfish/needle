@@ -3,6 +3,7 @@ use std::{
     path::Path,
 };
 
+use anyhow::Context;
 use libsql::Connection;
 
 pub struct SearchResult {
@@ -88,10 +89,12 @@ pub async fn upsert_note(
     hash: &str,
     chunks: &[(String, Vec<f32>)],
 ) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM chunks WHERE path = ?1", [path])
+    let tx = conn.transaction().await?;
+
+    tx.execute("DELETE FROM chunks WHERE path = ?1", [path])
         .await?;
 
-    conn.execute(
+    tx.execute(
         "INSERT OR REPLACE INTO notes (path, content_hash, updated_at) VALUES (?1, ?2, unixepoch())",
         [path, hash],
     )
@@ -99,27 +102,26 @@ pub async fn upsert_note(
 
     for (i, (content, embedding)) in chunks.iter().enumerate() {
         let embedding_json = serde_json::to_string(embedding)?;
+        let chunk_index = i64::try_from(i).context("chunk index exceeds i64 range")?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO chunks (path, chunk_index, content, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
-            libsql::params![
-                path,
-                i64::try_from(i).expect("chunk index exceeds i64"),
-                content.as_str(),
-                embedding_json
-            ],
+            libsql::params![path, chunk_index, content.as_str(), embedding_json],
         )
         .await?;
     }
 
+    tx.commit().await?;
     Ok(())
 }
 
 pub async fn delete_note(conn: &Connection, path: &str) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM chunks WHERE path = ?1", [path])
+    let tx = conn.transaction().await?;
+    tx.execute("DELETE FROM chunks WHERE path = ?1", [path])
         .await?;
-    conn.execute("DELETE FROM notes WHERE path = ?1", [path])
+    tx.execute("DELETE FROM notes WHERE path = ?1", [path])
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -145,7 +147,10 @@ pub async fn search_semantic(
              FROM vector_top_k('chunks_idx', vector32(?1), ?2) AS v
              JOIN chunks c ON c.rowid = v.id
              ORDER BY distance ASC",
-            libsql::params![embedding_json, i64::try_from(limit * 3).unwrap_or(i64::MAX)],
+            libsql::params![
+                embedding_json,
+                i64::try_from(limit.saturating_mul(3)).unwrap_or(i64::MAX)
+            ],
         )
         .await?;
 

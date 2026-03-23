@@ -137,7 +137,7 @@ impl FtsIndex {
             let query_parser = QueryParser::for_index(&index, vec![content_field]);
             let (parsed_query, _errors) = query_parser.parse_query_lenient(&query_owned);
 
-            let candidate_limit = limit * 3;
+            let candidate_limit = limit.saturating_mul(3);
             let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(candidate_limit))?;
 
             let snippet_generator =

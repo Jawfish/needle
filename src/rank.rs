@@ -40,7 +40,7 @@ pub async fn search(
     limit: usize,
     weights: &RrfWeights,
 ) -> anyhow::Result<Vec<FusedResult>> {
-    let candidate_limit = limit * 5;
+    let candidate_limit = limit.saturating_mul(5);
 
     let semantic_ranked = if weights.semantic > 0.0 {
         let client = client.ok_or(NeedleError::MissingApiKey)?;
@@ -347,5 +347,118 @@ mod tests {
     fn rank_by_filename_empty_paths_returns_empty() {
         let results = rank_by_filename("anything", &[]);
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_fuses_fts_and_filename_signals() {
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"))
+            .await
+            .expect("connect");
+
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let emb = vec![0.0f32; 1024];
+        crate::db::upsert_note(
+            &conn,
+            "rust-guide.md",
+            "h1",
+            &[(
+                "Rust is a systems programming language".to_owned(),
+                emb.clone(),
+            )],
+        )
+        .await
+        .expect("upsert");
+        crate::db::upsert_note(
+            &conn,
+            "python-guide.md",
+            "h2",
+            &[("Python is a scripting language".to_owned(), emb)],
+        )
+        .await
+        .expect("upsert");
+
+        fts.upsert(
+            "rust-guide.md",
+            &["Rust is a systems programming language".to_owned()],
+        )
+        .await
+        .expect("fts upsert");
+        fts.upsert(
+            "python-guide.md",
+            &["Python is a scripting language".to_owned()],
+        )
+        .await
+        .expect("fts upsert");
+
+        let weights = RrfWeights {
+            semantic: 0.0,
+            fts: 1.0,
+            filename: 1.0,
+        };
+        let results = search(&conn, &fts, None, "rust", 10, &weights)
+            .await
+            .expect("search");
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].path, "rust-guide.md");
+    }
+
+    #[tokio::test]
+    async fn search_works_without_api_key_when_semantic_is_zero() {
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"))
+            .await
+            .expect("connect");
+
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let emb = vec![0.0f32; 1024];
+        crate::db::upsert_note(
+            &conn,
+            "note.md",
+            "h1",
+            &[("some searchable content".to_owned(), emb)],
+        )
+        .await
+        .expect("upsert");
+
+        fts.upsert("note.md", &["some searchable content".to_owned()])
+            .await
+            .expect("fts upsert");
+
+        let weights = RrfWeights {
+            semantic: 0.0,
+            fts: 1.0,
+            filename: 0.0,
+        };
+        let results = search(&conn, &fts, None, "searchable", 10, &weights)
+            .await
+            .expect("search without api key");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "note.md");
+    }
+
+    #[tokio::test]
+    async fn search_requires_api_key_when_semantic_is_positive() {
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"))
+            .await
+            .expect("connect");
+
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let weights = RrfWeights {
+            semantic: 1.0,
+            fts: 1.0,
+            filename: 1.0,
+        };
+        let result = search(&conn, &fts, None, "anything", 10, &weights).await;
+        assert!(result.is_err());
     }
 }
