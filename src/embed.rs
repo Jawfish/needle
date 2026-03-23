@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +9,8 @@ const VOYAGE_API_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const VOYAGE_MODEL: &str = "voyage-4";
 const MAX_BATCH_SIZE: usize = 128;
 const CHUNK_TARGET_CHARS: usize = 4000; // ~1000 tokens
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RETRIES: u32 = 3;
 #[cfg(test)]
 const EMBEDDING_DIM: usize = 1024;
 
@@ -41,13 +45,15 @@ struct EmbeddingData {
 }
 
 impl VoyageClient {
-    pub fn new(api_key: &str) -> Self {
-        Self {
+    pub fn new(api_key: &str) -> anyhow::Result<Self> {
+        Ok(Self {
             inner: ClientMode::Live {
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder()
+                    .timeout(REQUEST_TIMEOUT)
+                    .build()?,
                 api_key: api_key.to_owned(),
             },
-        }
+        })
     }
 
     #[cfg(test)]
@@ -85,35 +91,59 @@ impl VoyageClient {
             }
         };
 
-        let request = EmbeddingRequest {
+        let request_body = EmbeddingRequest {
             model: VOYAGE_MODEL,
             input: texts,
             input_type,
         };
 
-        let response = client
-            .post(VOYAGE_API_URL)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .json(&request)
-            .send()
-            .await?;
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay_secs = 1u64 << (attempt - 1);
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                tracing::warn!(attempt, "retrying embedding request");
+            }
 
-        if !response.status().is_success() {
+            let response = match client
+                .post(VOYAGE_API_URL)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&request_body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(anyhow::Error::from(e));
+                    continue;
+                }
+            };
+
+            if response.status().is_success() {
+                let parsed: EmbeddingResponse = response.json().await?;
+                let embeddings: Vec<Vec<f32>> =
+                    parsed.data.into_iter().map(|d| d.embedding).collect();
+                if embeddings.len() != texts.len() {
+                    return Err(NeedleError::EmbeddingCountMismatch {
+                        expected: texts.len(),
+                        actual: embeddings.len(),
+                    }
+                    .into());
+                }
+                return Ok(embeddings);
+            }
+
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(NeedleError::VoyageApi(format!("{status}: {body}")).into());
+
+            if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(NeedleError::VoyageApi(format!("{status}: {body}")).into());
+            }
+
+            last_err = Some(NeedleError::VoyageApi(format!("{status}: {body}")).into());
         }
 
-        let parsed: EmbeddingResponse = response.json().await?;
-        let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
-        if embeddings.len() != texts.len() {
-            return Err(NeedleError::EmbeddingCountMismatch {
-                expected: texts.len(),
-                actual: embeddings.len(),
-            }
-            .into());
-        }
-        Ok(embeddings)
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("embedding request failed")))
     }
 }
 
