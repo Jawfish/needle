@@ -6,7 +6,7 @@ use nucleo::{
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
 };
 
-use crate::{db, embed::VoyageClient, fts::FtsIndex};
+use crate::{db, embed::VoyageClient, error::NeedleError, fts::FtsIndex};
 
 const RRF_K: f64 = 60.0;
 
@@ -35,7 +35,7 @@ pub struct FusedResult {
 pub async fn search(
     conn: &Connection,
     fts: &FtsIndex,
-    client: &VoyageClient,
+    client: Option<&VoyageClient>,
     query: &str,
     limit: usize,
     weights: &RrfWeights,
@@ -43,6 +43,7 @@ pub async fn search(
     let candidate_limit = limit * 5;
 
     let semantic_ranked = if weights.semantic > 0.0 {
+        let client = client.ok_or(NeedleError::MissingApiKey)?;
         let embedding = client.embed_query(query).await?;
         db::search_semantic(conn, &embedding, candidate_limit).await?
     } else {

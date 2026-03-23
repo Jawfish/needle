@@ -11,30 +11,35 @@ const DEBOUNCE_MS: u64 = 500;
 pub async fn run_watcher(
     conn: Connection,
     fts: FtsIndex,
-    client: VoyageClient,
+    client: &VoyageClient,
     notes_dir: PathBuf,
 ) -> anyhow::Result<()> {
     tracing::info!(dir = %notes_dir.display(), "initial indexing");
-    let stats = index::index_directory(&conn, &fts, &client, &notes_dir).await?;
+    let stats = index::index_directory(&conn, &fts, client, &notes_dir).await?;
     tracing::info!(%stats, "initial index complete");
 
-    let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
+    let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
 
     let watch_dir = notes_dir.clone();
-    let mut watcher = notify::recommended_watcher(move |event: Result<notify::Event, _>| {
-        if let Ok(event) = event {
-            match event.kind {
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                    for path in event.paths {
-                        if path.extension().is_some_and(|e| e == "md") {
-                            let _ = tx.blocking_send(path);
+    let mut watcher = {
+        let notes_dir = watch_dir.clone();
+        notify::recommended_watcher(move |event: Result<notify::Event, _>| {
+            if let Ok(event) = event {
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                        for path in event.paths {
+                            if path.extension().is_some_and(|e| e == "md")
+                                && !index::is_in_hidden_dir(&path, &notes_dir)
+                            {
+                                let _ = tx.send(path);
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-    })?;
+        })?
+    };
 
     watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
     tracing::info!(dir = %notes_dir.display(), "watching for changes");
@@ -63,7 +68,7 @@ pub async fn run_watcher(
         for path in &changed {
             if path.exists() {
                 if let Err(e) =
-                    index::index_single_file(&conn, &fts, &client, &notes_dir, path).await
+                    index::index_single_file(&conn, &fts, client, &notes_dir, path).await
                 {
                     tracing::error!(path = %path.display(), error = %e, "failed to index");
                 }

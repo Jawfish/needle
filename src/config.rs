@@ -9,7 +9,7 @@ pub struct Config {
     pub notes_dir: PathBuf,
     pub db_path: PathBuf,
     pub tantivy_dir: PathBuf,
-    pub voyage_api_key: String,
+    pub voyage_api_key: Option<String>,
     pub weights: RrfWeights,
 }
 
@@ -47,8 +47,7 @@ impl Config {
 
         let voyage_api_key = std::env::var("VOYAGE_API_KEY")
             .ok()
-            .or(file_config.voyage_api_key)
-            .ok_or(NeedleError::MissingApiKey)?;
+            .or(file_config.voyage_api_key);
 
         let db_dir = data_dir()?;
         std::fs::create_dir_all(&db_dir)?;

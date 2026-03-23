@@ -15,6 +15,7 @@ use crate::{
     cli::{Cli, Command},
     config::{CliWeights, Config},
     embed::VoyageClient,
+    error::NeedleError,
 };
 
 #[tokio::main]
@@ -44,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::resolve(cli.notes_dir, cli_weights)?;
     let (_db, conn) = db::connect(&config.db_path).await?;
     let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-    let client = VoyageClient::new(&config.voyage_api_key);
+    let client = config.voyage_api_key.as_deref().map(VoyageClient::new);
 
     if fts.is_empty() {
         let chunks = db::all_chunks(&conn).await?;
@@ -59,11 +60,13 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Watch => {
+            let client = client.as_ref().ok_or(NeedleError::MissingApiKey)?;
             watch::run_watcher(conn, fts, client, config.notes_dir).await?;
         }
         Command::Search { query, limit, .. } => {
             let results =
-                rank::search(&conn, &fts, &client, &query, limit, &config.weights).await?;
+                rank::search(&conn, &fts, client.as_ref(), &query, limit, &config.weights)
+                    .await?;
             for result in &results {
                 println!(
                     "{:.4}\t{}\t{}",
@@ -74,7 +77,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Reindex => {
-            let stats = index::index_directory(&conn, &fts, &client, &config.notes_dir).await?;
+            let client = client.as_ref().ok_or(NeedleError::MissingApiKey)?;
+            let stats = index::index_directory(&conn, &fts, client, &config.notes_dir).await?;
             tracing::info!(%stats, "reindex complete");
         }
     }
