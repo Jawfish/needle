@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use libsql::Connection;
 
@@ -7,11 +10,11 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
-pub async fn connect(db_path: &Path) -> anyhow::Result<Connection> {
+pub async fn connect(db_path: &Path) -> anyhow::Result<(libsql::Database, Connection)> {
     let db = libsql::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
     init_schema(&conn).await?;
-    Ok(conn)
+    Ok((db, conn))
 }
 
 async fn init_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -32,7 +35,7 @@ async fn init_schema(conn: &Connection) -> anyhow::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
 
-        DROP TABLE IF EXISTS chunks_fts;",
+",
     )
     .await?;
 
@@ -67,6 +70,16 @@ pub async fn all_note_hashes(conn: &Connection) -> anyhow::Result<HashMap<String
         hashes.insert(path, hash);
     }
     Ok(hashes)
+}
+
+pub async fn note_hash(conn: &Connection, path: &str) -> anyhow::Result<Option<String>> {
+    let mut rows = conn
+        .query("SELECT content_hash FROM notes WHERE path = ?1", [path])
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
 }
 
 pub async fn upsert_note(
@@ -136,17 +149,17 @@ pub async fn search_semantic(
         )
         .await?;
 
-    let mut seen = HashMap::new();
+    let mut seen = HashSet::new();
     let mut results = Vec::new();
 
     while let Some(row) = rows.next().await? {
         let path: String = row.get(0)?;
         let content: String = row.get(1)?;
 
-        if seen.contains_key(&path) {
+        if seen.contains(&path) {
             continue;
         }
-        seen.insert(path.clone(), true);
+        seen.insert(path.clone());
         results.push(SearchResult {
             path,
             snippet: content,
@@ -163,13 +176,11 @@ pub async fn search_semantic(
 mod tests {
     use super::*;
 
-    async fn test_conn() -> Connection {
+    async fn test_db() -> (tempfile::TempDir, libsql::Database, Connection) {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let conn = connect(&db_path).await.expect("connect failed");
-        // Keep dir alive by leaking it (tests are short-lived)
-        std::mem::forget(dir);
-        conn
+        let (db, conn) = connect(&db_path).await.expect("connect failed");
+        (dir, db, conn)
     }
 
     fn dummy_embedding() -> Vec<f32> {
@@ -185,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_creates_schema() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let mut rows = conn
             .query(
                 "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
@@ -206,14 +217,34 @@ mod tests {
 
     #[tokio::test]
     async fn all_note_hashes_empty_on_fresh_db() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let hashes = all_note_hashes(&conn).await.expect("query failed");
         assert!(hashes.is_empty());
     }
 
     #[tokio::test]
+    async fn note_hash_returns_none_for_missing_note() {
+        let (_dir, _db, conn) = test_db().await;
+        let hash = note_hash(&conn, "nonexistent.md")
+            .await
+            .expect("query failed");
+        assert!(hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn note_hash_returns_hash_for_existing_note() {
+        let (_dir, _db, conn) = test_db().await;
+        let chunks = make_chunks(&["content"]);
+        upsert_note(&conn, "note.md", "abc123", &chunks)
+            .await
+            .expect("upsert failed");
+        let hash = note_hash(&conn, "note.md").await.expect("query failed");
+        assert_eq!(hash, Some("abc123".to_owned()));
+    }
+
+    #[tokio::test]
     async fn upsert_and_retrieve_hashes() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let chunks = make_chunks(&["hello world"]);
         upsert_note(&conn, "note.md", "abc123", &chunks)
             .await
@@ -226,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_replaces_existing_note() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let chunks_v1 = make_chunks(&["version one"]);
         upsert_note(&conn, "note.md", "hash_v1", &chunks_v1)
             .await
@@ -248,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_stores_multiple_chunks() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let chunks = make_chunks(&["chunk one", "chunk two", "chunk three"]);
         upsert_note(&conn, "note.md", "abc", &chunks)
             .await
@@ -261,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_note_removes_note_and_chunks() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let chunks = make_chunks(&["some content"]);
         upsert_note(&conn, "note.md", "abc", &chunks)
             .await
@@ -278,14 +309,14 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_note_is_not_an_error() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let result = delete_note(&conn, "does_not_exist.md").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn all_chunks_returns_all_paths_and_content() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         upsert_note(&conn, "a.md", "h1", &make_chunks(&["alpha"]))
             .await
             .expect("upsert failed");
@@ -303,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_semantic_returns_results() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let embedding = vec![1.0; 1024];
         let chunks = vec![("test content".to_owned(), embedding)];
         upsert_note(&conn, "note.md", "abc", &chunks)
@@ -322,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_semantic_deduplicates_by_path() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         let embedding = vec![1.0; 1024];
         let chunks = vec![
             ("chunk one".to_owned(), embedding.clone()),
@@ -342,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_semantic_respects_limit() {
-        let conn = test_conn().await;
+        let (_dir, _db, conn) = test_db().await;
         for i in 0..5 {
             let embedding = vec![1.0; 1024];
             let chunks = vec![(format!("content {i}"), embedding)];

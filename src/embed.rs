@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::error::SemError;
+use crate::error::NeedleError;
 
 const VOYAGE_API_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const VOYAGE_MODEL: &str = "voyage-4";
@@ -75,11 +75,19 @@ impl VoyageClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(SemError::VoyageApi(format!("{status}: {body}")).into());
+            return Err(NeedleError::VoyageApi(format!("{status}: {body}")).into());
         }
 
         let parsed: EmbeddingResponse = response.json().await?;
-        Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+        let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
+        if embeddings.len() != texts.len() {
+            return Err(NeedleError::EmbeddingCountMismatch {
+                expected: texts.len(),
+                actual: embeddings.len(),
+            }
+            .into());
+        }
+        Ok(embeddings)
     }
 }
 
@@ -116,8 +124,8 @@ fn strip_frontmatter(content: &str) -> &str {
         return content;
     }
     content[3..]
-        .find("---")
-        .map_or(content, |end| content[end + 6..].trim_start())
+        .find("\n---")
+        .map_or(content, |end| content[end + 7..].trim_start())
 }
 
 #[cfg(test)]
@@ -211,6 +219,13 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert!(!chunks[0].contains("---"), "frontmatter should be stripped");
         assert!(chunks[0].contains("Heading"));
+    }
+
+    #[test]
+    fn strip_frontmatter_ignores_dashes_within_yaml_values() {
+        let content = "---\nfoo: a---b\n---\n\nBody";
+        let stripped = strip_frontmatter(content);
+        assert_eq!(stripped, "Body");
     }
 
     #[test]

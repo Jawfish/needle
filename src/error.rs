@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
-pub enum SemError {
+pub enum NeedleError {
     #[error("notes directory not found: {0}")]
     NotesDirectoryNotFound(PathBuf),
 
@@ -10,4 +10,7 @@ pub enum SemError {
 
     #[error("voyage API error: {0}")]
     VoyageApi(String),
+
+    #[error("embedding count mismatch: expected {expected}, got {actual}")]
+    EmbeddingCountMismatch { expected: usize, actual: usize },
 }

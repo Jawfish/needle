@@ -3,21 +3,15 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::error::SemError;
+use crate::{error::NeedleError, rank::RrfWeights};
 
 pub struct Config {
     pub notes_dir: PathBuf,
     pub db_path: PathBuf,
     pub tantivy_dir: PathBuf,
     pub voyage_api_key: String,
-    pub w_semantic: f64,
-    pub w_fts: f64,
-    pub w_filename: f64,
+    pub weights: RrfWeights,
 }
-
-const DEFAULT_W_SEMANTIC: f64 = 1.5;
-const DEFAULT_W_FTS: f64 = 1.0;
-const DEFAULT_W_FILENAME: f64 = 0.7;
 
 #[derive(Deserialize, Default)]
 struct FileConfig {
@@ -40,7 +34,7 @@ impl Config {
         cli_notes_dir: Option<PathBuf>,
         cli_weights: CliWeights,
     ) -> anyhow::Result<Self> {
-        let file_config = load_file_config();
+        let file_config = load_file_config()?;
 
         let notes_dir = cli_notes_dir
             .or_else(|| std::env::var("ZK_NOTEBOOK_DIR").ok().map(PathBuf::from))
@@ -48,73 +42,80 @@ impl Config {
             .context("notes directory not specified: use --notes-dir, set ZK_NOTEBOOK_DIR, or set notes_dir in config.toml")?;
 
         if !notes_dir.is_dir() {
-            return Err(SemError::NotesDirectoryNotFound(notes_dir).into());
+            return Err(NeedleError::NotesDirectoryNotFound(notes_dir).into());
         }
 
         let voyage_api_key = std::env::var("VOYAGE_API_KEY")
             .ok()
             .or(file_config.voyage_api_key)
-            .ok_or(SemError::MissingApiKey)?;
+            .ok_or(NeedleError::MissingApiKey)?;
 
-        let db_dir = data_dir();
+        let db_dir = data_dir()?;
         std::fs::create_dir_all(&db_dir)?;
         let db_path = db_dir.join("needle.db");
         let tantivy_dir = db_dir.join("tantivy");
         std::fs::create_dir_all(&tantivy_dir)?;
 
-        let w_semantic = cli_weights
-            .semantic
-            .or(file_config.w_semantic)
-            .unwrap_or(DEFAULT_W_SEMANTIC);
-        let w_fts = cli_weights
-            .fts
-            .or(file_config.w_fts)
-            .unwrap_or(DEFAULT_W_FTS);
-        let w_filename = cli_weights
-            .filename
-            .or(file_config.w_filename)
-            .unwrap_or(DEFAULT_W_FILENAME);
+        let defaults = RrfWeights::default();
+        let weights = RrfWeights {
+            semantic: cli_weights
+                .semantic
+                .or(file_config.w_semantic)
+                .unwrap_or(defaults.semantic),
+            fts: cli_weights
+                .fts
+                .or(file_config.w_fts)
+                .unwrap_or(defaults.fts),
+            filename: cli_weights
+                .filename
+                .or(file_config.w_filename)
+                .unwrap_or(defaults.filename),
+        };
 
         Ok(Self {
             notes_dir,
             db_path,
             tantivy_dir,
             voyage_api_key,
-            w_semantic,
-            w_fts,
-            w_filename,
+            weights,
         })
     }
 }
 
-fn config_path() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map_or_else(
-            |_| {
-                let home = std::env::var("HOME").expect("HOME not set");
-                PathBuf::from(home).join(".config")
-            },
-            PathBuf::from,
-        )
-        .join("needle/config.toml")
+fn config_path() -> anyhow::Result<PathBuf> {
+    let base = if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        PathBuf::from(home).join(".config")
+    };
+    Ok(base.join("needle/config.toml"))
 }
 
-fn data_dir() -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .map_or_else(
-            |_| {
-                let home = std::env::var("HOME").expect("HOME not set");
-                PathBuf::from(home).join(".local/share")
-            },
-            PathBuf::from,
-        )
-        .join("needle")
+fn data_dir() -> anyhow::Result<PathBuf> {
+    let base = if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        PathBuf::from(home).join(".local/share")
+    };
+    Ok(base.join("needle"))
 }
 
-fn load_file_config() -> FileConfig {
-    let path = config_path();
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|content| toml::from_str(&content).ok())
-        .unwrap_or_default()
+fn load_file_config() -> anyhow::Result<FileConfig> {
+    let Ok(path) = config_path() else {
+        return Ok(FileConfig::default());
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
+        Err(e) => {
+            return Err(
+                anyhow::Error::from(e).context(format!("reading config: {}", path.display()))
+            )
+        }
+    };
+
+    toml::from_str(&content).context(format!("parsing config: {}", path.display()))
 }

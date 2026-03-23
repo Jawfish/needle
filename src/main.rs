@@ -15,7 +15,6 @@ use crate::{
     cli::{Cli, Command},
     config::{CliWeights, Config},
     embed::VoyageClient,
-    rank::RrfWeights,
 };
 
 #[tokio::main]
@@ -43,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let config = Config::resolve(cli.notes_dir, cli_weights)?;
-    let conn = db::connect(&config.db_path).await?;
+    let (_db, conn) = db::connect(&config.db_path).await?;
     let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
     let client = VoyageClient::new(&config.voyage_api_key);
 
@@ -63,12 +62,8 @@ async fn main() -> anyhow::Result<()> {
             watch::run_watcher(conn, fts, client, config.notes_dir).await?;
         }
         Command::Search { query, limit, .. } => {
-            let weights = RrfWeights {
-                semantic: config.w_semantic,
-                fts: config.w_fts,
-                filename: config.w_filename,
-            };
-            let results = rank::search(&conn, &fts, &client, &query, limit, &weights).await?;
+            let results =
+                rank::search(&conn, &fts, &client, &query, limit, &config.weights).await?;
             for result in &results {
                 println!(
                     "{:.4}\t{}\t{}",
