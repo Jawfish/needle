@@ -80,44 +80,19 @@ pub async fn index_directory(
         tracing::info!(path, "deleted from index");
     }
 
-    if !pending.is_empty() {
-        let all_chunk_texts: Vec<&str> = pending
-            .iter()
-            .flat_map(|f| f.chunks.iter().map(String::as_str))
-            .collect();
+    // Embed and write pending files (may fail partway through)
+    let embed_result = if pending.is_empty() {
+        Ok(())
+    } else {
+        embed_and_write_pending(conn, client, &pending).await
+    };
 
-        tracing::info!(
-            files = pending.len(),
-            chunks = all_chunk_texts.len(),
-            "embedding"
-        );
-
-        let all_embeddings = client.embed_documents(&all_chunk_texts).await?;
-
-        let mut embedding_offset = 0;
-        for file in &pending {
-            let file_chunks: Vec<(String, Vec<f32>)> = file
-                .chunks
-                .iter()
-                .enumerate()
-                .map(|(i, text)| {
-                    let emb = all_embeddings[embedding_offset + i].clone();
-                    (text.clone(), emb)
-                })
-                .collect();
-
-            embedding_offset += file.chunks.len();
-
-            db::upsert_note(conn, &file.path, &file.content_hash, &file_chunks).await?;
-
-            let action = if file.is_new { "indexed" } else { "updated" };
-            tracing::info!(path = file.path, action);
-        }
-    }
-
-    // Rebuild FTS from authoritative DB state
+    // Always rebuild FTS from authoritative DB state
     let all_chunks = db::all_chunks(conn).await?;
     fts.rebuild(all_chunks).await?;
+
+    // Propagate embedding error after FTS is reconciled
+    embed_result?;
 
     let added = pending.iter().filter(|f| f.is_new).count();
     let updated = pending.len() - added;
@@ -165,6 +140,59 @@ pub async fn index_single_file(
 
     tracing::info!(path = rel_path, "indexed");
     Ok(())
+}
+
+async fn embed_and_write_pending(
+    conn: &Connection,
+    client: &VoyageClient,
+    pending: &[PendingFile],
+) -> anyhow::Result<()> {
+    let all_chunk_texts: Vec<&str> = pending
+        .iter()
+        .flat_map(|f| f.chunks.iter().map(String::as_str))
+        .collect();
+
+    tracing::info!(
+        files = pending.len(),
+        chunks = all_chunk_texts.len(),
+        "embedding"
+    );
+
+    let all_embeddings = client.embed_documents(&all_chunk_texts).await?;
+
+    let mut embedding_offset = 0;
+    for file in pending {
+        let file_chunks: Vec<(String, Vec<f32>)> = file
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let emb = all_embeddings[embedding_offset + i].clone();
+                (text.clone(), emb)
+            })
+            .collect();
+
+        embedding_offset += file.chunks.len();
+
+        db::upsert_note(conn, &file.path, &file.content_hash, &file_chunks).await?;
+
+        let action = if file.is_new { "indexed" } else { "updated" };
+        tracing::info!(path = file.path, action);
+    }
+
+    Ok(())
+}
+
+pub fn is_in_hidden_dir(path: &Path, root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(parent) = rel.parent() else {
+        return false;
+    };
+    parent
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
 }
 
 fn collect_markdown_files(dir: &Path) -> anyhow::Result<HashMap<String, std::path::PathBuf>> {
@@ -279,6 +307,25 @@ mod tests {
                 "relative path should not start with /: {key}"
             );
         }
+    }
+
+    #[test]
+    fn is_in_hidden_dir_checks_directory_ancestors() {
+        let root = Path::new("/notes");
+        assert!(!is_in_hidden_dir(Path::new("/notes/note.md"), root));
+        assert!(!is_in_hidden_dir(Path::new("/notes/sub/note.md"), root));
+        assert!(!is_in_hidden_dir(
+            Path::new("/notes/.dotfile.md"),
+            root,
+        ));
+        assert!(is_in_hidden_dir(
+            Path::new("/notes/.hidden/note.md"),
+            root,
+        ));
+        assert!(is_in_hidden_dir(
+            Path::new("/notes/sub/.git/note.md"),
+            root,
+        ));
     }
 
     #[test]
