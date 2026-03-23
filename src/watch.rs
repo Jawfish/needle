@@ -72,13 +72,21 @@ pub async fn run_watcher(
                     |_| path.to_string_lossy().to_string(),
                     |p| p.to_string_lossy().to_string(),
                 );
-                if let Err(e) = db::delete_note(&conn, &rel).await {
-                    tracing::error!(path = rel, error = %e, "failed to delete from db");
+                match db::delete_note(&conn, &rel).await {
+                    Ok(()) => {
+                        if let Err(e) = fts.delete(&rel).await {
+                            tracing::warn!(
+                                path = rel,
+                                error = %e,
+                                "FTS delete failed, run reindex to reconcile"
+                            );
+                        }
+                        tracing::info!(path = rel, "deleted from index");
+                    }
+                    Err(e) => {
+                        tracing::error!(path = rel, error = %e, "failed to delete from db");
+                    }
                 }
-                if let Err(e) = fts.delete(&rel).await {
-                    tracing::error!(path = rel, error = %e, "failed to delete from fts");
-                }
-                tracing::info!(path = rel, "deleted from index");
             }
         }
     }
