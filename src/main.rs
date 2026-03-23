@@ -65,8 +65,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Search { query, limit, .. } => {
             let results =
-                rank::search(&conn, &fts, client.as_ref(), &query, limit, &config.weights)
-                    .await?;
+                rank::search(&conn, &fts, client.as_ref(), &query, limit, &config.weights).await?;
             for result in &results {
                 println!(
                     "{:.4}\t{}\t{}",

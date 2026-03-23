@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::Path};
 
+use anyhow::Context;
 use libsql::Connection;
 
 use crate::{
@@ -167,10 +168,13 @@ async fn embed_and_write_pending(
             .iter()
             .enumerate()
             .map(|(i, text)| {
-                let emb = all_embeddings[embedding_offset + i].clone();
-                (text.clone(), emb)
+                let emb = all_embeddings
+                    .get(embedding_offset + i)
+                    .context("embedding index out of bounds")?
+                    .clone();
+                Ok((text.clone(), emb))
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         embedding_offset += file.chunks.len();
 
@@ -309,23 +313,105 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn index_directory_indexes_new_files() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "alpha.md");
+        create_file(notes_dir.path(), "sub/beta.md");
+        create_file(notes_dir.path(), ".hidden/secret.md");
+
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"))
+            .await
+            .expect("connect");
+
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let client = embed::VoyageClient::create_null();
+
+        let stats = index_directory(&conn, &fts, &client, notes_dir.path())
+            .await
+            .expect("index");
+
+        assert_eq!(stats.added, 2);
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.unchanged, 0);
+
+        let hashes = db::all_note_hashes(&conn).await.expect("hashes");
+        assert!(hashes.contains_key("alpha.md"));
+        assert!(hashes.contains_key("sub/beta.md"));
+        assert!(!hashes.contains_key(".hidden/secret.md"));
+    }
+
+    #[tokio::test]
+    async fn index_directory_detects_unchanged_files() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md");
+
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"))
+            .await
+            .expect("connect");
+
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let client = embed::VoyageClient::create_null();
+
+        let first = index_directory(&conn, &fts, &client, notes_dir.path())
+            .await
+            .expect("first index");
+        assert_eq!(first.added, 1);
+
+        let second = index_directory(&conn, &fts, &client, notes_dir.path())
+            .await
+            .expect("second index");
+        assert_eq!(second.added, 0);
+        assert_eq!(second.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn index_directory_detects_deleted_files() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "keep.md");
+        create_file(notes_dir.path(), "remove.md");
+
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"))
+            .await
+            .expect("connect");
+
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let client = embed::VoyageClient::create_null();
+
+        index_directory(&conn, &fts, &client, notes_dir.path())
+            .await
+            .expect("first index");
+
+        std::fs::remove_file(notes_dir.path().join("remove.md")).expect("remove");
+
+        let stats = index_directory(&conn, &fts, &client, notes_dir.path())
+            .await
+            .expect("second index");
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.unchanged, 1);
+
+        let hashes = db::all_note_hashes(&conn).await.expect("hashes");
+        assert!(hashes.contains_key("keep.md"));
+        assert!(!hashes.contains_key("remove.md"));
+    }
+
     #[test]
     fn is_in_hidden_dir_checks_directory_ancestors() {
         let root = Path::new("/notes");
         assert!(!is_in_hidden_dir(Path::new("/notes/note.md"), root));
         assert!(!is_in_hidden_dir(Path::new("/notes/sub/note.md"), root));
-        assert!(!is_in_hidden_dir(
-            Path::new("/notes/.dotfile.md"),
-            root,
-        ));
-        assert!(is_in_hidden_dir(
-            Path::new("/notes/.hidden/note.md"),
-            root,
-        ));
-        assert!(is_in_hidden_dir(
-            Path::new("/notes/sub/.git/note.md"),
-            root,
-        ));
+        assert!(!is_in_hidden_dir(Path::new("/notes/.dotfile.md"), root,));
+        assert!(is_in_hidden_dir(Path::new("/notes/.hidden/note.md"), root,));
+        assert!(is_in_hidden_dir(Path::new("/notes/sub/.git/note.md"), root,));
     }
 
     #[test]

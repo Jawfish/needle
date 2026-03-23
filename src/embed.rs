@@ -7,10 +7,20 @@ const VOYAGE_API_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const VOYAGE_MODEL: &str = "voyage-4";
 const MAX_BATCH_SIZE: usize = 128;
 const CHUNK_TARGET_CHARS: usize = 4000; // ~1000 tokens
+#[cfg(test)]
+const EMBEDDING_DIM: usize = 1024;
 
 pub struct VoyageClient {
-    client: reqwest::Client,
-    api_key: String,
+    inner: ClientMode,
+}
+
+enum ClientMode {
+    Live {
+        client: reqwest::Client,
+        api_key: String,
+    },
+    #[cfg(test)]
+    Null,
 }
 
 #[derive(Serialize)]
@@ -33,8 +43,17 @@ struct EmbeddingData {
 impl VoyageClient {
     pub fn new(api_key: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            api_key: api_key.to_owned(),
+            inner: ClientMode::Live {
+                client: reqwest::Client::new(),
+                api_key: api_key.to_owned(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn create_null() -> Self {
+        Self {
+            inner: ClientMode::Null,
         }
     }
 
@@ -58,16 +77,23 @@ impl VoyageClient {
     }
 
     async fn embed_batch(&self, texts: &[&str], input_type: &str) -> anyhow::Result<Vec<Vec<f32>>> {
+        let (client, api_key) = match &self.inner {
+            ClientMode::Live { client, api_key } => (client, api_key),
+            #[cfg(test)]
+            ClientMode::Null => {
+                return Ok(texts.iter().map(|_| vec![0.0; EMBEDDING_DIM]).collect());
+            }
+        };
+
         let request = EmbeddingRequest {
             model: VOYAGE_MODEL,
             input: texts,
             input_type,
         };
 
-        let response = self
-            .client
+        let response = client
             .post(VOYAGE_API_URL)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {api_key}"))
             .json(&request)
             .send()
             .await?;
