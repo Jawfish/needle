@@ -1,5 +1,6 @@
 use std::{path::Path, sync::Arc};
 
+use anyhow::Context;
 use tantivy::{
     IndexReader, IndexWriter, ReloadPolicy, TantivyDocument,
     collector::TopDocs,
@@ -9,6 +10,8 @@ use tantivy::{
 };
 use tokio::sync::Mutex;
 
+const WRITER_HEAP_SIZE: usize = 50_000_000;
+
 pub struct FtsResult {
     pub path: String,
     pub snippet: String,
@@ -17,9 +20,19 @@ pub struct FtsResult {
 pub struct FtsIndex {
     index: tantivy::Index,
     reader: IndexReader,
-    writer: Arc<Mutex<IndexWriter>>,
+    writer: Arc<Mutex<Option<IndexWriter>>>,
     path_field: Field,
     content_field: Field,
+}
+
+fn ensure_writer<'a>(
+    slot: &'a mut Option<IndexWriter>,
+    index: &tantivy::Index,
+) -> anyhow::Result<&'a mut IndexWriter> {
+    if slot.is_none() {
+        *slot = Some(index.writer(WRITER_HEAP_SIZE)?);
+    }
+    slot.as_mut().context("writer not initialized")
 }
 
 impl FtsIndex {
@@ -56,7 +69,6 @@ impl FtsIndex {
             .build(),
         );
 
-        let writer = index.writer(50_000_000)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -65,39 +77,44 @@ impl FtsIndex {
         Ok(Self {
             index,
             reader,
-            writer: Arc::new(Mutex::new(writer)),
+            writer: Arc::new(Mutex::new(None)),
             path_field,
             content_field,
         })
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         let _ = self.reader.reload();
         let searcher = self.reader.searcher();
         searcher.num_docs() == 0
     }
 
+    #[cfg(test)]
     pub async fn upsert(&self, path: &str, chunks: &[String]) -> anyhow::Result<()> {
         let path_field = self.path_field;
         let content_field = self.content_field;
         let path_owned = path.to_owned();
         let chunks_owned: Vec<String> = chunks.to_vec();
         let writer = Arc::clone(&self.writer);
+        let index = self.index.clone();
 
+        #[allow(clippy::significant_drop_tightening)]
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.blocking_lock();
+            let w = ensure_writer(&mut guard, &index)?;
+
             let path_term = tantivy::Term::from_field_text(path_field, &path_owned);
-            guard.delete_term(path_term);
+            w.delete_term(path_term);
 
             for chunk in &chunks_owned {
                 let mut doc = TantivyDocument::new();
                 doc.add_text(path_field, &path_owned);
                 doc.add_text(content_field, chunk);
-                guard.add_document(doc)?;
+                w.add_document(doc)?;
             }
 
-            guard.commit()?;
-            drop(guard);
+            w.commit()?;
             anyhow::Ok(())
         })
         .await??;
@@ -105,17 +122,21 @@ impl FtsIndex {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn delete(&self, path: &str) -> anyhow::Result<()> {
         let path_field = self.path_field;
         let path_owned = path.to_owned();
         let writer = Arc::clone(&self.writer);
+        let index = self.index.clone();
 
+        #[allow(clippy::significant_drop_tightening)]
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.blocking_lock();
+            let w = ensure_writer(&mut guard, &index)?;
+
             let path_term = tantivy::Term::from_field_text(path_field, &path_owned);
-            guard.delete_term(path_term);
-            guard.commit()?;
-            drop(guard);
+            w.delete_term(path_term);
+            w.commit()?;
             anyhow::Ok(())
         })
         .await??;
@@ -193,20 +214,23 @@ impl FtsIndex {
         let path_field = self.path_field;
         let content_field = self.content_field;
         let writer = Arc::clone(&self.writer);
+        let index = self.index.clone();
 
+        #[allow(clippy::significant_drop_tightening)]
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.blocking_lock();
-            guard.delete_all_documents()?;
+            let w = ensure_writer(&mut guard, &index)?;
+
+            w.delete_all_documents()?;
 
             for (path, content) in &chunks {
                 let mut doc = TantivyDocument::new();
                 doc.add_text(path_field, path);
                 doc.add_text(content_field, content);
-                guard.add_document(doc)?;
+                w.add_document(doc)?;
             }
 
-            guard.commit()?;
-            drop(guard);
+            w.commit()?;
             anyhow::Ok(())
         })
         .await??;
