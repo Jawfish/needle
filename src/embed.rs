@@ -179,9 +179,21 @@ fn strip_frontmatter(content: &str) -> &str {
     if !content.starts_with("---") {
         return content;
     }
-    content[3..]
-        .find("\n---")
-        .map_or(content, |end| content[end + 7..].trim_start())
+    let after_open = &content[3..];
+    let Some(close_pos) = after_open.find("\n---") else {
+        return content;
+    };
+
+    let body = after_open[..close_pos].trim();
+    if !is_yaml_frontmatter(body) {
+        return content;
+    }
+
+    content[close_pos + 7..].trim_start()
+}
+
+fn is_yaml_frontmatter(block: &str) -> bool {
+    block.is_empty() || block.lines().any(|line| line.trim().contains(": "))
 }
 
 #[cfg(test)]
@@ -282,6 +294,26 @@ mod tests {
         let content = "---\nfoo: a---b\n---\n\nBody";
         let stripped = strip_frontmatter(content);
         assert_eq!(stripped, "Body");
+    }
+
+    #[test]
+    fn strip_frontmatter_preserves_leading_horizontal_rule() {
+        let content = "---\n\nSome content after a horizontal rule";
+        let stripped = strip_frontmatter(content);
+        assert_eq!(
+            stripped, content,
+            "horizontal rule should not be treated as frontmatter"
+        );
+    }
+
+    #[test]
+    fn strip_frontmatter_preserves_non_yaml_block() {
+        let content = "---\nthis is not yaml\n---\n\nBody";
+        let stripped = strip_frontmatter(content);
+        assert_eq!(
+            stripped, content,
+            "block without key: value pairs should not be stripped"
+        );
     }
 
     #[test]
