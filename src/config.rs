@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{error::NeedleError, rank::RrfWeights};
+use crate::{error::NeedleError, hash, rank::RrfWeights};
 
 pub struct Config {
     pub notes_dir: PathBuf,
@@ -55,7 +55,7 @@ impl Config {
             .ok()
             .or(file_config.voyage_api_key);
 
-        let db_dir = data_dir()?;
+        let db_dir = data_dir_for(&notes_dir)?;
         std::fs::create_dir_all(&db_dir)?;
         let db_path = db_dir.join("needle.db");
         let tantivy_dir = db_dir.join("tantivy");
@@ -105,6 +105,13 @@ fn data_dir() -> anyhow::Result<PathBuf> {
         PathBuf::from(home).join(".local/share")
     };
     Ok(base.join("needle"))
+}
+
+fn data_dir_for(notes_dir: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = notes_dir.canonicalize()?;
+    let dir_hash = hash::content_hash(&canonical.to_string_lossy());
+    let base = data_dir()?;
+    Ok(base.join(&dir_hash[..12]))
 }
 
 fn load_file_config() -> anyhow::Result<FileConfig> {
