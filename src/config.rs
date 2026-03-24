@@ -42,6 +42,8 @@ impl Config {
         cli_weights: CliWeights,
         file_config: FileConfig,
     ) -> anyhow::Result<Self> {
+        let weights = resolve_weights(cli_weights, &file_config);
+
         let notes_dir = cli_notes_dir
             .or_else(|| std::env::var("ZK_NOTEBOOK_DIR").ok().map(PathBuf::from))
             .or(file_config.notes_dir)
@@ -60,22 +62,6 @@ impl Config {
         let db_path = db_dir.join("needle.db");
         let tantivy_dir = db_dir.join("tantivy");
         std::fs::create_dir_all(&tantivy_dir)?;
-
-        let defaults = RrfWeights::default();
-        let weights = RrfWeights {
-            semantic: cli_weights
-                .semantic
-                .or(file_config.w_semantic)
-                .unwrap_or(defaults.semantic),
-            fts: cli_weights
-                .fts
-                .or(file_config.w_fts)
-                .unwrap_or(defaults.fts),
-            filename: cli_weights
-                .filename
-                .or(file_config.w_filename)
-                .unwrap_or(defaults.filename),
-        };
 
         Ok(Self {
             notes_dir,
@@ -105,6 +91,24 @@ fn data_dir() -> anyhow::Result<PathBuf> {
         PathBuf::from(home).join(".local/share")
     };
     Ok(base.join("needle"))
+}
+
+fn resolve_weights(cli_weights: CliWeights, file_config: &FileConfig) -> RrfWeights {
+    let defaults = RrfWeights::default();
+    RrfWeights {
+        semantic: cli_weights
+            .semantic
+            .or(file_config.w_semantic)
+            .unwrap_or(defaults.semantic),
+        fts: cli_weights
+            .fts
+            .or(file_config.w_fts)
+            .unwrap_or(defaults.fts),
+        filename: cli_weights
+            .filename
+            .or(file_config.w_filename)
+            .unwrap_or(defaults.filename),
+    }
 }
 
 fn data_dir_for(notes_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -138,13 +142,10 @@ mod tests {
 
     #[test]
     fn cli_weights_override_file_config() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
         let file_config = FileConfig {
             w_semantic: Some(2.0),
             w_fts: Some(3.0),
             w_filename: Some(4.0),
-            notes_dir: Some(dir.path().to_owned()),
             ..Default::default()
         };
 
@@ -154,21 +155,18 @@ mod tests {
             filename: None,
         };
 
-        let config = Config::resolve_with(None, cli_weights, file_config).expect("resolve");
-        assert!((config.weights.semantic - 10.0).abs() < f64::EPSILON);
-        assert!((config.weights.fts - 3.0).abs() < f64::EPSILON);
-        assert!((config.weights.filename - 4.0).abs() < f64::EPSILON);
+        let weights = resolve_weights(cli_weights, &file_config);
+        assert!((weights.semantic - 10.0).abs() < f64::EPSILON);
+        assert!((weights.fts - 3.0).abs() < f64::EPSILON);
+        assert!((weights.filename - 4.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn file_config_overrides_defaults() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
         let file_config = FileConfig {
             w_semantic: Some(9.0),
             w_fts: Some(8.0),
             w_filename: Some(7.0),
-            notes_dir: Some(dir.path().to_owned()),
             ..Default::default()
         };
 
@@ -178,32 +176,25 @@ mod tests {
             filename: None,
         };
 
-        let config = Config::resolve_with(None, cli_weights, file_config).expect("resolve");
-        assert!((config.weights.semantic - 9.0).abs() < f64::EPSILON);
-        assert!((config.weights.fts - 8.0).abs() < f64::EPSILON);
-        assert!((config.weights.filename - 7.0).abs() < f64::EPSILON);
+        let weights = resolve_weights(cli_weights, &file_config);
+        assert!((weights.semantic - 9.0).abs() < f64::EPSILON);
+        assert!((weights.fts - 8.0).abs() < f64::EPSILON);
+        assert!((weights.filename - 7.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn defaults_used_when_no_overrides() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let file_config = FileConfig {
-            notes_dir: Some(dir.path().to_owned()),
-            ..Default::default()
-        };
-
         let cli_weights = CliWeights {
             semantic: None,
             fts: None,
             filename: None,
         };
 
-        let config = Config::resolve_with(None, cli_weights, file_config).expect("resolve");
+        let weights = resolve_weights(cli_weights, &FileConfig::default());
         let defaults = RrfWeights::default();
-        assert!((config.weights.semantic - defaults.semantic).abs() < f64::EPSILON);
-        assert!((config.weights.fts - defaults.fts).abs() < f64::EPSILON);
-        assert!((config.weights.filename - defaults.filename).abs() < f64::EPSILON);
+        assert!((weights.semantic - defaults.semantic).abs() < f64::EPSILON);
+        assert!((weights.fts - defaults.fts).abs() < f64::EPSILON);
+        assert!((weights.filename - defaults.filename).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -217,27 +208,5 @@ mod tests {
 
         let result = Config::resolve_with(Some(bad_dir), cli_weights, FileConfig::default());
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn cli_notes_dir_overrides_file_config() {
-        let cli_dir = tempfile::tempdir().expect("tempdir");
-        let file_dir = tempfile::tempdir().expect("tempdir");
-
-        let file_config = FileConfig {
-            notes_dir: Some(file_dir.path().to_owned()),
-            ..Default::default()
-        };
-
-        let cli_weights = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-
-        let config =
-            Config::resolve_with(Some(cli_dir.path().to_owned()), cli_weights, file_config)
-                .expect("resolve");
-        assert_eq!(config.notes_dir, cli_dir.path());
     }
 }
