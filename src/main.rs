@@ -45,18 +45,11 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::resolve(cli.notes_dir, cli_weights)?;
     let (_db, conn) = db::connect(&config.db_path).await?;
     let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-    let client = config.voyage_api_key.as_deref().map(VoyageClient::new);
-
-    if fts.is_empty() {
-        let chunks = db::all_chunks(&conn).await?;
-        if !chunks.is_empty() {
-            tracing::info!(
-                chunks = chunks.len(),
-                "rebuilding tantivy index from existing chunks"
-            );
-            fts.rebuild(chunks).await?;
-        }
-    }
+    let client = config
+        .voyage_api_key
+        .as_deref()
+        .map(VoyageClient::new)
+        .transpose()?;
 
     match cli.command {
         Command::Watch => {

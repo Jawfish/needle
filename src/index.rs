@@ -108,7 +108,6 @@ pub async fn index_directory(
 
 pub async fn index_single_file(
     conn: &Connection,
-    fts: &FtsIndex,
     client: &VoyageClient,
     notes_dir: &Path,
     abs_path: &Path,
@@ -134,10 +133,6 @@ pub async fn index_single_file(
 
     let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
     db::upsert_note(conn, &rel_path, &file_hash, &paired).await?;
-    let fts_chunks: Vec<String> = paired.into_iter().map(|(text, _)| text).collect();
-    if let Err(e) = fts.upsert(&rel_path, &fts_chunks).await {
-        tracing::warn!(path = rel_path, error = %e, "FTS upsert failed, run reindex to reconcile");
-    }
 
     tracing::info!(path = rel_path, "indexed");
     Ok(())

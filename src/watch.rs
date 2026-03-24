@@ -67,9 +67,7 @@ pub async fn run_watcher(
 
         for path in &changed {
             if path.exists() {
-                if let Err(e) =
-                    index::index_single_file(&conn, &fts, client, &notes_dir, path).await
-                {
+                if let Err(e) = index::index_single_file(&conn, client, &notes_dir, path).await {
                     tracing::error!(path = %path.display(), error = %e, "failed to index");
                 }
             } else {
@@ -78,19 +76,22 @@ pub async fn run_watcher(
                     |p| p.to_string_lossy().to_string(),
                 );
                 match db::delete_note(&conn, &rel).await {
-                    Ok(()) => {
-                        if let Err(e) = fts.delete(&rel).await {
-                            tracing::warn!(
-                                path = rel,
-                                error = %e,
-                                "FTS delete failed, run reindex to reconcile"
-                            );
-                        }
-                        tracing::info!(path = rel, "deleted from index");
+                    Ok(()) => tracing::info!(path = rel, "deleted from index"),
+                    Err(e) => tracing::error!(path = rel, error = %e, "failed to delete from db"),
+                }
+            }
+        }
+
+        // Reconcile FTS from authoritative DB state after each batch
+        if !changed.is_empty() {
+            match db::all_chunks(&conn).await {
+                Ok(chunks) => {
+                    if let Err(e) = fts.rebuild(chunks).await {
+                        tracing::error!(error = %e, "FTS reconciliation failed");
                     }
-                    Err(e) => {
-                        tracing::error!(path = rel, error = %e, "failed to delete from db");
-                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to read chunks for FTS reconciliation");
                 }
             }
         }
