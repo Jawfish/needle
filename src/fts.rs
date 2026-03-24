@@ -84,13 +84,12 @@ impl FtsIndex {
     }
 
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         let _ = self.reader.reload();
         let searcher = self.reader.searcher();
         searcher.num_docs() == 0
     }
 
-    #[cfg(test)]
     pub async fn upsert(&self, path: &str, chunks: &[String]) -> anyhow::Result<()> {
         let path_field = self.path_field;
         let content_field = self.content_field;
@@ -122,7 +121,6 @@ impl FtsIndex {
         Ok(())
     }
 
-    #[cfg(test)]
     pub async fn delete(&self, path: &str) -> anyhow::Result<()> {
         let path_field = self.path_field;
         let path_owned = path.to_owned();

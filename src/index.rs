@@ -28,6 +28,13 @@ impl std::fmt::Display for IndexStats {
     }
 }
 
+pub enum FtsStatus {
+    Current,
+    Stale,
+}
+
+const FILE_BATCH_SIZE: usize = 50;
+
 struct PendingFile {
     path: String,
     content_hash: String,
@@ -108,10 +115,11 @@ pub async fn index_directory(
 
 pub async fn index_single_file(
     conn: &Connection,
+    fts: &FtsIndex,
     client: &VoyageClient,
     notes_dir: &Path,
     abs_path: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<FtsStatus> {
     let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
         |_| abs_path.to_string_lossy().to_string(),
         |p| p.to_string_lossy().to_string(),
@@ -124,7 +132,7 @@ pub async fn index_single_file(
         .await?
         .is_some_and(|h| h == file_hash)
     {
-        return Ok(());
+        return Ok(FtsStatus::Current);
     }
 
     let chunks = embed::chunk_text(&content);
@@ -134,8 +142,16 @@ pub async fn index_single_file(
     let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
     db::upsert_note(conn, &rel_path, &file_hash, &paired).await?;
 
+    let fts_chunks: Vec<String> = paired.into_iter().map(|(text, _)| text).collect();
+    let status = if fts.upsert(&rel_path, &fts_chunks).await.is_ok() {
+        FtsStatus::Current
+    } else {
+        tracing::warn!(path = rel_path, "FTS upsert failed");
+        FtsStatus::Stale
+    };
+
     tracing::info!(path = rel_path, "indexed");
-    Ok(())
+    Ok(status)
 }
 
 async fn embed_and_write_pending(
@@ -143,40 +159,39 @@ async fn embed_and_write_pending(
     client: &VoyageClient,
     pending: &[PendingFile],
 ) -> anyhow::Result<()> {
-    let all_chunk_texts: Vec<&str> = pending
-        .iter()
-        .flat_map(|f| f.chunks.iter().map(String::as_str))
-        .collect();
+    let total_chunks: usize = pending.iter().map(|f| f.chunks.len()).sum();
+    tracing::info!(files = pending.len(), chunks = total_chunks, "embedding");
 
-    tracing::info!(
-        files = pending.len(),
-        chunks = all_chunk_texts.len(),
-        "embedding"
-    );
-
-    let all_embeddings = client.embed_documents(&all_chunk_texts).await?;
-
-    let mut embedding_offset = 0;
-    for file in pending {
-        let file_chunks: Vec<(String, Vec<f32>)> = file
-            .chunks
+    for file_batch in pending.chunks(FILE_BATCH_SIZE) {
+        let batch_texts: Vec<&str> = file_batch
             .iter()
-            .enumerate()
-            .map(|(i, text)| {
-                let emb = all_embeddings
-                    .get(embedding_offset + i)
-                    .context("embedding index out of bounds")?
-                    .clone();
-                Ok((text.clone(), emb))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .flat_map(|f| f.chunks.iter().map(String::as_str))
+            .collect();
 
-        embedding_offset += file.chunks.len();
+        let batch_embeddings = client.embed_documents(&batch_texts).await?;
 
-        db::upsert_note(conn, &file.path, &file.content_hash, &file_chunks).await?;
+        let mut offset = 0;
+        for file in file_batch {
+            let file_chunks: Vec<(String, Vec<f32>)> = file
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let emb = batch_embeddings
+                        .get(offset + i)
+                        .context("embedding index out of bounds")?
+                        .clone();
+                    Ok((text.clone(), emb))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let action = if file.is_new { "indexed" } else { "updated" };
-        tracing::info!(path = file.path, action);
+            offset += file.chunks.len();
+
+            db::upsert_note(conn, &file.path, &file.content_hash, &file_chunks).await?;
+
+            let action = if file.is_new { "indexed" } else { "updated" };
+            tracing::info!(path = file.path, action);
+        }
     }
 
     Ok(())
