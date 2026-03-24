@@ -134,6 +134,22 @@ pub async fn all_chunks(conn: &Connection) -> anyhow::Result<Vec<(String, String
     Ok(results)
 }
 
+pub async fn all_chunk_embeddings(conn: &Connection) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut rows = conn
+        .query(
+            "SELECT path, embedding FROM chunks WHERE embedding IS NOT NULL",
+            (),
+        )
+        .await?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let path: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        results.push((path, blob));
+    }
+    Ok(results)
+}
+
 pub async fn search_semantic(
     conn: &Connection,
     query_embedding: &[f32],
@@ -335,6 +351,21 @@ mod tests {
         let paths: Vec<&str> = chunks.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"a.md"));
         assert!(paths.contains(&"b.md"));
+    }
+
+    #[tokio::test]
+    async fn all_chunk_embeddings_returns_blob_data() {
+        let (_dir, _db, conn) = test_db().await;
+        let embedding = vec![1.0_f32; 1024];
+        let chunks = vec![("content".to_owned(), embedding)];
+        upsert_note(&conn, "note.md", "abc", &chunks)
+            .await
+            .expect("upsert failed");
+
+        let results = all_chunk_embeddings(&conn).await.expect("query failed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "note.md");
+        assert_eq!(results[0].1.len(), 1024 * 4, "blob should be 4096 bytes");
     }
 
     #[tokio::test]
