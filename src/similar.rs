@@ -1,13 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::bail;
 use libsql::Connection;
 
 use crate::db;
-
-const EMBEDDING_DIM: usize = 1024;
-const BYTES_PER_F32: usize = 4;
-const EXPECTED_BLOB_SIZE: usize = EMBEDDING_DIM * BYTES_PER_F32;
 
 pub struct SimilarPair {
     pub similarity: f64,
@@ -15,29 +10,9 @@ pub struct SimilarPair {
     pub path_b: String,
 }
 
-fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
-    if blob.len() != EXPECTED_BLOB_SIZE {
-        bail!(
-            "expected {EXPECTED_BLOB_SIZE} bytes for {EMBEDDING_DIM}-dim f32 embedding, got {}",
-            blob.len()
-        );
-    }
-    Ok(blob
-        .chunks_exact(BYTES_PER_F32)
-        .map(|chunk| {
-            let bytes: [u8; BYTES_PER_F32] = chunk
-                .try_into()
-                .expect("chunks_exact guarantees exactly 4 bytes");
-            f32::from_le_bytes(bytes)
-        })
-        .collect())
-}
-
 fn average_embeddings(embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
-    if embeddings.is_empty() {
-        return None;
-    }
-    let mut acc = vec![0.0_f64; EMBEDDING_DIM];
+    let dim = embeddings.first()?.len();
+    let mut acc = vec![0.0_f64; dim];
     for emb in embeddings {
         for (a, &v) in acc.iter_mut().zip(emb.iter()) {
             *a += f64::from(v);
@@ -69,33 +44,129 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
         .sum()
 }
 
+fn sort_pairs_descending(pairs: &mut [SimilarPair]) {
+    pairs.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 fn find_similar_pairs(
     docs: &[(String, Vec<f32>)],
     threshold: f64,
     limit: Option<usize>,
 ) -> Vec<SimilarPair> {
     let mut pairs = Vec::new();
+    let mut effective_threshold = threshold;
+    let compact_at = limit.map(|n| n.saturating_mul(2).max(1));
+
     for i in 0..docs.len() {
         for j in (i + 1)..docs.len() {
             let sim = cosine_similarity(&docs[i].1, &docs[j].1);
-            if sim >= threshold {
+            if sim >= effective_threshold {
                 pairs.push(SimilarPair {
                     similarity: sim,
                     path_a: docs[i].0.clone(),
                     path_b: docs[j].0.clone(),
                 });
+                if let Some(cap) = compact_at
+                    && pairs.len() >= cap
+                {
+                    let n = limit.unwrap_or(cap);
+                    sort_pairs_descending(&mut pairs);
+                    pairs.truncate(n);
+                    effective_threshold = pairs.last().map_or(threshold, |p| p.similarity);
+                }
             }
         }
     }
-    pairs.sort_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_pairs_descending(&mut pairs);
     if let Some(n) = limit {
         pairs.truncate(n);
     }
     pairs
+}
+
+pub struct SimilarGroup {
+    pub paths: Vec<String>,
+    pub pairs: Vec<SimilarPair>,
+}
+
+pub fn group_pairs(pairs: Vec<SimilarPair>) -> Vec<SimilarGroup> {
+    let mut adjacency: HashMap<String, HashSet<String>> = HashMap::new();
+    for pair in &pairs {
+        adjacency
+            .entry(pair.path_a.clone())
+            .or_default()
+            .insert(pair.path_b.clone());
+        adjacency
+            .entry(pair.path_b.clone())
+            .or_default()
+            .insert(pair.path_a.clone());
+    }
+
+    let mut path_to_component: HashMap<String, usize> = HashMap::new();
+    let mut component_id = 0;
+
+    for node in adjacency.keys() {
+        if path_to_component.contains_key(node) {
+            continue;
+        }
+        let mut queue = VecDeque::new();
+        queue.push_back(node.clone());
+        path_to_component.insert(node.clone(), component_id);
+
+        while let Some(current) = queue.pop_front() {
+            if let Some(neighbors) = adjacency.get(&current) {
+                for neighbor in neighbors {
+                    if !path_to_component.contains_key(neighbor) {
+                        path_to_component.insert(neighbor.clone(), component_id);
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+        }
+        component_id += 1;
+    }
+
+    let mut group_map: HashMap<usize, (HashSet<String>, Vec<SimilarPair>)> = HashMap::new();
+    for pair in pairs {
+        let cid = path_to_component.get(&pair.path_a).copied().unwrap_or(0);
+        let entry = group_map.entry(cid).or_default();
+        entry.0.insert(pair.path_a.clone());
+        entry.0.insert(pair.path_b.clone());
+        entry.1.push(pair);
+    }
+
+    let mut groups: Vec<SimilarGroup> = group_map
+        .into_values()
+        .map(|(path_set, mut gpairs)| {
+            gpairs.sort_by(|a, b| {
+                b.similarity
+                    .partial_cmp(&a.similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut paths: Vec<String> = path_set.into_iter().collect();
+            paths.sort();
+            SimilarGroup {
+                paths,
+                pairs: gpairs,
+            }
+        })
+        .collect();
+
+    groups.sort_by(|a, b| {
+        b.paths.len().cmp(&a.paths.len()).then_with(|| {
+            let max_a = a.pairs.first().map_or(0.0, |p| p.similarity);
+            let max_b = b.pairs.first().map_or(0.0, |p| p.similarity);
+            max_b
+                .partial_cmp(&max_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    groups
 }
 
 pub async fn find_similar(
@@ -103,12 +174,11 @@ pub async fn find_similar(
     threshold: f64,
     limit: Option<usize>,
 ) -> anyhow::Result<Vec<SimilarPair>> {
-    let raw_chunks = db::all_chunk_embeddings(conn).await?;
+    let chunks = db::all_chunk_embeddings(conn).await?;
 
     let mut by_path: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
-    for (path, blob) in &raw_chunks {
-        let embedding = decode_embedding(blob)?;
-        by_path.entry(path.clone()).or_default().push(embedding);
+    for (path, embedding) in chunks {
+        by_path.entry(path).or_default().push(embedding);
     }
 
     let mut docs: Vec<(String, Vec<f32>)> = by_path
@@ -129,34 +199,7 @@ pub async fn find_similar(
 mod tests {
     use super::*;
 
-    fn make_blob(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-
-    #[test]
-    fn decode_embedding_converts_known_bytes() {
-        #[allow(clippy::cast_precision_loss)]
-        let values: Vec<f32> = (0..EMBEDDING_DIM).map(|i| i as f32 * 0.1).collect();
-        let blob = make_blob(&values);
-        let decoded = decode_embedding(&blob).expect("decode failed");
-        assert_eq!(decoded.len(), EMBEDDING_DIM);
-        for (a, b) in decoded.iter().zip(values.iter()) {
-            assert!((a - b).abs() < f32::EPSILON);
-        }
-    }
-
-    #[test]
-    fn decode_embedding_rejects_wrong_size() {
-        let blob = vec![0u8; 100];
-        assert!(decode_embedding(&blob).is_err());
-    }
-
-    #[test]
-    fn decode_embedding_accepts_exact_4096_bytes() {
-        let blob = vec![0u8; EXPECTED_BLOB_SIZE];
-        let decoded = decode_embedding(&blob).expect("decode failed");
-        assert_eq!(decoded.len(), EMBEDDING_DIM);
-    }
+    const EMBEDDING_DIM: usize = 1024;
 
     #[test]
     fn average_embeddings_returns_none_for_empty_slice() {
@@ -305,6 +348,94 @@ mod tests {
     fn find_similar_pairs_returns_empty_for_no_documents() {
         let pairs = find_similar_pairs(&[], 0.0, None);
         assert!(pairs.is_empty());
+    }
+
+    fn make_pair(sim: f64, a: &str, b: &str) -> SimilarPair {
+        SimilarPair {
+            similarity: sim,
+            path_a: a.to_owned(),
+            path_b: b.to_owned(),
+        }
+    }
+
+    #[test]
+    fn group_pairs_empty_input_returns_empty() {
+        let groups = group_pairs(vec![]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_pairs_single_pair_produces_one_group() {
+        let groups = group_pairs(vec![make_pair(0.9, "a.md", "b.md")]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].paths.len(), 2);
+        assert_eq!(groups[0].pairs.len(), 1);
+    }
+
+    #[test]
+    fn group_pairs_disconnected_pairs_form_separate_groups() {
+        let pairs = vec![
+            make_pair(0.9, "a.md", "b.md"),
+            make_pair(0.85, "c.md", "d.md"),
+        ];
+        let groups = group_pairs(pairs);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn group_pairs_chain_forms_single_group() {
+        let pairs = vec![
+            make_pair(0.9, "a.md", "b.md"),
+            make_pair(0.85, "b.md", "c.md"),
+        ];
+        let groups = group_pairs(pairs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].paths.len(), 3);
+        assert_eq!(groups[0].pairs.len(), 2);
+    }
+
+    #[test]
+    fn group_pairs_three_pairwise_connected_docs_form_one_group() {
+        let pairs = vec![
+            make_pair(0.95, "a.md", "b.md"),
+            make_pair(0.90, "a.md", "c.md"),
+            make_pair(0.88, "b.md", "c.md"),
+        ];
+        let groups = group_pairs(pairs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].paths.len(), 3);
+        assert_eq!(groups[0].pairs.len(), 3);
+    }
+
+    #[test]
+    fn group_pairs_sorted_by_size_then_max_similarity() {
+        let pairs = vec![
+            make_pair(0.99, "x.md", "y.md"),
+            make_pair(0.90, "a.md", "b.md"),
+            make_pair(0.85, "b.md", "c.md"),
+        ];
+        let groups = group_pairs(pairs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].paths.len(), 3, "larger group should come first");
+        assert_eq!(groups[1].paths.len(), 2);
+    }
+
+    #[test]
+    fn group_pairs_sorts_paths_alphabetically() {
+        let groups = group_pairs(vec![make_pair(0.9, "z.md", "a.md")]);
+        assert_eq!(groups[0].paths, vec!["a.md", "z.md"]);
+    }
+
+    #[test]
+    fn group_pairs_sorts_pairs_by_similarity_descending() {
+        let pairs = vec![
+            make_pair(0.85, "a.md", "c.md"),
+            make_pair(0.95, "a.md", "b.md"),
+            make_pair(0.90, "b.md", "c.md"),
+        ];
+        let groups = group_pairs(pairs);
+        let sims: Vec<f64> = groups[0].pairs.iter().map(|p| p.similarity).collect();
+        assert_eq!(sims, vec![0.95, 0.90, 0.85]);
     }
 
     #[tokio::test]
