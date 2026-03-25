@@ -3,8 +3,30 @@ use std::{
     path::Path,
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use libsql::Connection;
+
+const EMBEDDING_DIM: usize = 1024;
+const BYTES_PER_F32: usize = 4;
+const EXPECTED_BLOB_SIZE: usize = EMBEDDING_DIM * BYTES_PER_F32;
+
+fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
+    if blob.len() != EXPECTED_BLOB_SIZE {
+        bail!(
+            "expected {EXPECTED_BLOB_SIZE} bytes for {EMBEDDING_DIM}-dim f32 embedding, got {}",
+            blob.len()
+        );
+    }
+    Ok(blob
+        .chunks_exact(BYTES_PER_F32)
+        .map(|chunk| {
+            let bytes: [u8; BYTES_PER_F32] = chunk
+                .try_into()
+                .expect("chunks_exact guarantees exactly 4 bytes");
+            f32::from_le_bytes(bytes)
+        })
+        .collect())
+}
 
 pub struct SearchResult {
     pub path: String,
@@ -134,7 +156,7 @@ pub async fn all_chunks(conn: &Connection) -> anyhow::Result<Vec<(String, String
     Ok(results)
 }
 
-pub async fn all_chunk_embeddings(conn: &Connection) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+pub async fn all_chunk_embeddings(conn: &Connection) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
     let mut rows = conn
         .query(
             "SELECT path, embedding FROM chunks WHERE embedding IS NOT NULL",
@@ -145,7 +167,8 @@ pub async fn all_chunk_embeddings(conn: &Connection) -> anyhow::Result<Vec<(Stri
     while let Some(row) = rows.next().await? {
         let path: String = row.get(0)?;
         let blob: Vec<u8> = row.get(1)?;
-        results.push((path, blob));
+        let embedding = decode_embedding(&blob)?;
+        results.push((path, embedding));
     }
     Ok(results)
 }
@@ -354,10 +377,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_chunk_embeddings_returns_blob_data() {
+    async fn all_chunk_embeddings_returns_decoded_vectors() {
         let (_dir, _db, conn) = test_db().await;
         let embedding = vec![1.0_f32; 1024];
-        let chunks = vec![("content".to_owned(), embedding)];
+        let chunks = vec![("content".to_owned(), embedding.clone())];
         upsert_note(&conn, "note.md", "abc", &chunks)
             .await
             .expect("upsert failed");
@@ -365,7 +388,26 @@ mod tests {
         let results = all_chunk_embeddings(&conn).await.expect("query failed");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "note.md");
-        assert_eq!(results[0].1.len(), 1024 * 4, "blob should be 4096 bytes");
+        assert_eq!(results[0].1.len(), 1024);
+        assert!((results[0].1[0] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn decode_embedding_converts_known_bytes() {
+        #[allow(clippy::cast_precision_loss)]
+        let values: Vec<f32> = (0..EMBEDDING_DIM).map(|i| i as f32 * 0.1).collect();
+        let blob: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let decoded = decode_embedding(&blob).expect("decode failed");
+        assert_eq!(decoded.len(), EMBEDDING_DIM);
+        for (a, b) in decoded.iter().zip(values.iter()) {
+            assert!((a - b).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn decode_embedding_rejects_wrong_size() {
+        let blob = vec![0u8; 100];
+        assert!(decode_embedding(&blob).is_err());
     }
 
     #[tokio::test]
