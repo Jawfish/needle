@@ -45,7 +45,6 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::resolve(cli.notes_dir, cli_weights)?;
     let (_db, conn) = db::connect(&config.db_path).await?;
-    let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
     let client = config
         .voyage_api_key
         .as_deref()
@@ -54,10 +53,12 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Watch => {
+            let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
             let client = client.as_ref().ok_or(NeedleError::MissingApiKey)?;
             watch::run_watcher(conn, fts, client, config.notes_dir).await?;
         }
         Command::Search { query, limit, .. } => {
+            let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
             let results =
                 rank::search(&conn, &fts, client.as_ref(), &query, limit, &config.weights).await?;
             for result in &results {
@@ -69,13 +70,34 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Command::Similar { threshold, limit } => {
+        Command::Similar {
+            threshold,
+            limit,
+            group,
+        } => {
             let pairs = similar::find_similar(&conn, threshold, limit).await?;
-            for pair in &pairs {
-                println!("{:.4}\t{}\t{}", pair.similarity, pair.path_a, pair.path_b);
+            if group {
+                let groups = similar::group_pairs(pairs);
+                for (i, g) in groups.iter().enumerate() {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("Group {} ({} documents):", i + 1, g.paths.len());
+                    for pair in &g.pairs {
+                        println!(
+                            "  {:.4}  {} <> {}",
+                            pair.similarity, pair.path_a, pair.path_b
+                        );
+                    }
+                }
+            } else {
+                for pair in &pairs {
+                    println!("{:.4}\t{}\t{}", pair.similarity, pair.path_a, pair.path_b);
+                }
             }
         }
         Command::Reindex => {
+            let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
             let client = client.as_ref().ok_or(NeedleError::MissingApiKey)?;
             let stats = index::index_directory(&conn, &fts, client, &config.notes_dir).await?;
             tracing::info!(%stats, "reindex complete");

@@ -32,6 +32,8 @@ pub enum Command {
         threshold: f64,
         #[arg(short, long)]
         limit: Option<usize>,
+        #[arg(long)]
+        group: bool,
     },
     /// Reindex all notes
     Reindex,
