@@ -172,7 +172,7 @@ pub fn group_pairs(pairs: Vec<SimilarPair>) -> Vec<SimilarGroup> {
 pub async fn find_similar(
     conn: &Connection,
     threshold: f64,
-    limit: Option<usize>,
+    limit: usize,
 ) -> anyhow::Result<Vec<SimilarPair>> {
     let chunks = db::all_chunk_embeddings(conn).await?;
 
@@ -192,7 +192,7 @@ pub async fn find_similar(
 
     docs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    Ok(find_similar_pairs(&docs, threshold, limit))
+    Ok(find_similar_pairs(&docs, threshold, Some(limit)))
 }
 
 #[cfg(test)]
@@ -459,7 +459,7 @@ mod tests {
             .await
             .expect("upsert failed");
 
-        let pairs = find_similar(&conn, 0.9, None).await.expect("find failed");
+        let pairs = find_similar(&conn, 0.9, 50).await.expect("find failed");
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].path_a, "a.md");
         assert_eq!(pairs[0].path_b, "b.md");

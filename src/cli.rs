@@ -30,8 +30,8 @@ pub enum Command {
     Similar {
         #[arg(long, default_value = "0.85")]
         threshold: f64,
-        #[arg(short, long)]
-        limit: Option<usize>,
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
         #[arg(long)]
         group: bool,
     },
