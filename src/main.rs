@@ -7,6 +7,7 @@ mod fts;
 mod hash;
 mod index;
 mod rank;
+mod similar;
 mod watch;
 
 use clap::Parser;
@@ -66,6 +67,12 @@ async fn main() -> anyhow::Result<()> {
                     result.path,
                     first_line(&result.snippet)
                 );
+            }
+        }
+        Command::Similar { threshold, limit } => {
+            let pairs = similar::find_similar(&conn, threshold, limit).await?;
+            for pair in &pairs {
+                println!("{:.4}\t{}\t{}", pair.similarity, pair.path_a, pair.path_b);
             }
         }
         Command::Reindex => {

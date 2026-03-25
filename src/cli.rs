@@ -26,6 +26,13 @@ pub enum Command {
         #[arg(long, env = "NEEDLE_W_FILENAME")]
         w_filename: Option<f64>,
     },
+    /// Find similar document pairs based on embeddings
+    Similar {
+        #[arg(long, default_value = "0.85")]
+        threshold: f64,
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
     /// Reindex all notes
     Reindex,
 }
