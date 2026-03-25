@@ -167,8 +167,10 @@ pub async fn all_chunk_embeddings(conn: &Connection) -> anyhow::Result<Vec<(Stri
     while let Some(row) = rows.next().await? {
         let path: String = row.get(0)?;
         let blob: Vec<u8> = row.get(1)?;
-        let embedding = decode_embedding(&blob)?;
-        results.push((path, embedding));
+        match decode_embedding(&blob) {
+            Ok(embedding) => results.push((path, embedding)),
+            Err(err) => tracing::warn!(path, %err, "skipping chunk with corrupt embedding"),
+        }
     }
     Ok(results)
 }
