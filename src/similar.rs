@@ -172,27 +172,53 @@ pub fn group_pairs(pairs: Vec<SimilarPair>) -> Vec<SimilarGroup> {
 pub async fn find_similar(
     conn: &Connection,
     threshold: f64,
-    limit: usize,
+    limit: Option<usize>,
 ) -> anyhow::Result<Vec<SimilarPair>> {
-    let chunks = db::all_chunk_embeddings(conn).await?;
+    let mut rows = conn
+        .query(
+            "SELECT path, embedding FROM chunks WHERE embedding IS NOT NULL ORDER BY path",
+            (),
+        )
+        .await?;
 
-    let mut by_path: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
-    for (path, embedding) in chunks {
-        by_path.entry(path).or_default().push(embedding);
+    let mut docs: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut current_path = String::new();
+    let mut current_chunks: Vec<Vec<f32>> = Vec::new();
+
+    while let Some(row) = rows.next().await? {
+        let path: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        let embedding = match db::decode_embedding(&blob) {
+            Ok(emb) => emb,
+            Err(err) => {
+                tracing::warn!(path, %err, "skipping chunk with corrupt embedding");
+                continue;
+            }
+        };
+
+        if path != current_path {
+            flush_document(&mut docs, &mut current_path, &mut current_chunks);
+            current_path = path;
+        }
+        current_chunks.push(embedding);
     }
-
-    let mut docs: Vec<(String, Vec<f32>)> = by_path
-        .into_iter()
-        .filter_map(|(path, embeddings)| average_embeddings(&embeddings).map(|avg| (path, avg)))
-        .collect();
-
-    for (_, emb) in &mut docs {
-        normalize(emb);
-    }
+    flush_document(&mut docs, &mut current_path, &mut current_chunks);
 
     docs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    Ok(find_similar_pairs(&docs, threshold, Some(limit)))
+    Ok(find_similar_pairs(&docs, threshold, limit))
+}
+
+fn flush_document(
+    docs: &mut Vec<(String, Vec<f32>)>,
+    path: &mut String,
+    chunks: &mut Vec<Vec<f32>>,
+) {
+    if let Some(mut avg) = average_embeddings(chunks) {
+        normalize(&mut avg);
+        docs.push((std::mem::take(path), avg));
+    }
+    chunks.clear();
 }
 
 #[cfg(test)]
@@ -459,7 +485,9 @@ mod tests {
             .await
             .expect("upsert failed");
 
-        let pairs = find_similar(&conn, 0.9, 50).await.expect("find failed");
+        let pairs = find_similar(&conn, 0.9, Some(50))
+            .await
+            .expect("find failed");
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].path_a, "a.md");
         assert_eq!(pairs[0].path_b, "b.md");

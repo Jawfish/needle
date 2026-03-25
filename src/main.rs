@@ -75,9 +75,11 @@ async fn main() -> anyhow::Result<()> {
             limit,
             group,
         } => {
-            let pairs = similar::find_similar(&conn, threshold, limit).await?;
+            let pair_limit = if group { None } else { Some(limit) };
+            let pairs = similar::find_similar(&conn, threshold, pair_limit).await?;
             if group {
-                let groups = similar::group_pairs(pairs);
+                let mut groups = similar::group_pairs(pairs);
+                groups.truncate(limit);
                 for (i, g) in groups.iter().enumerate() {
                     if i > 0 {
                         println!();
