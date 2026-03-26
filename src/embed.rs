@@ -1,38 +1,132 @@
+mod openai;
+mod voyage;
+
+#[cfg(feature = "local")]
+mod local;
+
 use std::time::Duration;
 
-use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::error::NeedleError;
+use crate::{config::EmbedConfig, error::NeedleError};
 
-const VOYAGE_API_URL: &str = "https://api.voyageai.com/v1/embeddings";
-const VOYAGE_MODEL: &str = "voyage-4";
-const MAX_BATCH_SIZE: usize = 128;
-const CHUNK_TARGET_CHARS: usize = 4000; // ~1000 tokens
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;
-#[cfg(test)]
-const EMBEDDING_DIM: usize = 1024;
+const CHUNK_TARGET_CHARS: usize = 4000; // ~1000 tokens
 
-pub struct VoyageClient {
-    inner: ClientMode,
-}
-
-enum ClientMode {
-    Live {
-        client: reqwest::Client,
-        api_key: String,
-    },
+pub enum Embedder {
+    Voyage(voyage::VoyageProvider),
+    OpenAi(openai::OpenAiProvider),
+    #[cfg(feature = "local")]
+    Local(local::LocalProvider),
     #[cfg(test)]
-    Null,
+    Null {
+        dim: usize,
+    },
 }
 
-#[derive(Serialize)]
-struct EmbeddingRequest<'a> {
-    model: &'a str,
-    input: &'a [&'a str],
-    input_type: &'a str,
+impl Embedder {
+    pub fn from_config(config: &EmbedConfig) -> anyhow::Result<Self> {
+        let kind = match config.provider.as_deref() {
+            Some(name) => parse_provider_name(name)?,
+            None => infer_from_keys(config)?,
+        };
+
+        match kind {
+            ProviderKind::Voyage => {
+                let api_key = config
+                    .voyage_api_key
+                    .as_deref()
+                    .ok_or_else(|| NeedleError::MissingApiKey("VOYAGE_API_KEY".to_owned()))?;
+                Ok(Self::Voyage(voyage::VoyageProvider::new(
+                    api_key,
+                    config.model.as_deref(),
+                    config.dim,
+                )?))
+            }
+            ProviderKind::OpenAi => Ok(Self::OpenAi(openai::OpenAiProvider::new(
+                config.openai_api_key.as_deref(),
+                config.api_base.as_deref(),
+                config.model.as_deref(),
+                config.dim,
+            )?)),
+            #[cfg(feature = "local")]
+            ProviderKind::Local => Ok(Self::Local(local::LocalProvider::new(
+                config.model.as_deref(),
+            )?)),
+            #[cfg(not(feature = "local"))]
+            ProviderKind::Local => Err(NeedleError::NoEmbeddingProvider.into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn create_null(dim: usize) -> Self {
+        Self::Null { dim }
+    }
+
+    pub const fn dim(&self) -> usize {
+        match self {
+            Self::Voyage(p) => p.dim(),
+            Self::OpenAi(p) => p.dim(),
+            #[cfg(feature = "local")]
+            Self::Local(p) => p.dim(),
+            #[cfg(test)]
+            Self::Null { dim } => *dim,
+        }
+    }
+
+    pub async fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Voyage(p) => p.embed_documents(texts).await,
+            Self::OpenAi(p) => p.embed_documents(texts).await,
+            #[cfg(feature = "local")]
+            Self::Local(p) => p.embed_documents(texts).await,
+            #[cfg(test)]
+            Self::Null { dim } => Ok(texts.iter().map(|_| vec![0.0; *dim]).collect()),
+        }
+    }
+
+    pub async fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Voyage(p) => p.embed_query(query).await,
+            Self::OpenAi(p) => p.embed_query(query).await,
+            #[cfg(feature = "local")]
+            Self::Local(p) => p.embed_query(query).await,
+            #[cfg(test)]
+            Self::Null { dim } => Ok(vec![0.0; *dim]),
+        }
+    }
 }
+
+enum ProviderKind {
+    Voyage,
+    OpenAi,
+    Local,
+}
+
+fn parse_provider_name(name: &str) -> anyhow::Result<ProviderKind> {
+    match name {
+        "voyage" => Ok(ProviderKind::Voyage),
+        "openai" => Ok(ProviderKind::OpenAi),
+        "local" => Ok(ProviderKind::Local),
+        _ => anyhow::bail!("unknown provider: {name} (expected: voyage, openai, local)"),
+    }
+}
+
+fn infer_from_keys(config: &EmbedConfig) -> anyhow::Result<ProviderKind> {
+    if config.voyage_api_key.is_some() {
+        return Ok(ProviderKind::Voyage);
+    }
+    if config.openai_api_key.is_some() {
+        return Ok(ProviderKind::OpenAi);
+    }
+    if cfg!(feature = "local") {
+        return Ok(ProviderKind::Local);
+    }
+    Err(NeedleError::NoEmbeddingProvider.into())
+}
+
+// --- Shared HTTP helpers ---
 
 #[derive(Deserialize)]
 struct EmbeddingResponse {
@@ -44,108 +138,50 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
-impl VoyageClient {
-    pub fn new(api_key: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: ClientMode::Live {
-                client: reqwest::Client::builder()
-                    .timeout(REQUEST_TIMEOUT)
-                    .build()?,
-                api_key: api_key.to_owned(),
-            },
-        })
-    }
-
-    #[cfg(test)]
-    pub const fn create_null() -> Self {
-        Self {
-            inner: ClientMode::Null,
-        }
-    }
-
-    pub async fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-
-        for batch in texts.chunks(MAX_BATCH_SIZE) {
-            let embeddings = self.embed_batch(batch, "document").await?;
-            all_embeddings.extend(embeddings);
-        }
-
-        Ok(all_embeddings)
-    }
-
-    pub async fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
-        let embeddings = self.embed_batch(&[query], "query").await?;
-        embeddings
-            .into_iter()
-            .next()
-            .context("voyage API returned no embeddings")
-    }
-
-    async fn embed_batch(&self, texts: &[&str], input_type: &str) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (client, api_key) = match &self.inner {
-            ClientMode::Live { client, api_key } => (client, api_key),
-            #[cfg(test)]
-            ClientMode::Null => {
-                return Ok(texts.iter().map(|_| vec![0.0; EMBEDDING_DIM]).collect());
-            }
-        };
-
-        let request_body = EmbeddingRequest {
-            model: VOYAGE_MODEL,
-            input: texts,
-            input_type,
-        };
-
-        let mut last_err = None;
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay_secs = 1u64 << (attempt - 1);
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                tracing::warn!(attempt, "retrying embedding request");
-            }
-
-            let response = match client
-                .post(VOYAGE_API_URL)
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&request_body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = Some(anyhow::Error::from(e));
-                    continue;
-                }
-            };
-
-            if response.status().is_success() {
-                let parsed: EmbeddingResponse = response.json().await?;
-                let embeddings: Vec<Vec<f32>> =
-                    parsed.data.into_iter().map(|d| d.embedding).collect();
-                if embeddings.len() != texts.len() {
-                    return Err(NeedleError::EmbeddingCountMismatch {
-                        expected: texts.len(),
-                        actual: embeddings.len(),
-                    }
-                    .into());
-                }
-                return Ok(embeddings);
-            }
-
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-
-            if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(NeedleError::VoyageApi(format!("{status}: {body}")).into());
-            }
-
-            last_err = Some(NeedleError::VoyageApi(format!("{status}: {body}")).into());
-        }
-
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("embedding request failed")))
-    }
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()?)
 }
+
+async fn send_with_retry(
+    build_request: impl Fn() -> reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    let mut last_err = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let delay_secs = 1u64 << (attempt - 1);
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            tracing::warn!(attempt, "retrying embedding request");
+        }
+
+        let response = match build_request().send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow::Error::from(e));
+                continue;
+            }
+        };
+
+        if response.status().is_success() {
+            return Ok(response);
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(NeedleError::EmbeddingApi(format!("{status}: {body}")).into());
+        }
+
+        last_err = Some(NeedleError::EmbeddingApi(format!("{status}: {body}")).into());
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("embedding request failed")))
+}
+
+// --- Text chunking (provider-independent) ---
 
 pub fn chunk_text(content: &str) -> Vec<String> {
     let content = strip_frontmatter(content);
@@ -324,5 +360,89 @@ mod tests {
             stripped, content,
             "--- not at start should not be treated as frontmatter"
         );
+    }
+
+    #[test]
+    fn infer_voyage_from_api_key() {
+        let config = EmbedConfig {
+            provider: None,
+            model: None,
+            api_base: None,
+            dim: None,
+            voyage_api_key: Some("vk-test".to_owned()),
+            openai_api_key: None,
+        };
+        let kind = infer_from_keys(&config).expect("should infer");
+        assert!(matches!(kind, ProviderKind::Voyage));
+    }
+
+    #[test]
+    fn infer_openai_from_api_key() {
+        let config = EmbedConfig {
+            provider: None,
+            model: None,
+            api_base: None,
+            dim: None,
+            voyage_api_key: None,
+            openai_api_key: Some("sk-test".to_owned()),
+        };
+        let kind = infer_from_keys(&config).expect("should infer");
+        assert!(matches!(kind, ProviderKind::OpenAi));
+    }
+
+    #[test]
+    fn voyage_takes_precedence_when_both_keys_set() {
+        let config = EmbedConfig {
+            provider: None,
+            model: None,
+            api_base: None,
+            dim: None,
+            voyage_api_key: Some("vk-test".to_owned()),
+            openai_api_key: Some("sk-test".to_owned()),
+        };
+        let kind = infer_from_keys(&config).expect("should infer");
+        assert!(matches!(kind, ProviderKind::Voyage));
+    }
+
+    #[test]
+    fn parse_provider_name_accepts_valid_names() {
+        assert!(matches!(
+            parse_provider_name("voyage").expect("valid"),
+            ProviderKind::Voyage
+        ));
+        assert!(matches!(
+            parse_provider_name("openai").expect("valid"),
+            ProviderKind::OpenAi
+        ));
+        assert!(matches!(
+            parse_provider_name("local").expect("valid"),
+            ProviderKind::Local
+        ));
+    }
+
+    #[test]
+    fn parse_provider_name_rejects_unknown() {
+        assert!(parse_provider_name("gemini").is_err());
+    }
+
+    #[test]
+    fn null_embedder_returns_correct_dimension() {
+        let embedder = Embedder::create_null(384);
+        assert_eq!(embedder.dim(), 384);
+    }
+
+    #[tokio::test]
+    async fn null_embedder_returns_zero_vectors() {
+        let embedder = Embedder::create_null(128);
+        let docs = embedder
+            .embed_documents(&["hello", "world"])
+            .await
+            .expect("should succeed");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].len(), 128);
+        assert!(docs[0].iter().all(|&v| v == 0.0));
+
+        let query = embedder.embed_query("hello").await.expect("should succeed");
+        assert_eq!(query.len(), 128);
     }
 }
