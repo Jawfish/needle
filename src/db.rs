@@ -6,14 +6,12 @@ use std::{
 use anyhow::{Context, bail};
 use libsql::Connection;
 
-const EMBEDDING_DIM: usize = 1024;
 const BYTES_PER_F32: usize = 4;
-const EXPECTED_BLOB_SIZE: usize = EMBEDDING_DIM * BYTES_PER_F32;
 
 pub fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
-    if blob.len() != EXPECTED_BLOB_SIZE {
+    if !blob.len().is_multiple_of(BYTES_PER_F32) {
         bail!(
-            "expected {EXPECTED_BLOB_SIZE} bytes for {EMBEDDING_DIM}-dim f32 embedding, got {}",
+            "embedding blob size {} is not a multiple of {BYTES_PER_F32}",
             blob.len()
         );
     }
@@ -38,36 +36,55 @@ pub struct RelatedResult {
     pub similarity: f64,
 }
 
-pub async fn connect(db_path: &Path) -> anyhow::Result<(libsql::Database, Connection)> {
+pub async fn connect(
+    db_path: &Path,
+    expected_dim: Option<usize>,
+) -> anyhow::Result<(libsql::Database, Connection)> {
     let db = libsql::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
-    init_schema(&conn).await?;
+    init_schema(&conn, expected_dim).await?;
     Ok((db, conn))
 }
 
-async fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS notes (
+        "CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS notes (
             path TEXT PRIMARY KEY,
             content_hash TEXT NOT NULL,
             updated_at INTEGER NOT NULL
-        );
+        );",
+    )
+    .await?;
 
-        CREATE TABLE IF NOT EXISTS chunks (
+    let dim = match expected_dim {
+        Some(dim) => {
+            validate_or_store_dim(conn, dim).await?;
+            dim
+        }
+        None => stored_dim(conn).await?.unwrap_or(1024),
+    };
+
+    let create_chunks = format!(
+        "CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
-            embedding F32_BLOB(1024)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
-
-",
+            embedding F32_BLOB({dim})
+        )"
+    );
+    conn.execute(&create_chunks, ()).await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path)",
+        (),
     )
     .await?;
 
-    // Vector index creation is separate since it uses special syntax
     let has_vector_idx = conn
         .query("SELECT 1 FROM sqlite_master WHERE name='chunks_idx'", ())
         .await?
@@ -83,6 +100,38 @@ async fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         .await?;
     }
 
+    Ok(())
+}
+
+async fn stored_dim(conn: &Connection) -> anyhow::Result<Option<usize>> {
+    let mut rows = conn
+        .query("SELECT value FROM metadata WHERE key = 'embedding_dim'", ())
+        .await?;
+    match rows.next().await? {
+        Some(row) => {
+            let val: String = row.get(0)?;
+            Ok(Some(val.parse().context("invalid stored embedding_dim")?))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn validate_or_store_dim(conn: &Connection, dim: usize) -> anyhow::Result<()> {
+    if let Some(existing) = stored_dim(conn).await? {
+        if existing != dim {
+            return Err(crate::error::NeedleError::DimensionMismatch {
+                db: existing,
+                provider: dim,
+            }
+            .into());
+        }
+    } else {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_dim', ?1)",
+            [dim.to_string()],
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -274,15 +323,19 @@ pub async fn search_related(
 mod tests {
     use super::*;
 
+    const TEST_DIM: usize = 1024;
+
     async fn test_db() -> (tempfile::TempDir, libsql::Database, Connection) {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (db, conn) = connect(&db_path).await.expect("connect failed");
+        let (db, conn) = connect(&db_path, Some(TEST_DIM))
+            .await
+            .expect("connect failed");
         (dir, db, conn)
     }
 
     fn dummy_embedding() -> Vec<f32> {
-        vec![0.0; 1024]
+        vec![0.0; TEST_DIM]
     }
 
     fn make_chunks(texts: &[&str]) -> Vec<(String, Vec<f32>)> {
@@ -433,31 +486,38 @@ mod tests {
     #[test]
     fn decode_embedding_converts_known_bytes() {
         #[allow(clippy::cast_precision_loss)]
-        let values: Vec<f32> = (0..EMBEDDING_DIM).map(|i| i as f32 * 0.1).collect();
+        let values: Vec<f32> = (0..TEST_DIM).map(|i| i as f32 * 0.1).collect();
         let blob: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let decoded = decode_embedding(&blob).expect("decode failed");
-        assert_eq!(decoded.len(), EMBEDDING_DIM);
+        assert_eq!(decoded.len(), TEST_DIM);
         for (a, b) in decoded.iter().zip(values.iter()) {
             assert!((a - b).abs() < f32::EPSILON);
         }
     }
 
     #[test]
-    fn decode_embedding_rejects_wrong_size() {
-        let blob = vec![0u8; 100];
+    fn decode_embedding_rejects_non_aligned_size() {
+        let blob = vec![0u8; 5];
         assert!(decode_embedding(&blob).is_err());
+    }
+
+    #[test]
+    fn decode_embedding_accepts_any_aligned_size() {
+        let blob = vec![0u8; 12]; // 3 floats
+        let decoded = decode_embedding(&blob).expect("decode failed");
+        assert_eq!(decoded.len(), 3);
     }
 
     #[tokio::test]
     async fn search_semantic_returns_results() {
         let (_dir, _db, conn) = test_db().await;
-        let embedding = vec![1.0; 1024];
+        let embedding = vec![1.0; TEST_DIM];
         let chunks = vec![("test content".to_owned(), embedding)];
         upsert_note(&conn, "note.md", "abc", &chunks)
             .await
             .expect("upsert failed");
 
-        let query_embedding = vec![1.0; 1024];
+        let query_embedding = vec![1.0; TEST_DIM];
         let results = search_semantic(&conn, &query_embedding, 10)
             .await
             .expect("search failed");
@@ -470,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn search_semantic_deduplicates_by_path() {
         let (_dir, _db, conn) = test_db().await;
-        let embedding = vec![1.0; 1024];
+        let embedding = vec![1.0; TEST_DIM];
         let chunks = vec![
             ("chunk one".to_owned(), embedding.clone()),
             ("chunk two".to_owned(), embedding),
@@ -479,7 +539,7 @@ mod tests {
             .await
             .expect("upsert failed");
 
-        let query_embedding = vec![1.0; 1024];
+        let query_embedding = vec![1.0; TEST_DIM];
         let results = search_semantic(&conn, &query_embedding, 10)
             .await
             .expect("search failed");
@@ -491,14 +551,14 @@ mod tests {
     async fn search_semantic_respects_limit() {
         let (_dir, _db, conn) = test_db().await;
         for i in 0..5 {
-            let embedding = vec![1.0; 1024];
+            let embedding = vec![1.0; TEST_DIM];
             let chunks = vec![(format!("content {i}"), embedding)];
             upsert_note(&conn, &format!("note{i}.md"), &format!("h{i}"), &chunks)
                 .await
                 .expect("upsert failed");
         }
 
-        let query_embedding = vec![1.0; 1024];
+        let query_embedding = vec![1.0; TEST_DIM];
         let results = search_semantic(&conn, &query_embedding, 2)
             .await
             .expect("search failed");
@@ -509,7 +569,7 @@ mod tests {
     #[tokio::test]
     async fn chunk_embeddings_for_path_returns_embeddings_in_order() {
         let (_dir, _db, conn) = test_db().await;
-        let mut emb_a = vec![1.0_f32; 1024];
+        let mut emb_a = vec![1.0_f32; TEST_DIM];
         let mut emb_b = vec![2.0_f32; 1024];
         emb_a[0] = 0.1;
         emb_b[0] = 0.2;
@@ -541,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn search_related_excludes_specified_path() {
         let (_dir, _db, conn) = test_db().await;
-        let embedding = vec![1.0; 1024];
+        let embedding = vec![1.0; TEST_DIM];
         upsert_note(
             &conn,
             "a.md",
@@ -574,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn search_related_deduplicates_by_path() {
         let (_dir, _db, conn) = test_db().await;
-        let embedding = vec![1.0; 1024];
+        let embedding = vec![1.0; TEST_DIM];
         upsert_note(
             &conn,
             "a.md",
