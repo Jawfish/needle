@@ -6,6 +6,15 @@ pub struct Cli {
     #[arg(long, env = "ZK_NOTEBOOK_DIR")]
     pub notes_dir: Option<PathBuf>,
 
+    #[arg(long, env = "NEEDLE_PROVIDER")]
+    pub provider: Option<String>,
+
+    #[arg(long, env = "NEEDLE_MODEL")]
+    pub model: Option<String>,
+
+    #[arg(long, env = "NEEDLE_API_BASE")]
+    pub api_base: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

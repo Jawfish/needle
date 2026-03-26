@@ -5,17 +5,37 @@ use serde::Deserialize;
 
 use crate::{error::NeedleError, hash, rank::RrfWeights};
 
+pub struct CliEmbedArgs {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api_base: Option<String>,
+}
+
 pub struct Config {
     pub notes_dir: PathBuf,
     pub db_path: PathBuf,
     pub tantivy_dir: PathBuf,
-    pub voyage_api_key: Option<String>,
+    pub embed: EmbedConfig,
     pub weights: RrfWeights,
+}
+
+pub struct EmbedConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api_base: Option<String>,
+    pub dim: Option<usize>,
+    pub voyage_api_key: Option<String>,
+    pub openai_api_key: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct FileConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    api_base: Option<String>,
+    dim: Option<usize>,
     voyage_api_key: Option<String>,
+    openai_api_key: Option<String>,
     notes_dir: Option<PathBuf>,
     w_semantic: Option<f64>,
     w_fts: Option<f64>,
@@ -33,16 +53,19 @@ impl Config {
     pub fn resolve(
         cli_notes_dir: Option<PathBuf>,
         cli_weights: CliWeights,
+        cli_embed: CliEmbedArgs,
     ) -> anyhow::Result<Self> {
-        Self::resolve_with(cli_notes_dir, cli_weights, load_file_config()?)
+        Self::resolve_with(cli_notes_dir, cli_weights, cli_embed, load_file_config()?)
     }
 
     fn resolve_with(
         cli_notes_dir: Option<PathBuf>,
         cli_weights: CliWeights,
+        cli_embed: CliEmbedArgs,
         file_config: FileConfig,
     ) -> anyhow::Result<Self> {
         let weights = resolve_weights(cli_weights, &file_config);
+        let embed = resolve_embed_config(cli_embed, &file_config);
 
         let notes_dir = cli_notes_dir
             .or_else(|| std::env::var("ZK_NOTEBOOK_DIR").ok().map(PathBuf::from))
@@ -52,10 +75,6 @@ impl Config {
         if !notes_dir.is_dir() {
             return Err(NeedleError::NotesDirectoryNotFound(notes_dir).into());
         }
-
-        let voyage_api_key = std::env::var("VOYAGE_API_KEY")
-            .ok()
-            .or(file_config.voyage_api_key);
 
         let db_dir = data_dir_for(&notes_dir)?;
         std::fs::create_dir_all(&db_dir)?;
@@ -67,9 +86,31 @@ impl Config {
             notes_dir,
             db_path,
             tantivy_dir,
-            voyage_api_key,
+            embed,
             weights,
         })
+    }
+}
+
+fn resolve_embed_config(cli: CliEmbedArgs, file: &FileConfig) -> EmbedConfig {
+    let env = |key: &str| std::env::var(key).ok();
+
+    EmbedConfig {
+        provider: cli
+            .provider
+            .or_else(|| env("NEEDLE_PROVIDER"))
+            .or_else(|| file.provider.clone()),
+        model: cli
+            .model
+            .or_else(|| env("NEEDLE_MODEL"))
+            .or_else(|| file.model.clone()),
+        api_base: cli
+            .api_base
+            .or_else(|| env("NEEDLE_API_BASE"))
+            .or_else(|| file.api_base.clone()),
+        dim: env("NEEDLE_DIM").and_then(|s| s.parse().ok()).or(file.dim),
+        voyage_api_key: env("VOYAGE_API_KEY").or_else(|| file.voyage_api_key.clone()),
+        openai_api_key: env("OPENAI_API_KEY").or_else(|| file.openai_api_key.clone()),
     }
 }
 
@@ -206,7 +247,48 @@ mod tests {
             filename: None,
         };
 
-        let result = Config::resolve_with(Some(bad_dir), cli_weights, FileConfig::default());
+        let cli_embed = CliEmbedArgs {
+            provider: None,
+            model: None,
+            api_base: None,
+        };
+
+        let result =
+            Config::resolve_with(Some(bad_dir), cli_weights, cli_embed, FileConfig::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_embed_args_override_file_config() {
+        let file_config = FileConfig {
+            provider: Some("voyage".to_owned()),
+            model: Some("voyage-4".to_owned()),
+            ..Default::default()
+        };
+
+        let cli_embed = CliEmbedArgs {
+            provider: Some("openai".to_owned()),
+            model: None,
+            api_base: None,
+        };
+
+        let embed = resolve_embed_config(cli_embed, &file_config);
+        assert_eq!(embed.provider.as_deref(), Some("openai"));
+        assert_eq!(embed.model.as_deref(), Some("voyage-4"));
+    }
+
+    #[test]
+    fn embed_config_defaults_to_none() {
+        let cli_embed = CliEmbedArgs {
+            provider: None,
+            model: None,
+            api_base: None,
+        };
+
+        let embed = resolve_embed_config(cli_embed, &FileConfig::default());
+        assert!(embed.provider.is_none());
+        assert!(embed.model.is_none());
+        assert!(embed.api_base.is_none());
+        assert!(embed.dim.is_none());
     }
 }
