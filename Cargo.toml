@@ -5,7 +5,12 @@ edition = "2024"
 license = "MIT"
 publish = false
 
+[features]
+default = ["local"]
+local = ["dep:fastembed"]
+
 [dependencies]
+fastembed = { version = "5", optional = true }
 anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive", "env"] }
 libsql = "0.9.30"
