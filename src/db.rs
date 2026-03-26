@@ -33,6 +33,11 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+pub struct RelatedResult {
+    pub path: String,
+    pub similarity: f64,
+}
+
 pub async fn connect(db_path: &Path) -> anyhow::Result<(libsql::Database, Connection)> {
     let db = libsql::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
@@ -190,6 +195,72 @@ pub async fn search_semantic(
         results.push(SearchResult {
             path,
             snippet: content,
+        });
+        if results.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(results)
+}
+
+pub async fn chunk_embeddings_for_path(
+    conn: &Connection,
+    path: &str,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let mut rows = conn
+        .query(
+            "SELECT embedding FROM chunks WHERE path = ?1 AND embedding IS NOT NULL ORDER BY chunk_index",
+            [path],
+        )
+        .await?;
+
+    let mut embeddings = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let blob: Vec<u8> = row.get(0)?;
+        match decode_embedding(&blob) {
+            Ok(emb) => embeddings.push(emb),
+            Err(err) => tracing::warn!(path, %err, "skipping chunk with corrupt embedding"),
+        }
+    }
+    Ok(embeddings)
+}
+
+pub async fn search_related(
+    conn: &Connection,
+    query_embedding: &[f32],
+    exclude_path: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<RelatedResult>> {
+    let embedding_json = serde_json::to_string(query_embedding)?;
+
+    let mut rows = conn
+        .query(
+            "SELECT c.path, vector_distance_cos(c.embedding, vector32(?1)) AS distance
+             FROM vector_top_k('chunks_idx', vector32(?1), ?2) AS v
+             JOIN chunks c ON c.rowid = v.id
+             ORDER BY distance ASC",
+            libsql::params![
+                embedding_json,
+                i64::try_from(limit.saturating_mul(5)).unwrap_or(i64::MAX)
+            ],
+        )
+        .await?;
+
+    let mut seen = HashSet::new();
+    let mut results = Vec::new();
+
+    while let Some(row) = rows.next().await? {
+        let path: String = row.get(0)?;
+        let distance: f64 = row.get(1)?;
+
+        if path == exclude_path || seen.contains(&path) {
+            continue;
+        }
+        seen.insert(path.clone());
+        results.push(RelatedResult {
+            path,
+            similarity: 1.0 - distance,
         });
         if results.len() >= limit {
             break;
@@ -433,5 +504,101 @@ mod tests {
             .expect("search failed");
 
         assert!(results.len() <= 2, "should respect limit");
+    }
+
+    #[tokio::test]
+    async fn chunk_embeddings_for_path_returns_embeddings_in_order() {
+        let (_dir, _db, conn) = test_db().await;
+        let mut emb_a = vec![1.0_f32; 1024];
+        let mut emb_b = vec![2.0_f32; 1024];
+        emb_a[0] = 0.1;
+        emb_b[0] = 0.2;
+        let chunks = vec![
+            ("chunk one".to_owned(), emb_a),
+            ("chunk two".to_owned(), emb_b),
+        ];
+        upsert_note(&conn, "note.md", "abc", &chunks)
+            .await
+            .expect("upsert failed");
+
+        let embeddings = chunk_embeddings_for_path(&conn, "note.md")
+            .await
+            .expect("query failed");
+        assert_eq!(embeddings.len(), 2);
+        assert!((embeddings[0][0] - 0.1).abs() < f32::EPSILON);
+        assert!((embeddings[1][0] - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn chunk_embeddings_for_path_returns_empty_for_missing_path() {
+        let (_dir, _db, conn) = test_db().await;
+        let embeddings = chunk_embeddings_for_path(&conn, "nonexistent.md")
+            .await
+            .expect("query failed");
+        assert!(embeddings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_related_excludes_specified_path() {
+        let (_dir, _db, conn) = test_db().await;
+        let embedding = vec![1.0; 1024];
+        upsert_note(
+            &conn,
+            "a.md",
+            "h1",
+            &[("content a".to_owned(), embedding.clone())],
+        )
+        .await
+        .expect("upsert failed");
+        upsert_note(
+            &conn,
+            "b.md",
+            "h2",
+            &[("content b".to_owned(), embedding.clone())],
+        )
+        .await
+        .expect("upsert failed");
+
+        let results = search_related(&conn, &embedding, "a.md", 10)
+            .await
+            .expect("search failed");
+
+        assert!(
+            results.iter().all(|r| r.path != "a.md"),
+            "should exclude the queried path"
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "b.md");
+    }
+
+    #[tokio::test]
+    async fn search_related_deduplicates_by_path() {
+        let (_dir, _db, conn) = test_db().await;
+        let embedding = vec![1.0; 1024];
+        upsert_note(
+            &conn,
+            "a.md",
+            "h1",
+            &[("content a".to_owned(), embedding.clone())],
+        )
+        .await
+        .expect("upsert failed");
+        upsert_note(
+            &conn,
+            "b.md",
+            "h2",
+            &[
+                ("chunk 1".to_owned(), embedding.clone()),
+                ("chunk 2".to_owned(), embedding.clone()),
+            ],
+        )
+        .await
+        .expect("upsert failed");
+
+        let results = search_related(&conn, &embedding, "a.md", 10)
+            .await
+            .expect("search failed");
+
+        assert_eq!(results.len(), 1, "should deduplicate chunks from same path");
     }
 }

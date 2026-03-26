@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use libsql::Connection;
 
-use crate::db;
+use crate::{db, error::NeedleError};
 
 pub struct SimilarPair {
     pub similarity: f64,
@@ -10,7 +10,7 @@ pub struct SimilarPair {
     pub path_b: String,
 }
 
-fn average_embeddings(embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
+pub fn average_embeddings(embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
     let dim = embeddings.first()?.len();
     let mut acc = vec![0.0_f64; dim];
     for emb in embeddings {
@@ -25,7 +25,7 @@ fn average_embeddings(embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
     Some(result)
 }
 
-fn normalize(v: &mut [f32]) {
+pub fn normalize(v: &mut [f32]) {
     let norm_sq: f64 = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
     let norm = norm_sq.sqrt();
     if norm > f64::EPSILON {
@@ -219,6 +219,18 @@ fn flush_document(
         docs.push((std::mem::take(path), avg));
     }
     chunks.clear();
+}
+
+pub async fn find_related(
+    conn: &Connection,
+    path: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<db::RelatedResult>> {
+    let chunks = db::chunk_embeddings_for_path(conn, path).await?;
+    let mut avg =
+        average_embeddings(&chunks).ok_or_else(|| NeedleError::NoteNotEmbedded(path.to_owned()))?;
+    normalize(&mut avg);
+    db::search_related(conn, &avg, path, limit).await
 }
 
 #[cfg(test)]
@@ -492,5 +504,60 @@ mod tests {
         assert_eq!(pairs[0].path_a, "a.md");
         assert_eq!(pairs[0].path_b, "b.md");
         assert!(pairs[0].similarity > 0.99);
+    }
+
+    #[tokio::test]
+    async fn find_related_returns_similar_documents() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (_db, conn) = db::connect(&db_path).await.expect("connect failed");
+
+        let emb_a = vec![1.0_f32; EMBEDDING_DIM];
+        let emb_b = vec![1.0_f32; EMBEDDING_DIM];
+        let mut emb_c = vec![0.0_f32; EMBEDDING_DIM];
+        emb_c[0] = 1.0;
+
+        db::upsert_note(&conn, "a.md", "h1", &[("content a".to_owned(), emb_a)])
+            .await
+            .expect("upsert failed");
+        db::upsert_note(&conn, "b.md", "h2", &[("content b".to_owned(), emb_b)])
+            .await
+            .expect("upsert failed");
+        db::upsert_note(&conn, "c.md", "h3", &[("content c".to_owned(), emb_c)])
+            .await
+            .expect("upsert failed");
+
+        let results = find_related(&conn, "a.md", 10).await.expect("find failed");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].path, "b.md");
+        assert!(results[0].similarity > 0.99);
+    }
+
+    #[tokio::test]
+    async fn find_related_excludes_self() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (_db, conn) = db::connect(&db_path).await.expect("connect failed");
+
+        let emb = vec![1.0_f32; EMBEDDING_DIM];
+        db::upsert_note(&conn, "a.md", "h1", &[("content".to_owned(), emb)])
+            .await
+            .expect("upsert failed");
+
+        let results = find_related(&conn, "a.md", 10).await.expect("find failed");
+        assert!(
+            results.iter().all(|r| r.path != "a.md"),
+            "should not include the queried document"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_related_errors_for_missing_path() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (_db, conn) = db::connect(&db_path).await.expect("connect failed");
+
+        let result = find_related(&conn, "nonexistent.md", 10).await;
+        assert!(result.is_err());
     }
 }

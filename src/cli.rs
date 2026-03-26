@@ -16,9 +16,11 @@ pub enum Command {
     Watch,
     /// Search notes using fused ranking (semantic + FTS + filename)
     Search {
-        query: String,
+        query: Option<String>,
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        #[arg(short, long)]
+        paths_only: bool,
         #[arg(long, env = "NEEDLE_W_SEMANTIC")]
         w_semantic: Option<f64>,
         #[arg(long, env = "NEEDLE_W_FTS")]
@@ -34,6 +36,16 @@ pub enum Command {
         limit: usize,
         #[arg(long)]
         group: bool,
+        #[arg(short, long)]
+        paths_only: bool,
+    },
+    /// Find documents related to a specific note
+    Related {
+        path: String,
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        #[arg(short, long)]
+        paths_only: bool,
     },
     /// Reindex all notes
     Reindex,

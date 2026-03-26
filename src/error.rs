@@ -13,4 +13,7 @@ pub enum NeedleError {
 
     #[error("embedding count mismatch: expected {expected}, got {actual}")]
     EmbeddingCountMismatch { expected: usize, actual: usize },
+
+    #[error("note has no embeddings: {0}")]
+    NoteNotEmbedded(String),
 }
