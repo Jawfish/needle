@@ -5,7 +5,7 @@ use libsql::Connection;
 
 use crate::{
     db,
-    embed::{self, VoyageClient},
+    embed::{self, Embedder},
     fts::FtsIndex,
     hash,
 };
@@ -45,7 +45,7 @@ struct PendingFile {
 pub async fn index_directory(
     conn: &Connection,
     fts: &FtsIndex,
-    client: &VoyageClient,
+    embedder: &Embedder,
     notes_dir: &Path,
 ) -> anyhow::Result<IndexStats> {
     let existing_hashes = db::all_note_hashes(conn).await?;
@@ -92,7 +92,7 @@ pub async fn index_directory(
     let embed_result = if pending.is_empty() {
         Ok(())
     } else {
-        embed_and_write_pending(conn, client, &pending).await
+        embed_and_write_pending(conn, embedder, &pending).await
     };
 
     // Always rebuild FTS from authoritative DB state
@@ -116,7 +116,7 @@ pub async fn index_directory(
 pub async fn index_single_file(
     conn: &Connection,
     fts: &FtsIndex,
-    client: &VoyageClient,
+    embedder: &Embedder,
     notes_dir: &Path,
     abs_path: &Path,
 ) -> anyhow::Result<FtsStatus> {
@@ -137,7 +137,7 @@ pub async fn index_single_file(
 
     let chunks = embed::chunk_text(&content);
     let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
-    let embeddings = client.embed_documents(&chunk_refs).await?;
+    let embeddings = embedder.embed_documents(&chunk_refs).await?;
 
     let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
     db::upsert_note(conn, &rel_path, &file_hash, &paired).await?;
@@ -156,7 +156,7 @@ pub async fn index_single_file(
 
 async fn embed_and_write_pending(
     conn: &Connection,
-    client: &VoyageClient,
+    embedder: &Embedder,
     pending: &[PendingFile],
 ) -> anyhow::Result<()> {
     let total_chunks: usize = pending.iter().map(|f| f.chunks.len()).sum();
@@ -168,7 +168,7 @@ async fn embed_and_write_pending(
             .flat_map(|f| f.chunks.iter().map(String::as_str))
             .collect();
 
-        let batch_embeddings = client.embed_documents(&batch_texts).await?;
+        let batch_embeddings = embedder.embed_documents(&batch_texts).await?;
 
         let mut offset = 0;
         for file in file_batch {
@@ -331,14 +331,14 @@ mod tests {
         create_file(notes_dir.path(), ".hidden/secret.md");
 
         let db_dir = tempfile::tempdir().expect("tempdir");
-        let (_db, conn) = db::connect(&db_dir.path().join("test.db"))
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
             .await
             .expect("connect");
 
         let fts_dir = tempfile::tempdir().expect("tempdir");
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
 
-        let client = embed::VoyageClient::create_null();
+        let client = embed::Embedder::create_null(1024);
 
         let stats = index_directory(&conn, &fts, &client, notes_dir.path())
             .await
@@ -360,14 +360,14 @@ mod tests {
         create_file(notes_dir.path(), "note.md");
 
         let db_dir = tempfile::tempdir().expect("tempdir");
-        let (_db, conn) = db::connect(&db_dir.path().join("test.db"))
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
             .await
             .expect("connect");
 
         let fts_dir = tempfile::tempdir().expect("tempdir");
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
 
-        let client = embed::VoyageClient::create_null();
+        let client = embed::Embedder::create_null(1024);
 
         let first = index_directory(&conn, &fts, &client, notes_dir.path())
             .await
@@ -388,14 +388,14 @@ mod tests {
         create_file(notes_dir.path(), "remove.md");
 
         let db_dir = tempfile::tempdir().expect("tempdir");
-        let (_db, conn) = db::connect(&db_dir.path().join("test.db"))
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
             .await
             .expect("connect");
 
         let fts_dir = tempfile::tempdir().expect("tempdir");
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
 
-        let client = embed::VoyageClient::create_null();
+        let client = embed::Embedder::create_null(1024);
 
         index_directory(&conn, &fts, &client, notes_dir.path())
             .await

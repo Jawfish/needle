@@ -16,8 +16,8 @@ use clap::Parser;
 
 use crate::{
     cli::{Cli, Command},
-    config::{CliWeights, Config},
-    embed::VoyageClient,
+    config::{CliEmbedArgs, CliWeights, Config},
+    embed::Embedder,
     error::NeedleError,
 };
 
@@ -27,8 +27,8 @@ async fn main() -> anyhow::Result<()> {
     run(Cli::parse()).await
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    let cli_weights = match &cli.command {
+const fn extract_cli_weights(command: &Command) -> CliWeights {
+    match command {
         Command::Search {
             w_semantic,
             w_fts,
@@ -44,21 +44,35 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             fts: None,
             filename: None,
         },
-    };
+    }
+}
 
-    let config = Config::resolve(cli.notes_dir, cli_weights)?;
-    let (_db, conn) = db::connect(&config.db_path).await?;
-    let client = config
-        .voyage_api_key
-        .as_deref()
-        .map(VoyageClient::new)
-        .transpose()?;
+async fn run(cli: Cli) -> anyhow::Result<()> {
+    let cli_weights = extract_cli_weights(&cli.command);
+    let cli_embed = CliEmbedArgs {
+        provider: cli.provider,
+        model: cli.model,
+        api_base: cli.api_base,
+    };
+    let config = Config::resolve(cli.notes_dir, cli_weights, cli_embed)?;
+
+    let needs_embedder = matches!(
+        cli.command,
+        Command::Watch | Command::Reindex | Command::Search { .. }
+    );
+    let embedder = if needs_embedder {
+        Some(Embedder::from_config(&config.embed)?)
+    } else {
+        None
+    };
+    let dim = embedder.as_ref().map(Embedder::dim);
+    let (_db, conn) = db::connect(&config.db_path, dim).await?;
 
     match cli.command {
         Command::Watch => {
             let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-            let client = client.as_ref().ok_or(NeedleError::MissingApiKey)?;
-            watch::run_watcher(conn, fts, client, config.notes_dir).await?;
+            let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
+            watch::run_watcher(conn, fts, &embedder, config.notes_dir).await?;
         }
         Command::Search {
             query,
@@ -72,8 +86,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 std::io::stdin().is_terminal(),
             )?;
             let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-            let results =
-                rank::search(&conn, &fts, client.as_ref(), &query, limit, &config.weights).await?;
+            let results = rank::search(
+                &conn,
+                &fts,
+                embedder.as_ref(),
+                &query,
+                limit,
+                &config.weights,
+            )
+            .await?;
             if paths_only {
                 for result in &results {
                     println!("{}", result.path);
@@ -117,8 +138,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Reindex => {
             let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-            let client = client.as_ref().ok_or(NeedleError::MissingApiKey)?;
-            let stats = index::index_directory(&conn, &fts, client, &config.notes_dir).await?;
+            let embedder = embedder.as_ref().ok_or(NeedleError::NoEmbeddingProvider)?;
+            let stats = index::index_directory(&conn, &fts, embedder, &config.notes_dir).await?;
             tracing::info!(%stats, "reindex complete");
         }
     }
@@ -130,12 +151,7 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
-fn print_similar(
-    pairs: Vec<similar::SimilarPair>,
-    limit: usize,
-    group: bool,
-    paths_only: bool,
-) {
+fn print_similar(pairs: Vec<similar::SimilarPair>, limit: usize, group: bool, paths_only: bool) {
     if group {
         let mut groups = similar::group_pairs(pairs);
         groups.truncate(limit);

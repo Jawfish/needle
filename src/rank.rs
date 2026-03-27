@@ -6,7 +6,7 @@ use nucleo::{
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
 };
 
-use crate::{db, embed::VoyageClient, error::NeedleError, fts::FtsIndex};
+use crate::{db, embed::Embedder, error::NeedleError, fts::FtsIndex};
 
 const RRF_K: f64 = 60.0;
 
@@ -35,7 +35,7 @@ pub struct FusedResult {
 pub async fn search(
     conn: &Connection,
     fts: &FtsIndex,
-    client: Option<&VoyageClient>,
+    embedder: Option<&Embedder>,
     query: &str,
     limit: usize,
     weights: &RrfWeights,
@@ -43,8 +43,8 @@ pub async fn search(
     let candidate_limit = limit.saturating_mul(5);
 
     let semantic_ranked = if weights.semantic > 0.0 {
-        let client = client.ok_or(NeedleError::MissingApiKey)?;
-        let embedding = client.embed_query(query).await?;
+        let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
+        let embedding = embedder.embed_query(query).await?;
         db::search_semantic(conn, &embedding, candidate_limit).await?
     } else {
         Vec::new()
@@ -352,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn search_fuses_fts_and_filename_signals() {
         let db_dir = tempfile::tempdir().expect("tempdir");
-        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"))
+        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"), Some(1024))
             .await
             .expect("connect");
 
@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn search_works_without_api_key_when_semantic_is_zero() {
         let db_dir = tempfile::tempdir().expect("tempdir");
-        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"))
+        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"), Some(1024))
             .await
             .expect("connect");
 
@@ -446,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn search_requires_api_key_when_semantic_is_positive() {
         let db_dir = tempfile::tempdir().expect("tempdir");
-        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"))
+        let (_db, conn) = crate::db::connect(&db_dir.path().join("test.db"), Some(1024))
             .await
             .expect("connect");
 

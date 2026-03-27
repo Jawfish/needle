@@ -480,7 +480,9 @@ mod tests {
     async fn find_similar_with_test_database() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path).await.expect("connect failed");
+        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+            .await
+            .expect("connect failed");
 
         let emb_a = vec![1.0_f32; EMBEDDING_DIM];
         let emb_b = vec![1.0_f32; EMBEDDING_DIM];
@@ -510,7 +512,9 @@ mod tests {
     async fn find_related_returns_similar_documents() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path).await.expect("connect failed");
+        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+            .await
+            .expect("connect failed");
 
         let emb_a = vec![1.0_f32; EMBEDDING_DIM];
         let emb_b = vec![1.0_f32; EMBEDDING_DIM];
@@ -537,7 +541,9 @@ mod tests {
     async fn find_related_excludes_self() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path).await.expect("connect failed");
+        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+            .await
+            .expect("connect failed");
 
         let emb = vec![1.0_f32; EMBEDDING_DIM];
         db::upsert_note(&conn, "a.md", "h1", &[("content".to_owned(), emb)])
@@ -555,7 +561,9 @@ mod tests {
     async fn find_related_errors_for_missing_path() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path).await.expect("connect failed");
+        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+            .await
+            .expect("connect failed");
 
         let result = find_related(&conn, "nonexistent.md", 10).await;
         assert!(result.is_err());

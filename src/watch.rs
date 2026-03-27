@@ -8,18 +8,18 @@ use libsql::Connection;
 use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use crate::{db, embed::VoyageClient, fts::FtsIndex, index};
+use crate::{db, embed::Embedder, fts::FtsIndex, index};
 
 const DEBOUNCE_MS: u64 = 500;
 
 pub async fn run_watcher(
     conn: Connection,
     fts: FtsIndex,
-    client: &VoyageClient,
+    embedder: &Embedder,
     notes_dir: PathBuf,
 ) -> anyhow::Result<()> {
     tracing::info!(dir = %notes_dir.display(), "initial indexing");
-    let stats = index::index_directory(&conn, &fts, client, &notes_dir).await?;
+    let stats = index::index_directory(&conn, &fts, embedder, &notes_dir).await?;
     tracing::info!(%stats, "initial index complete");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
@@ -70,7 +70,7 @@ pub async fn run_watcher(
         }
 
         if !changed.is_empty() {
-            process_batch(&conn, &fts, client, &notes_dir, &changed).await;
+            process_batch(&conn, &fts, embedder, &notes_dir, &changed).await;
         }
     }
 
@@ -80,7 +80,7 @@ pub async fn run_watcher(
 async fn process_batch(
     conn: &Connection,
     fts: &FtsIndex,
-    client: &VoyageClient,
+    embedder: &Embedder,
     notes_dir: &Path,
     changed: &HashSet<PathBuf>,
 ) {
@@ -88,7 +88,7 @@ async fn process_batch(
 
     for path in changed {
         if path.exists() {
-            match index::index_single_file(conn, fts, client, notes_dir, path).await {
+            match index::index_single_file(conn, fts, embedder, notes_dir, path).await {
                 Ok(index::FtsStatus::Current) => {}
                 Ok(index::FtsStatus::Stale) => needs_fts_reconcile = true,
                 Err(e) => tracing::error!(path = %path.display(), error = %e, "failed to index"),
@@ -146,17 +146,16 @@ mod tests {
         Connection,
         tempfile::TempDir,
         FtsIndex,
-        VoyageClient,
+        Embedder,
     ) {
         let db_dir = tempfile::tempdir().expect("tempdir");
-        let (db, conn) = db::connect(&db_dir.path().join("test.db"))
+        let (db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
             .await
             .expect("connect");
         let fts_dir = tempfile::tempdir().expect("tempdir");
         let fts = FtsIndex::open_or_create(fts_dir.path()).expect("fts");
-        let client = embed::VoyageClient::create_null();
+        let client = embed::Embedder::create_null(1024);
 
-        // Initial index to populate DB and FTS
         index::index_directory(&conn, &fts, &client, notes_dir)
             .await
             .expect("initial index");
