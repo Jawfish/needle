@@ -187,6 +187,8 @@ fn print_similar(pairs: Vec<similar::SimilarPair>, limit: usize, group: bool, pa
     }
 }
 
+const STDIN_QUERY_LIMIT_BYTES: u64 = 1024 * 1024; // 1 MiB
+
 fn resolve_query(
     explicit: Option<String>,
     reader: &mut impl Read,
@@ -199,7 +201,9 @@ fn resolve_query(
         anyhow::bail!("no query provided; pass as argument or pipe to stdin");
     }
     let mut buf = String::new();
-    reader.read_to_string(&mut buf)?;
+    reader
+        .take(STDIN_QUERY_LIMIT_BYTES)
+        .read_to_string(&mut buf)?;
     let trimmed = buf.trim().to_owned();
     if trimmed.is_empty() {
         anyhow::bail!("empty query from stdin");
@@ -257,5 +261,18 @@ mod tests {
         let mut reader = Cursor::new(b"   \n  ");
         let result = resolve_query(None, &mut reader, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_query_truncates_stdin_at_limit_and_still_returns_content() {
+        // Input larger than STDIN_QUERY_LIMIT_BYTES should not OOM or error;
+        // the leading content within the limit is accepted as the query.
+        let limit_bytes = usize::try_from(STDIN_QUERY_LIMIT_BYTES).expect("limit fits usize");
+        let big_input = vec![b'x'; limit_bytes + 1];
+        let mut reader = Cursor::new(big_input);
+        let result = resolve_query(None, &mut reader, false);
+        assert!(result.is_ok(), "oversized stdin should not error");
+        let query = result.expect("should succeed");
+        assert_eq!(query.len(), limit_bytes);
     }
 }
