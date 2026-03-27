@@ -174,6 +174,10 @@ pub async fn find_similar(
     threshold: f64,
     limit: Option<usize>,
 ) -> anyhow::Result<Vec<SimilarPair>> {
+    if !db::chunks_table_exists(conn).await? {
+        return Ok(vec![]);
+    }
+
     let mut rows = conn
         .query(
             "SELECT path, embedding FROM chunks WHERE embedding IS NOT NULL ORDER BY path",
@@ -474,6 +478,22 @@ mod tests {
         let groups = group_pairs(pairs);
         let sims: Vec<f64> = groups[0].pairs.iter().map(|p| p.similarity).collect();
         assert_eq!(sims, vec![0.95, 0.90, 0.85]);
+    }
+
+    #[tokio::test]
+    async fn find_similar_on_fresh_db_without_embedder_returns_empty() {
+        // Regression: similar must not error when run on a fresh DB that was opened
+        // without an embedder dim (i.e. no chunks table exists yet).
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (_db, conn) = db::connect(&db_path, None)
+            .await
+            .expect("connect without dim should succeed");
+
+        let pairs = find_similar(&conn, 0.9, Some(10))
+            .await
+            .expect("find_similar on fresh db should return empty, not error");
+        assert!(pairs.is_empty());
     }
 
     #[tokio::test]
