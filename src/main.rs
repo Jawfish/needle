@@ -27,6 +27,14 @@ async fn main() -> anyhow::Result<()> {
     run(Cli::parse()).await
 }
 
+fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool {
+    match command {
+        Command::Watch | Command::Reindex => true,
+        Command::Search { .. } => weights.semantic > 0.0,
+        _ => false,
+    }
+}
+
 const fn extract_cli_weights(command: &Command) -> CliWeights {
     match command {
         Command::Search {
@@ -56,11 +64,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let config = Config::resolve(cli.notes_dir, cli_weights, cli_embed)?;
 
-    let needs_embedder = matches!(
-        cli.command,
-        Command::Watch | Command::Reindex | Command::Search { .. }
-    );
-    let embedder = if needs_embedder {
+    let embedder = if search_needs_embedder(&cli.command, &config.weights) {
         Some(Embedder::from_config(&config.embed)?)
     } else {
         None
@@ -274,5 +278,74 @@ mod tests {
         assert!(result.is_ok(), "oversized stdin should not error");
         let query = result.expect("should succeed");
         assert_eq!(query.len(), limit_bytes);
+    }
+
+    fn search_command(w_semantic: Option<f64>) -> Command {
+        Command::Search {
+            query: None,
+            limit: 10,
+            paths_only: false,
+            w_semantic,
+            w_fts: None,
+            w_filename: None,
+        }
+    }
+
+    #[test]
+    fn search_with_positive_semantic_weight_needs_embedder() {
+        let weights = rank::RrfWeights {
+            semantic: 1.5,
+            fts: 1.0,
+            filename: 0.7,
+        };
+        assert!(search_needs_embedder(&search_command(None), &weights));
+    }
+
+    #[test]
+    fn search_with_zero_semantic_weight_does_not_need_embedder() {
+        let weights = rank::RrfWeights {
+            semantic: 0.0,
+            fts: 1.0,
+            filename: 0.7,
+        };
+        assert!(!search_needs_embedder(&search_command(None), &weights));
+    }
+
+    #[test]
+    fn watch_always_needs_embedder() {
+        let weights = rank::RrfWeights {
+            semantic: 0.0,
+            fts: 0.0,
+            filename: 0.0,
+        };
+        assert!(search_needs_embedder(&Command::Watch, &weights));
+    }
+
+    #[test]
+    fn reindex_always_needs_embedder() {
+        let weights = rank::RrfWeights {
+            semantic: 0.0,
+            fts: 0.0,
+            filename: 0.0,
+        };
+        assert!(search_needs_embedder(&Command::Reindex, &weights));
+    }
+
+    #[test]
+    fn similar_never_needs_embedder() {
+        let weights = rank::RrfWeights {
+            semantic: 1.5,
+            fts: 1.0,
+            filename: 0.7,
+        };
+        assert!(!search_needs_embedder(
+            &Command::Similar {
+                threshold: 0.85,
+                limit: 50,
+                group: false,
+                paths_only: false,
+            },
+            &weights
+        ));
     }
 }
