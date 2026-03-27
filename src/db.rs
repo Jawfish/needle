@@ -275,6 +275,10 @@ pub async fn chunk_embeddings_for_path(
     Ok(embeddings)
 }
 
+// Upper bound on how many index candidates search_related will ever request.
+// Prevents unbounded growth if the index is very large and results are scarce.
+const RELATED_MAX_K: usize = 100_000;
+
 pub async fn search_related(
     conn: &Connection,
     query_embedding: &[f32],
@@ -283,40 +287,53 @@ pub async fn search_related(
 ) -> anyhow::Result<Vec<RelatedResult>> {
     let embedding_json = serde_json::to_string(query_embedding)?;
 
-    let mut rows = conn
-        .query(
-            "SELECT c.path, vector_distance_cos(c.embedding, vector32(?1)) AS distance
-             FROM vector_top_k('chunks_idx', vector32(?1), ?2) AS v
-             JOIN chunks c ON c.rowid = v.id
-             ORDER BY distance ASC",
-            libsql::params![
-                embedding_json,
-                i64::try_from(limit.saturating_mul(5)).unwrap_or(i64::MAX)
-            ],
-        )
-        .await?;
+    // Start with a modest candidate pool and double until we have enough distinct
+    // non-excluded results or we hit the index ceiling. The excluded note's chunks
+    // can dominate the top-K when it is long, so a fixed small multiplier silently
+    // drops valid related documents.
+    let mut k = limit.saturating_mul(5).max(20);
 
-    let mut seen = HashSet::new();
-    let mut results = Vec::new();
+    loop {
+        let k_param = i64::try_from(k).unwrap_or(i64::MAX);
+        let mut rows = conn
+            .query(
+                "SELECT c.path, vector_distance_cos(c.embedding, vector32(?1)) AS distance
+                 FROM vector_top_k('chunks_idx', vector32(?1), ?2) AS v
+                 JOIN chunks c ON c.rowid = v.id
+                 ORDER BY distance ASC",
+                libsql::params![embedding_json.clone(), k_param],
+            )
+            .await?;
 
-    while let Some(row) = rows.next().await? {
-        let path: String = row.get(0)?;
-        let distance: f64 = row.get(1)?;
+        let mut seen = HashSet::new();
+        let mut results = Vec::new();
+        let mut total_candidates = 0usize;
 
-        if path == exclude_path || seen.contains(&path) {
-            continue;
+        while let Some(row) = rows.next().await? {
+            total_candidates += 1;
+            let path: String = row.get(0)?;
+            let distance: f64 = row.get(1)?;
+
+            if path == exclude_path || seen.contains(&path) {
+                continue;
+            }
+            seen.insert(path.clone());
+            results.push(RelatedResult {
+                path,
+                similarity: 1.0 - distance,
+            });
+            if results.len() >= limit {
+                break;
+            }
         }
-        seen.insert(path.clone());
-        results.push(RelatedResult {
-            path,
-            similarity: 1.0 - distance,
-        });
-        if results.len() >= limit {
-            break;
+
+        let exhausted_index = total_candidates < k;
+        if results.len() >= limit || exhausted_index || k >= RELATED_MAX_K {
+            return Ok(results);
         }
+
+        k = k.saturating_mul(2).min(RELATED_MAX_K);
     }
-
-    Ok(results)
 }
 
 #[cfg(test)]
@@ -629,6 +646,43 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "b.md");
+    }
+
+    #[tokio::test]
+    async fn search_related_finds_results_when_excluded_note_dominates_candidates() {
+        // Reproduce: excluded note has many chunks that fill the initial candidate
+        // pool, leaving no room for other documents. The adaptive loop must expand K
+        // until the other document appears.
+        let (_dir, _db, conn) = test_db().await;
+        let embedding = vec![1.0; TEST_DIM];
+
+        // "source.md" has 12 chunks -- more than limit(1) * 5 = 5 initial candidates.
+        let source_chunks: Vec<(String, Vec<f32>)> = (0..12)
+            .map(|i| (format!("source chunk {i}"), embedding.clone()))
+            .collect();
+        upsert_note(&conn, "source.md", "h_src", &source_chunks)
+            .await
+            .expect("upsert failed");
+
+        upsert_note(
+            &conn,
+            "other.md",
+            "h_other",
+            &[("other content".to_owned(), embedding.clone())],
+        )
+        .await
+        .expect("upsert failed");
+
+        let results = search_related(&conn, &embedding, "source.md", 1)
+            .await
+            .expect("search failed");
+
+        assert_eq!(
+            results.len(),
+            1,
+            "should find the other document despite excluded note dominating candidates"
+        );
+        assert_eq!(results[0].path, "other.md");
     }
 
     #[tokio::test]
