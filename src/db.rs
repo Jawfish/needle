@@ -61,12 +61,12 @@ async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::
     )
     .await?;
 
-    let dim = match expected_dim {
-        Some(dim) => {
-            validate_or_store_dim(conn, dim).await?;
-            dim
-        }
-        None => stored_dim(conn).await?.unwrap_or(1024),
+    // When neither the caller nor stored metadata can supply a dimension (fresh DB
+    // opened by a read-only command like `similar`) skip chunks infrastructure
+    // entirely. Writing a guessed dimension here would permanently corrupt the
+    // schema for the first real indexing run.
+    let Some(dim) = resolve_schema_dim(conn, expected_dim).await? else {
+        return Ok(());
     };
 
     let create_chunks = format!(
@@ -103,6 +103,45 @@ async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::
     Ok(())
 }
 
+// Returns the concrete dimension to use for the chunks schema, or None when
+// this is a fresh DB opened by a command that does not produce embeddings.
+async fn resolve_schema_dim(
+    conn: &Connection,
+    expected_dim: Option<usize>,
+) -> anyhow::Result<Option<usize>> {
+    let stored = stored_dim(conn).await?;
+
+    // Legacy/migration path: chunks table already exists but the metadata row
+    // was never written (older DB). Recover the dimension from the column
+    // definition and persist it so future opens do not need to re-infer.
+    let effective_stored = if stored.is_none() && chunks_table_exists(conn).await? {
+        let inferred = infer_dim_from_chunks_schema(conn).await?;
+        store_dim(conn, inferred).await?;
+        Some(inferred)
+    } else {
+        stored
+    };
+
+    match (expected_dim, effective_stored) {
+        (Some(expected), Some(stored)) => {
+            if expected != stored {
+                return Err(crate::error::NeedleError::DimensionMismatch {
+                    db: stored,
+                    provider: expected,
+                }
+                .into());
+            }
+            Ok(Some(expected))
+        }
+        (Some(expected), None) => {
+            store_dim(conn, expected).await?;
+            Ok(Some(expected))
+        }
+        (None, Some(stored)) => Ok(Some(stored)),
+        (None, None) => Ok(None),
+    }
+}
+
 async fn stored_dim(conn: &Connection) -> anyhow::Result<Option<usize>> {
     let mut rows = conn
         .query("SELECT value FROM metadata WHERE key = 'embedding_dim'", ())
@@ -116,23 +155,56 @@ async fn stored_dim(conn: &Connection) -> anyhow::Result<Option<usize>> {
     }
 }
 
-async fn validate_or_store_dim(conn: &Connection, dim: usize) -> anyhow::Result<()> {
-    if let Some(existing) = stored_dim(conn).await? {
-        if existing != dim {
-            return Err(crate::error::NeedleError::DimensionMismatch {
-                db: existing,
-                provider: dim,
-            }
-            .into());
-        }
-    } else {
-        conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_dim', ?1)",
-            [dim.to_string()],
+async fn store_dim(conn: &Connection, dim: usize) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('embedding_dim', ?1)",
+        [dim.to_string()],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn chunks_table_exists(conn: &Connection) -> anyhow::Result<bool> {
+    Ok(conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some())
+}
+
+async fn infer_dim_from_chunks_schema(conn: &Connection) -> anyhow::Result<usize> {
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks'",
+            (),
         )
         .await?;
-    }
-    Ok(())
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("chunks table not found in schema"))?;
+    let sql: String = row.get(0)?;
+    parse_dim_from_schema_sql(&sql)
+}
+
+fn parse_dim_from_schema_sql(sql: &str) -> anyhow::Result<usize> {
+    let upper = sql.to_ascii_uppercase();
+    let marker = "F32_BLOB(";
+    let start = upper
+        .find(marker)
+        .ok_or_else(|| anyhow::anyhow!("embedding column not found in chunks schema"))?;
+    let after_paren = start + marker.len();
+    let close = upper[after_paren..]
+        .find(')')
+        .ok_or_else(|| anyhow::anyhow!("malformed F32_BLOB in chunks schema"))?;
+    upper[after_paren..after_paren + close]
+        .trim()
+        .parse::<usize>()
+        .context("invalid dimension in chunks schema")
 }
 
 pub async fn all_note_hashes(conn: &Connection) -> anyhow::Result<HashMap<String, String>> {
@@ -257,6 +329,10 @@ pub async fn chunk_embeddings_for_path(
     conn: &Connection,
     path: &str,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
+    if !chunks_table_exists(conn).await? {
+        return Ok(vec![]);
+    }
+
     let mut rows = conn
         .query(
             "SELECT embedding FROM chunks WHERE path = ?1 AND embedding IS NOT NULL ORDER BY chunk_index",
@@ -360,6 +436,148 @@ mod tests {
             .iter()
             .map(|t| ((*t).to_owned(), dummy_embedding()))
             .collect()
+    }
+
+    #[test]
+    fn parse_dim_from_schema_sql_extracts_dimension() {
+        let sql =
+            "CREATE TABLE chunks (\n    id INTEGER PRIMARY KEY,\n    embedding F32_BLOB(384)\n)";
+        assert_eq!(parse_dim_from_schema_sql(sql).expect("should parse"), 384);
+    }
+
+    #[test]
+    fn parse_dim_from_schema_sql_is_case_insensitive() {
+        let sql = "CREATE TABLE chunks (embedding f32_blob(1024))";
+        assert_eq!(parse_dim_from_schema_sql(sql).expect("should parse"), 1024);
+    }
+
+    #[test]
+    fn parse_dim_from_schema_sql_errors_when_column_absent() {
+        let sql = "CREATE TABLE chunks (id INTEGER PRIMARY KEY, content TEXT)";
+        assert!(parse_dim_from_schema_sql(sql).is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_without_dim_on_fresh_db_skips_chunks_table() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (_db, conn) = connect(&db_path, None)
+            .await
+            .expect("connect without dim should succeed");
+        assert!(
+            !chunks_table_exists(&conn).await.expect("check failed"),
+            "chunks table must not be created when dim is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_without_dim_does_not_write_metadata() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (_db, conn) = connect(&db_path, None)
+            .await
+            .expect("connect without dim should succeed");
+        assert!(
+            stored_dim(&conn).await.expect("query failed").is_none(),
+            "no dim should be written to metadata when dim is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_without_dim_then_with_dim_succeeds() {
+        // Regression: similar (no embedder) on a fresh DB must not wedge the schema
+        // so that a subsequent reindex with a real provider can succeed.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        let (db1, conn1) = connect(&db_path, None)
+            .await
+            .expect("first connect (no dim) should succeed");
+        drop(conn1);
+        drop(db1);
+
+        let (_db2, conn2) = connect(&db_path, Some(384))
+            .await
+            .expect("second connect with dim should succeed after no-dim connect");
+
+        let embedding = vec![0.0_f32; 384];
+        upsert_note(
+            &conn2,
+            "note.md",
+            "abc",
+            &[("content".to_owned(), embedding)],
+        )
+        .await
+        .expect("upsert with correct dim must succeed");
+    }
+
+    #[tokio::test]
+    async fn connect_with_dim_validates_against_stored_dim() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (db, conn) = connect(&db_path, Some(1024))
+            .await
+            .expect("initial connect");
+        drop(conn);
+        drop(db);
+
+        let result = connect(&db_path, Some(384)).await;
+        assert!(result.is_err());
+        let msg = result.expect_err("should fail").to_string();
+        assert!(
+            msg.contains("dimension mismatch"),
+            "expected dimension mismatch error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_recovers_dim_from_schema_when_metadata_missing() {
+        // Simulate a legacy DB: chunks table exists with F32_BLOB(1024) but the
+        // embedding_dim metadata row was never written.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (db, conn) = connect(&db_path, Some(TEST_DIM))
+            .await
+            .expect("initial connect");
+        conn.execute("DELETE FROM metadata WHERE key = 'embedding_dim'", ())
+            .await
+            .expect("delete metadata");
+        drop(conn);
+        drop(db);
+
+        // Reconnect with the matching dim -- should recover and succeed.
+        let (_db2, conn2) = connect(&db_path, Some(TEST_DIM))
+            .await
+            .expect("connect should recover dim from schema");
+        assert_eq!(
+            stored_dim(&conn2).await.expect("query failed"),
+            Some(TEST_DIM),
+            "metadata should be repopulated after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_dim_mismatch_with_legacy_db() {
+        // Legacy DB: chunks F32_BLOB(1024), no metadata. Connecting with a different
+        // provider dim must fail rather than silently corrupting the schema.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let (db, conn) = connect(&db_path, Some(TEST_DIM))
+            .await
+            .expect("initial connect");
+        conn.execute("DELETE FROM metadata WHERE key = 'embedding_dim'", ())
+            .await
+            .expect("delete metadata");
+        drop(conn);
+        drop(db);
+
+        let result = connect(&db_path, Some(384)).await;
+        assert!(result.is_err());
+        let msg = result.expect_err("should fail").to_string();
+        assert!(
+            msg.contains("dimension mismatch"),
+            "expected dimension mismatch error, got: {msg}"
+        );
     }
 
     #[tokio::test]
