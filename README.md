@@ -6,12 +6,43 @@ Useful if you keep a folder of notes (Zettelkasten, engineering journal, docs re
 
 ## Install
 
-Requires a [Voyage AI](https://www.voyageai.com/) API key for embeddings.
-
 ```
 cargo install --path .
-export VOYAGE_API_KEY=your-key
 export ZK_NOTEBOOK_DIR=/path/to/notes
+```
+
+By default, needle uses [fastembed](https://github.com/Anush008/fastembed-rs) for local embeddings (all-MiniLM-L6-v2). No API key needed. The model downloads automatically on first run.
+
+For a smaller binary without the local model, build with `--no-default-features` and use an API provider instead.
+
+### Embedding Providers
+
+Needle supports three embedding backends. It infers which to use from available API keys, or you can set `NEEDLE_PROVIDER` explicitly.
+
+**Local (default):** No setup needed. Uses fastembed with ONNX models in-process.
+
+**OpenAI-compatible:** Works with OpenAI, Ollama, vLLM, text-embeddings-inference, or any server that speaks the `/v1/embeddings` API.
+
+```
+export OPENAI_API_KEY=sk-...
+needle reindex
+```
+
+For a local server like Ollama:
+
+```
+export NEEDLE_PROVIDER=openai
+export NEEDLE_API_BASE=http://localhost:11434/v1
+export NEEDLE_MODEL=nomic-embed-text
+export NEEDLE_DIM=768
+needle reindex
+```
+
+**Voyage AI:**
+
+```
+export VOYAGE_API_KEY=your-key
+needle reindex
 ```
 
 ## Usage
@@ -75,17 +106,33 @@ Optional config file at `~/.config/needle/config.toml`:
 
 ```toml
 notes_dir = "/home/you/notes"
-voyage_api_key = "your-key"
+provider = "openai"
+model = "text-embedding-3-small"
+api_base = "http://localhost:11434/v1"
+dim = 768
+openai_api_key = "sk-..."
 w_semantic = 1.5
 w_fts = 1.0
 w_filename = 0.7
 ```
 
-Environment variables (`VOYAGE_API_KEY`, `ZK_NOTEBOOK_DIR`, `NEEDLE_W_*`) override the config file. CLI flags override everything.
+Environment variables override the config file. CLI flags override everything.
+
+| Setting | Env var | Config key |
+|---------|---------|------------|
+| Provider | `NEEDLE_PROVIDER` | `provider` |
+| Model | `NEEDLE_MODEL` | `model` |
+| API base URL | `NEEDLE_API_BASE` | `api_base` |
+| Dimension override | `NEEDLE_DIM` | `dim` |
+| Voyage API key | `VOYAGE_API_KEY` | `voyage_api_key` |
+| OpenAI API key | `OPENAI_API_KEY` | `openai_api_key` |
+| Notes directory | `ZK_NOTEBOOK_DIR` | `notes_dir` |
 
 ## How it works
 
-Needle chunks each markdown file, embeds it via Voyage AI (`voyage-4`, 1024 dimensions), and stores the vectors in a local SQLite database with a vector index (libsql). Full-text search uses Tantivy. The search command fuses all ranking signals with reciprocal rank fusion.
+Needle chunks each markdown file, embeds it with your chosen provider, and stores the vectors in a local SQLite database with a vector index (libsql). Full-text search uses Tantivy. The search command fuses all ranking signals with reciprocal rank fusion.
+
+Switching providers requires a reindex since embedding dimensions may differ.
 
 ## License
 
