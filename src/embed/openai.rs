@@ -31,8 +31,8 @@ impl OpenAiProvider {
         model: Option<&str>,
         dim_override: Option<usize>,
     ) -> anyhow::Result<Self> {
-        let is_custom_base = api_base.is_some();
         let base = api_base.unwrap_or(DEFAULT_API_BASE);
+        let is_custom_base = base.trim_end_matches('/') != DEFAULT_API_BASE;
         let model_name = model.unwrap_or(DEFAULT_MODEL);
         let dim = dim_override
             .or_else(|| lookup_dim(model_name))
@@ -114,11 +114,91 @@ impl OpenAiProvider {
     }
 }
 
+#[cfg(test)]
+impl OpenAiProvider {
+    fn selected_api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+}
+
 fn lookup_dim(model: &str) -> Option<usize> {
     match model {
         "text-embedding-3-small" => Some(DEFAULT_DIM),
         "text-embedding-3-large" => Some(3072),
         "text-embedding-ada-002" => Some(1536),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(
+        openai_key: Option<&str>,
+        needle_key: Option<&str>,
+        api_base: Option<&str>,
+    ) -> OpenAiProvider {
+        OpenAiProvider::new(openai_key, needle_key, api_base, None, Some(1536))
+            .expect("provider construction failed")
+    }
+
+    #[test]
+    fn no_base_uses_openai_key() {
+        let p = provider(Some("sk-openai"), None, None);
+        assert_eq!(p.selected_api_key(), Some("sk-openai"));
+    }
+
+    #[test]
+    fn explicit_default_base_url_uses_openai_key() {
+        let p = provider(Some("sk-openai"), None, Some(DEFAULT_API_BASE));
+        assert_eq!(
+            p.selected_api_key(),
+            Some("sk-openai"),
+            "explicit default base must not suppress OPENAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn explicit_default_base_url_with_trailing_slash_uses_openai_key() {
+        let with_slash = format!("{DEFAULT_API_BASE}/");
+        let p = provider(Some("sk-openai"), None, Some(&with_slash));
+        assert_eq!(
+            p.selected_api_key(),
+            Some("sk-openai"),
+            "trailing slash on default base must not suppress OPENAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn custom_base_uses_needle_key() {
+        let p = provider(
+            Some("sk-openai"),
+            Some("nk-needle"),
+            Some("http://localhost:11434/v1"),
+        );
+        assert_eq!(p.selected_api_key(), Some("nk-needle"));
+    }
+
+    #[test]
+    fn custom_base_with_only_openai_key_sends_no_auth() {
+        let p = provider(Some("sk-openai"), None, Some("http://localhost:11434/v1"));
+        assert_eq!(
+            p.selected_api_key(),
+            None,
+            "OPENAI_API_KEY must not be forwarded to a custom endpoint"
+        );
+    }
+
+    #[test]
+    fn custom_base_with_no_keys_sends_no_auth() {
+        let p = provider(None, None, Some("http://localhost:11434/v1"));
+        assert_eq!(p.selected_api_key(), None);
+    }
+
+    #[test]
+    fn no_base_no_keys_sends_no_auth() {
+        let p = provider(None, None, None);
+        assert_eq!(p.selected_api_key(), None);
     }
 }
