@@ -26,6 +26,7 @@ pub struct EmbedConfig {
     pub dim: Option<usize>,
     pub voyage_api_key: Option<String>,
     pub openai_api_key: Option<String>,
+    pub needle_api_key: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -36,6 +37,7 @@ struct FileConfig {
     dim: Option<usize>,
     voyage_api_key: Option<String>,
     openai_api_key: Option<String>,
+    needle_api_key: Option<String>,
     notes_dir: Option<PathBuf>,
     w_semantic: Option<f64>,
     w_fts: Option<f64>,
@@ -111,6 +113,7 @@ fn resolve_embed_config(cli: CliEmbedArgs, file: &FileConfig) -> EmbedConfig {
         dim: env("NEEDLE_DIM").and_then(|s| s.parse().ok()).or(file.dim),
         voyage_api_key: env("VOYAGE_API_KEY").or_else(|| file.voyage_api_key.clone()),
         openai_api_key: env("OPENAI_API_KEY").or_else(|| file.openai_api_key.clone()),
+        needle_api_key: env("NEEDLE_API_KEY").or_else(|| file.needle_api_key.clone()),
     }
 }
 
