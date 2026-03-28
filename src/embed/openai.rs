@@ -25,11 +25,13 @@ struct OpenAiRequest<'a> {
 
 impl OpenAiProvider {
     pub fn new(
-        api_key: Option<&str>,
+        openai_api_key: Option<&str>,
+        needle_api_key: Option<&str>,
         api_base: Option<&str>,
         model: Option<&str>,
         dim_override: Option<usize>,
     ) -> anyhow::Result<Self> {
+        let is_custom_base = api_base.is_some();
         let base = api_base.unwrap_or(DEFAULT_API_BASE);
         let model_name = model.unwrap_or(DEFAULT_MODEL);
         let dim = dim_override
@@ -38,9 +40,22 @@ impl OpenAiProvider {
                 model: model_name.to_owned(),
             })?;
 
+        let api_key = if is_custom_base {
+            if needle_api_key.is_none() && openai_api_key.is_some() {
+                tracing::warn!(
+                    "NEEDLE_API_BASE is set but only OPENAI_API_KEY is present; \
+                     OPENAI_API_KEY will not be sent to the custom endpoint. \
+                     Set NEEDLE_API_KEY to authenticate with the custom base URL."
+                );
+            }
+            needle_api_key.map(str::to_owned)
+        } else {
+            openai_api_key.map(str::to_owned)
+        };
+
         Ok(Self {
             client: super::build_http_client()?,
-            api_key: api_key.map(str::to_owned),
+            api_key,
             api_base: base.trim_end_matches('/').to_owned(),
             model: model_name.to_owned(),
             dim,
