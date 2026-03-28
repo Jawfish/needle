@@ -151,6 +151,20 @@ fn promote_temp_artifacts(
     backup_fts_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     // Step 1: Move live FTS aside to vacate the target path.
+    //
+    // A stale backup can exist when a prior run crashed after step 2 (temp FTS
+    // renamed into place) but before step 4 (backup removed).  In that state
+    // both live and backup exist; the live FTS is correct and the backup is
+    // obsolete.  Remove it before the rename so Linux rename(2) does not return
+    // ENOTEMPTY when the backup directory is non-empty.
+    if backup_fts_dir.exists() {
+        std::fs::remove_dir_all(backup_fts_dir).with_context(|| {
+            format!(
+                "removing stale FTS backup {} before promotion",
+                backup_fts_dir.display()
+            )
+        })?;
+    }
     let live_fts_existed = fts_dir.exists();
     if live_fts_existed {
         std::fs::rename(fts_dir, backup_fts_dir).with_context(|| {
@@ -835,6 +849,74 @@ mod tests {
             results.len(),
             1,
             "FTS must contain the reindexed content after a successful mismatch reindex"
+        );
+    }
+
+    /// A prior run may crash after promote step 2 (temp FTS is now live) but before
+    /// step 4 removes the backup.  The next mismatch reindex reaches step 1 and
+    /// tries rename(live, backup), which fails on Linux when backup is non-empty.
+    /// The fix must remove the stale backup before step 1 so the rename succeeds.
+    #[tokio::test]
+    async fn mismatch_reindex_succeeds_when_stale_backup_and_live_fts_both_exist() {
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
+
+        // Build an initial populated index at dim=384.
+        {
+            std::fs::write(notes_dir.path().join("note.md"), "# Note\n\nphoton content")
+                .expect("write note");
+
+            let (_db, conn) = db::connect(&db_path, Some(384)).await.expect("connect");
+            let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+            let embedder = embed::Embedder::create_null(384);
+            index::index_directory(&conn, &fts, &embedder, notes_dir.path())
+                .await
+                .expect("initial index");
+        }
+
+        // Simulate crash after step 2 but before step 4: both live and backup exist.
+        let backup_fts_dir = sibling_fts_dir(fts_dir.path(), "reindex-bak");
+        std::fs::create_dir_all(&backup_fts_dir).expect("create stale backup dir");
+        std::fs::write(backup_fts_dir.join("stale.marker"), b"stale").expect("write stale marker");
+
+        assert!(
+            fts_dir.path().exists(),
+            "live FTS must exist to reproduce the dual-directory crash state"
+        );
+        assert!(
+            backup_fts_dir.exists(),
+            "stale backup must exist to reproduce the dual-directory crash state"
+        );
+
+        // Run a successful mismatch reindex (dim=1024, no corrupt files).
+        let embedder = embed::Embedder::create_null(1024);
+        let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
+        assert!(
+            result.is_ok(),
+            "mismatch reindex must succeed even when stale backup and live FTS both exist: {:?}",
+            result.err()
+        );
+
+        // DB must be openable with the new dimension.
+        let (_db, conn) = db::connect(&db_path, Some(1024))
+            .await
+            .expect("DB must be openable with the new dimension");
+        assert!(
+            db::chunks_table_exists(&conn)
+                .await
+                .expect("check chunks table"),
+            "DB must have chunks table with new dimension"
+        );
+
+        // FTS must contain the reindexed content.
+        let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let results = fts.search("photon", 10).await.expect("fts search");
+        assert_eq!(
+            results.len(),
+            1,
+            "FTS must contain the reindexed content after recovery from dual-directory state"
         );
     }
 
