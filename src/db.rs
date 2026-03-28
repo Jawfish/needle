@@ -46,19 +46,6 @@ pub async fn connect(
     Ok((db, conn))
 }
 
-/// Delete the database file so the next `connect` starts with a clean slate.
-///
-/// Used by `reindex` when a dimension mismatch would otherwise prevent it from
-/// running: the command's purpose is to rebuild the index, so resetting is
-/// safe and expected.
-pub fn reset(db_path: &Path) -> anyhow::Result<()> {
-    if db_path.exists() {
-        std::fs::remove_file(db_path)
-            .with_context(|| format!("removing database at {}", db_path.display()))?;
-    }
-    Ok(())
-}
-
 async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metadata (
