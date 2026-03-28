@@ -76,7 +76,12 @@ async fn reindex_via_temp(
     let tmp_fts_dir = sibling_fts_dir(fts_dir, "reindex-tmp");
     let backup_fts_dir = sibling_fts_dir(fts_dir, "reindex-bak");
 
-    clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir, &backup_fts_dir);
+    // Crash recovery must run before cleanup: if backup exists and live FTS is
+    // absent, the backup is the only copy of the live index.  Restore it now so
+    // that a subsequent build failure does not leave the index permanently gone.
+    recover_fts_from_interrupted_swap(fts_dir, &backup_fts_dir)?;
+
+    clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
 
     let result = build_index_in_temp(&tmp_db_path, &tmp_fts_dir, embedder, notes_dir, dim).await;
 
@@ -92,10 +97,36 @@ async fn reindex_via_temp(
             Ok(stats)
         }
         Err(e) => {
-            clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir, &backup_fts_dir);
+            clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
             Err(e)
         }
     }
+}
+
+/// Restore the FTS backup when the live FTS directory is missing.
+///
+/// `promote_temp_artifacts` moves the live FTS aside before swapping in the
+/// new one.  If the process is killed between those two steps the backup holds
+/// the only copy of the index.  This function detects that state and renames
+/// the backup back to the live path so subsequent cleanup cannot delete it.
+fn recover_fts_from_interrupted_swap(
+    fts_dir: &std::path::Path,
+    backup_fts_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if backup_fts_dir.exists() && !fts_dir.exists() {
+        tracing::warn!(
+            backup = %backup_fts_dir.display(),
+            "FTS backup found without live FTS dir; prior reindex was interrupted; restoring"
+        );
+        std::fs::rename(backup_fts_dir, fts_dir).with_context(|| {
+            format!(
+                "restoring FTS backup {} to {}",
+                backup_fts_dir.display(),
+                fts_dir.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Promote fully-built temp artifacts into the live locations.
@@ -195,11 +226,7 @@ fn sibling_fts_dir(fts_dir: &std::path::Path, suffix: &str) -> std::path::PathBu
     fts_dir.with_file_name(name)
 }
 
-fn clean_temp_artifacts(
-    tmp_db_path: &std::path::Path,
-    tmp_fts_dir: &std::path::Path,
-    backup_fts_dir: &std::path::Path,
-) {
+fn clean_temp_artifacts(tmp_db_path: &std::path::Path, tmp_fts_dir: &std::path::Path) {
     if tmp_db_path.exists()
         && let Err(e) = std::fs::remove_file(tmp_db_path)
     {
@@ -212,15 +239,6 @@ fn clean_temp_artifacts(
             path = %tmp_fts_dir.display(),
             err = %e,
             "failed to remove temp FTS dir"
-        );
-    }
-    if backup_fts_dir.exists()
-        && let Err(e) = std::fs::remove_dir_all(backup_fts_dir)
-    {
-        tracing::warn!(
-            path = %backup_fts_dir.display(),
-            err = %e,
-            "failed to remove FTS backup dir"
         );
     }
 }
@@ -817,6 +835,81 @@ mod tests {
             results.len(),
             1,
             "FTS must contain the reindexed content after a successful mismatch reindex"
+        );
+    }
+
+    /// A prior run may crash between promote step 1 (backup live FTS) and step 2
+    /// (rename temp FTS into place).  That leaves the backup as the only copy of
+    /// the live FTS.  When the next reindex attempt starts, it must restore the
+    /// backup before cleaning temp artifacts; otherwise deleting the backup
+    /// permanently destroys FTS availability even if the new build also fails.
+    #[tokio::test]
+    async fn interrupted_reindex_restores_fts_backup_on_next_attempt() {
+        use std::io::Write;
+
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
+
+        // Build initial index with known searchable content at dim=384.
+        {
+            std::fs::write(
+                notes_dir.path().join("note.md"),
+                "# Note\n\nneutron content",
+            )
+            .expect("write note");
+
+            let (_db, conn) = db::connect(&db_path, Some(384)).await.expect("connect");
+            let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+            let embedder = embed::Embedder::create_null(384);
+            index::index_directory(&conn, &fts, &embedder, notes_dir.path())
+                .await
+                .expect("initial index");
+        }
+
+        // Simulate a crash between promote step 1 (live FTS moved to backup) and
+        // step 2 (temp FTS renamed into place): the backup exists and live FTS is
+        // absent.
+        let backup_fts_dir = sibling_fts_dir(fts_dir.path(), "reindex-bak");
+        std::fs::rename(fts_dir.path(), &backup_fts_dir)
+            .expect("simulate: move live FTS to backup");
+        assert!(
+            !fts_dir.path().exists(),
+            "live FTS must be absent to reproduce the crash state"
+        );
+
+        // Add a corrupt file so the new build deterministically fails, verifying
+        // that recovery holds even when the subsequent rebuild does not succeed.
+        let bad_file = notes_dir.path().join("corrupt.md");
+        {
+            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
+            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
+        }
+
+        // Trigger mismatch reindex (dim=1024). Must fail due to corrupt file.
+        let embedder = embed::Embedder::create_null(1024);
+        let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
+        assert!(result.is_err(), "reindex must fail due to corrupt file");
+
+        // The backup must have been restored to the live FTS location before the
+        // build started, so the original content is intact regardless of the
+        // build failure.
+        assert!(
+            fts_dir.path().exists(),
+            "live FTS must be restored from backup even after a failed reindex"
+        );
+        assert!(
+            !backup_fts_dir.exists(),
+            "backup must be gone after restoration"
+        );
+
+        let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("open restored fts");
+        let results = fts.search("neutron", 10).await.expect("fts search");
+        assert_eq!(
+            results.len(),
+            1,
+            "original FTS content must be intact after crash recovery and failed reindex"
         );
     }
 }
