@@ -372,4 +372,52 @@ mod tests {
             &weights
         ));
     }
+
+    #[tokio::test]
+    async fn open_db_succeeds_when_dimensions_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let result = open_db(&path, Some(384), false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_db_propagates_mismatch_when_reset_not_allowed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+
+        let (db, conn) = db::connect(&path, Some(384)).await.expect("first connect");
+        drop(conn);
+        drop(db);
+
+        let result = open_db(&path, Some(1024), false).await;
+        assert!(result.is_err());
+        assert!(
+            is_dimension_mismatch(&result.expect_err("should fail")),
+            "error must be DimensionMismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_db_resets_and_reconnects_on_mismatch_when_allowed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+
+        let (db, conn) = db::connect(&path, Some(384)).await.expect("first connect");
+        drop(conn);
+        drop(db);
+
+        let result = open_db(&path, Some(1024), true).await;
+        assert!(
+            result.is_ok(),
+            "open_db must succeed after reset: {:?}",
+            result.err()
+        );
+
+        let (_db, conn) = result.expect("open succeeded");
+        assert!(
+            db::chunks_table_exists(&conn).await.expect("check failed"),
+            "schema must be initialised with the new dimension"
+        );
+    }
 }
