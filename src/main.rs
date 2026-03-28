@@ -12,6 +12,7 @@ mod watch;
 
 use std::io::{IsTerminal, Read};
 
+use anyhow::Context;
 use clap::Parser;
 
 use crate::{
@@ -26,22 +27,92 @@ fn is_dimension_mismatch(err: &anyhow::Error) -> bool {
         .is_some_and(|e| matches!(e, NeedleError::DimensionMismatch { .. }))
 }
 
-/// Open the database, resetting it first when a dimension mismatch is
-/// encountered and the caller intends to reindex (which rebuilds everything).
 async fn open_db(
     db_path: &std::path::Path,
     dim: Option<usize>,
-    allow_reset_on_mismatch: bool,
 ) -> anyhow::Result<(libsql::Database, libsql::Connection)> {
-    match db::connect(db_path, dim).await {
-        Ok(pair) => Ok(pair),
-        Err(ref e) if allow_reset_on_mismatch && is_dimension_mismatch(e) => {
-            tracing::warn!("dimension mismatch detected; resetting index for reindex");
-            db::reset(db_path)?;
-            db::connect(db_path, dim).await
+    db::connect(db_path, dim).await
+}
+
+/// Run a full reindex, recovering atomically when there is a dimension mismatch.
+///
+/// When the stored dimension differs from the embedder dimension the new index
+/// is built into a sibling temp file.  Only after the full reindex succeeds is
+/// the temp file renamed over the original.  On any failure the temp file is
+/// removed and the original DB is left untouched.
+async fn run_reindex(
+    db_path: &std::path::Path,
+    fts: &fts::FtsIndex,
+    embedder: &embed::Embedder,
+    notes_dir: &std::path::Path,
+) -> anyhow::Result<index::IndexStats> {
+    let dim = embedder.dim();
+
+    match db::connect(db_path, Some(dim)).await {
+        Ok((_db, conn)) => {
+            let stats = index::index_directory(&conn, fts, embedder, notes_dir).await?;
+            Ok(stats)
+        }
+        Err(ref e) if is_dimension_mismatch(e) => {
+            tracing::warn!("dimension mismatch detected; rebuilding index atomically");
+            reindex_via_temp(db_path, fts, embedder, notes_dir, dim).await
         }
         Err(e) => Err(e),
     }
+}
+
+async fn reindex_via_temp(
+    db_path: &std::path::Path,
+    fts: &fts::FtsIndex,
+    embedder: &embed::Embedder,
+    notes_dir: &std::path::Path,
+    dim: usize,
+) -> anyhow::Result<index::IndexStats> {
+    let tmp_path = db_path.with_extension("reindex-tmp");
+
+    // Remove any stale temp file from a previous interrupted attempt.
+    if tmp_path.exists() {
+        std::fs::remove_file(&tmp_path)
+            .with_context(|| format!("removing stale temp DB at {}", tmp_path.display()))?;
+    }
+
+    let result = build_index_in_temp(&tmp_path, fts, embedder, notes_dir, dim).await;
+
+    match result {
+        Ok(stats) => {
+            std::fs::rename(&tmp_path, db_path).with_context(|| {
+                format!(
+                    "swapping temp DB {} over {}",
+                    tmp_path.display(),
+                    db_path.display()
+                )
+            })?;
+            Ok(stats)
+        }
+        Err(e) => {
+            if tmp_path.exists()
+                && let Err(rm_err) = std::fs::remove_file(&tmp_path)
+            {
+                tracing::warn!(
+                    path = %tmp_path.display(),
+                    err = %rm_err,
+                    "failed to remove temp DB after reindex failure"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn build_index_in_temp(
+    tmp_path: &std::path::Path,
+    fts: &fts::FtsIndex,
+    embedder: &embed::Embedder,
+    notes_dir: &std::path::Path,
+    dim: usize,
+) -> anyhow::Result<index::IndexStats> {
+    let (_tmp_db, tmp_conn) = db::connect(tmp_path, Some(dim)).await?;
+    index::index_directory(&tmp_conn, fts, embedder, notes_dir).await
 }
 
 #[tokio::main]
@@ -92,9 +163,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         None
     };
+
+    if matches!(cli.command, Command::Reindex) {
+        let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
+        let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
+        let stats = run_reindex(&config.db_path, &fts, &embedder, &config.notes_dir).await?;
+        tracing::info!(%stats, "reindex complete");
+        return Ok(());
+    }
+
     let dim = embedder.as_ref().map(Embedder::dim);
-    let is_reindex = matches!(cli.command, Command::Reindex);
-    let (_db, conn) = open_db(&config.db_path, dim, is_reindex).await?;
+    let (_db, conn) = open_db(&config.db_path, dim).await?;
 
     match cli.command {
         Command::Watch => {
@@ -164,12 +243,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Reindex => {
-            let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-            let embedder = embedder.as_ref().ok_or(NeedleError::NoEmbeddingProvider)?;
-            let stats = index::index_directory(&conn, &fts, embedder, &config.notes_dir).await?;
-            tracing::info!(%stats, "reindex complete");
-        }
+        Command::Reindex => unreachable!("handled above"),
     }
 
     Ok(())
@@ -377,12 +451,12 @@ mod tests {
     async fn open_db_succeeds_when_dimensions_match() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
-        let result = open_db(&path, Some(384), false).await;
+        let result = open_db(&path, Some(384)).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn open_db_propagates_mismatch_when_reset_not_allowed() {
+    async fn open_db_propagates_mismatch_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
 
@@ -390,7 +464,7 @@ mod tests {
         drop(conn);
         drop(db);
 
-        let result = open_db(&path, Some(1024), false).await;
+        let result = open_db(&path, Some(1024)).await;
         assert!(result.is_err());
         assert!(
             is_dimension_mismatch(&result.expect_err("should fail")),
@@ -399,25 +473,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_db_resets_and_reconnects_on_mismatch_when_allowed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.db");
+    async fn run_reindex_recovers_from_dimension_mismatch_when_reindex_succeeds() {
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
 
-        let (db, conn) = db::connect(&path, Some(384)).await.expect("first connect");
+        std::fs::write(notes_dir.path().join("note.md"), "# Hello\n\nContent.")
+            .expect("write note");
+
+        let (db, conn) = db::connect(&db_path, Some(384))
+            .await
+            .expect("first connect");
         drop(conn);
         drop(db);
 
-        let result = open_db(&path, Some(1024), true).await;
+        let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let embedder = embed::Embedder::create_null(1024);
+        let result = run_reindex(&db_path, &fts, &embedder, notes_dir.path()).await;
         assert!(
             result.is_ok(),
-            "open_db must succeed after reset: {:?}",
+            "run_reindex must succeed after mismatch: {:?}",
             result.err()
         );
 
-        let (_db, conn) = result.expect("open succeeded");
+        let (_db, conn) = db::connect(&db_path, Some(1024))
+            .await
+            .expect("DB must be openable with the new dimension after successful reindex");
         assert!(
             db::chunks_table_exists(&conn).await.expect("check failed"),
             "schema must be initialised with the new dimension"
+        );
+    }
+
+    /// Dimension mismatch + reindex failure must leave the original DB intact.
+    ///
+    /// Steps:
+    ///   1. Build a populated index at dimension 384.
+    ///   2. Drop a non-UTF8 file into the notes dir so `index_directory` fails.
+    ///   3. Call `run_reindex` with dimension 1024 (triggers mismatch path).
+    ///   4. Assert the original DB file still exists and still contains the old
+    ///      data (the prior index is preserved, not destroyed).
+    #[tokio::test]
+    async fn reindex_failure_preserves_original_db_on_dimension_mismatch() {
+        use std::io::Write;
+
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
+
+        // Populate the original index with dim=384.
+        {
+            let good_md = notes_dir.path().join("good.md");
+            std::fs::write(&good_md, "# Good note\n\nSome content.").expect("write note");
+
+            let (_db, conn) = db::connect(&db_path, Some(384)).await.expect("connect");
+            let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+            let embedder = crate::embed::Embedder::create_null(384);
+            index::index_directory(&conn, &fts, &embedder, notes_dir.path())
+                .await
+                .expect("initial index");
+        }
+
+        assert!(db_path.exists(), "original DB must exist before test");
+
+        // Place a non-UTF8 file that will cause `read_to_string` to fail.
+        let bad_file = notes_dir.path().join("corrupt.md");
+        {
+            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
+            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
+        }
+
+        // Run reindex with dim=1024 (mismatch). The corrupt file should cause failure.
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let embedder = crate::embed::Embedder::create_null(1024);
+        let result = run_reindex(&db_path, &fts, &embedder, notes_dir.path()).await;
+        assert!(result.is_err(), "reindex must fail due to corrupt file");
+
+        // The original DB file must still be present and contain the prior data.
+        assert!(
+            db_path.exists(),
+            "original DB must be preserved after a failed reindex"
+        );
+        let (_db, conn) = db::connect(&db_path, Some(384))
+            .await
+            .expect("original DB must still be openable with old dimension");
+        let hashes = db::all_note_hashes(&conn).await.expect("query hashes");
+        assert!(
+            hashes.contains_key("good.md"),
+            "prior index content must be intact after failed reindex"
         );
     }
 }
