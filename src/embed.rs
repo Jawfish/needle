@@ -4,7 +4,7 @@ mod voyage;
 #[cfg(feature = "local")]
 mod local;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use serde::Deserialize;
 
@@ -13,6 +13,49 @@ use crate::{config::EmbedConfig, error::NeedleError};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;
 const CHUNK_TARGET_CHARS: usize = 4000; // ~1000 tokens
+
+type SendFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = anyhow::Result<(reqwest::StatusCode, Vec<u8>)>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Port for HTTP request dispatch.  Concrete providers receive this via their
+/// constructors so tests can substitute a fake without a live network.
+///
+/// The return type uses a boxed future so the trait is object-safe and can be
+/// stored as `Arc<dyn HttpTransport>`.
+pub trait HttpTransport: Send + Sync {
+    fn send(&self, request: reqwest::Request) -> SendFuture<'_>;
+}
+
+/// Production implementation backed by a real `reqwest::Client`.
+pub struct ReqwestTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestTransport {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()?,
+        })
+    }
+}
+
+impl HttpTransport for ReqwestTransport {
+    fn send(&self, request: reqwest::Request) -> SendFuture<'_> {
+        Box::pin(async move {
+            let response = self.client.execute(request).await?;
+            let status = response.status();
+            let body = response.bytes().await?.to_vec();
+            Ok((status, body))
+        })
+    }
+}
 
 pub enum Embedder {
     Voyage(voyage::VoyageProvider),
@@ -38,23 +81,30 @@ impl Embedder {
                     .voyage_api_key
                     .as_deref()
                     .ok_or_else(|| NeedleError::MissingApiKey("VOYAGE_API_KEY".to_owned()))?;
+                let transport = Arc::new(ReqwestTransport::new()?);
                 Ok(Self::Voyage(voyage::VoyageProvider::new(
                     api_key,
                     config.model.as_deref(),
                     config.dim,
+                    transport,
                 )?))
             }
-            ProviderKind::OpenAi => Ok(Self::OpenAi(openai::OpenAiProvider::new(
-                config.openai_api_key.as_deref(),
-                config.needle_api_key.as_deref(),
-                config.api_base.as_deref(),
-                config.model.as_deref(),
-                config.dim,
-            )?)),
+            ProviderKind::OpenAi => {
+                let transport = Arc::new(ReqwestTransport::new()?);
+                Ok(Self::OpenAi(openai::OpenAiProvider::new(
+                    config.openai_api_key.as_deref(),
+                    config.needle_api_key.as_deref(),
+                    config.api_base.as_deref(),
+                    config.model.as_deref(),
+                    config.dim,
+                    transport,
+                )?))
+            }
             #[cfg(feature = "local")]
-            ProviderKind::Local => Ok(Self::Local(local::LocalProvider::new(
-                config.model.as_deref(),
-            )?)),
+            ProviderKind::Local => {
+                let (model, dim) = local::init_model(config.model.as_deref())?;
+                Ok(Self::Local(local::LocalProvider::new(model, dim)))
+            }
             #[cfg(not(feature = "local"))]
             ProviderKind::Local => Err(NeedleError::NoEmbeddingProvider.into()),
         }
@@ -139,16 +189,11 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
-fn build_http_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()?)
-}
-
 async fn send_with_retry(
-    build_request: impl Fn() -> reqwest::RequestBuilder,
-) -> anyhow::Result<reqwest::Response> {
-    let mut last_err = None;
+    transport: &dyn HttpTransport,
+    build_request: impl Fn() -> anyhow::Result<reqwest::Request>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -157,26 +202,26 @@ async fn send_with_retry(
             tracing::warn!(attempt, "retrying embedding request");
         }
 
-        let response = match build_request().send().await {
+        let request = build_request()?;
+        let (status, body) = match transport.send(request).await {
             Ok(r) => r,
             Err(e) => {
-                last_err = Some(anyhow::Error::from(e));
+                last_err = Some(e);
                 continue;
             }
         };
 
-        if response.status().is_success() {
-            return Ok(response);
+        if status.is_success() {
+            return Ok(body);
         }
 
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&body).into_owned();
 
         if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(NeedleError::EmbeddingApi(format!("{status}: {body}")).into());
+            return Err(NeedleError::EmbeddingApi(format!("{status}: {body_text}")).into());
         }
 
-        last_err = Some(NeedleError::EmbeddingApi(format!("{status}: {body}")).into());
+        last_err = Some(NeedleError::EmbeddingApi(format!("{status}: {body_text}")).into());
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("embedding request failed")))
