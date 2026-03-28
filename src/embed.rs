@@ -46,6 +46,7 @@ impl Embedder {
             }
             ProviderKind::OpenAi => Ok(Self::OpenAi(openai::OpenAiProvider::new(
                 config.openai_api_key.as_deref(),
+                config.needle_api_key.as_deref(),
                 config.api_base.as_deref(),
                 config.model.as_deref(),
                 config.dim,
@@ -371,6 +372,7 @@ mod tests {
             dim: None,
             voyage_api_key: Some("vk-test".to_owned()),
             openai_api_key: None,
+            needle_api_key: None,
         };
         let kind = infer_from_keys(&config).expect("should infer");
         assert!(matches!(kind, ProviderKind::Voyage));
@@ -385,6 +387,7 @@ mod tests {
             dim: None,
             voyage_api_key: None,
             openai_api_key: Some("sk-test".to_owned()),
+            needle_api_key: None,
         };
         let kind = infer_from_keys(&config).expect("should infer");
         assert!(matches!(kind, ProviderKind::OpenAi));
@@ -399,6 +402,7 @@ mod tests {
             dim: None,
             voyage_api_key: Some("vk-test".to_owned()),
             openai_api_key: Some("sk-test".to_owned()),
+            needle_api_key: None,
         };
         let kind = infer_from_keys(&config).expect("should infer");
         assert!(matches!(kind, ProviderKind::Voyage));
