@@ -73,47 +73,133 @@ async fn reindex_via_temp(
     dim: usize,
 ) -> anyhow::Result<index::IndexStats> {
     let tmp_db_path = db_path.with_extension("reindex-tmp");
-    let tmp_fts_dir = sibling_temp_fts_dir(fts_dir);
+    let tmp_fts_dir = sibling_fts_dir(fts_dir, "reindex-tmp");
+    let backup_fts_dir = sibling_fts_dir(fts_dir, "reindex-bak");
 
-    clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
+    clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir, &backup_fts_dir);
 
     let result = build_index_in_temp(&tmp_db_path, &tmp_fts_dir, embedder, notes_dir, dim).await;
 
     match result {
         Ok(stats) => {
-            std::fs::rename(&tmp_db_path, db_path).with_context(|| {
-                format!(
-                    "swapping temp DB {} over {}",
-                    tmp_db_path.display(),
-                    db_path.display()
-                )
-            })?;
-            std::fs::rename(&tmp_fts_dir, fts_dir).with_context(|| {
-                format!(
-                    "swapping temp FTS dir {} over {}",
-                    tmp_fts_dir.display(),
-                    fts_dir.display()
-                )
-            })?;
+            promote_temp_artifacts(
+                &tmp_db_path,
+                db_path,
+                &tmp_fts_dir,
+                fts_dir,
+                &backup_fts_dir,
+            )?;
             Ok(stats)
         }
         Err(e) => {
-            clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
+            clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir, &backup_fts_dir);
             Err(e)
         }
     }
 }
 
-fn sibling_temp_fts_dir(fts_dir: &std::path::Path) -> std::path::PathBuf {
+/// Promote fully-built temp artifacts into the live locations.
+///
+/// Linux rename(2) cannot replace a non-empty directory, so the live FTS
+/// directory must be vacated before the temp one can be renamed into place.
+/// Steps are ordered so that failure at any point leaves a state that can be
+/// rolled back to the original:
+///
+///   1. Move live FTS to a backup path (vacates the target path for step 2).
+///   2. Move temp FTS into the now-vacant live FTS location.
+///   3. Move temp DB over the live DB file (file-over-file rename is atomic).
+///   4. Remove the FTS backup (best-effort cleanup).
+///
+/// The DB rename is last. If the FTS steps succeed but the DB rename fails,
+/// rolling back the FTS restores full consistency without touching the DB.
+fn promote_temp_artifacts(
+    tmp_db_path: &std::path::Path,
+    db_path: &std::path::Path,
+    tmp_fts_dir: &std::path::Path,
+    fts_dir: &std::path::Path,
+    backup_fts_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    // Step 1: Move live FTS aside to vacate the target path.
+    let live_fts_existed = fts_dir.exists();
+    if live_fts_existed {
+        std::fs::rename(fts_dir, backup_fts_dir).with_context(|| {
+            format!(
+                "backing up live FTS dir {} to {}",
+                fts_dir.display(),
+                backup_fts_dir.display()
+            )
+        })?;
+    }
+
+    // Step 2: Move temp FTS into the now-empty live location.
+    if let Err(e) = std::fs::rename(tmp_fts_dir, fts_dir) {
+        if live_fts_existed && let Err(rb) = std::fs::rename(backup_fts_dir, fts_dir) {
+            tracing::error!(
+                err = %rb,
+                "failed to restore FTS backup after swap error; index may be inconsistent"
+            );
+        }
+        return Err(e).with_context(|| {
+            format!(
+                "moving temp FTS {} into live location {}",
+                tmp_fts_dir.display(),
+                fts_dir.display()
+            )
+        });
+    }
+
+    // Step 3: Move temp DB over the live DB (file-over-file rename is atomic).
+    if let Err(e) = std::fs::rename(tmp_db_path, db_path) {
+        // Roll back FTS: move new FTS back to temp, then restore backup.
+        if let Err(rb) = std::fs::rename(fts_dir, tmp_fts_dir) {
+            tracing::error!(
+                err = %rb,
+                "failed to revert FTS during DB swap rollback; index may be inconsistent"
+            );
+        } else if live_fts_existed && let Err(rb) = std::fs::rename(backup_fts_dir, fts_dir) {
+            tracing::error!(
+                err = %rb,
+                "failed to restore FTS backup during DB rollback; index may be inconsistent"
+            );
+        }
+        return Err(e).with_context(|| {
+            format!(
+                "swapping temp DB {} over live DB {}",
+                tmp_db_path.display(),
+                db_path.display()
+            )
+        });
+    }
+
+    // Step 4: Remove FTS backup (best effort; state is already consistent).
+    if backup_fts_dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(backup_fts_dir)
+    {
+        tracing::warn!(
+            path = %backup_fts_dir.display(),
+            err = %e,
+            "failed to remove FTS backup after successful swap"
+        );
+    }
+
+    Ok(())
+}
+
+fn sibling_fts_dir(fts_dir: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut name = fts_dir
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("fts"))
         .to_os_string();
-    name.push(".reindex-tmp");
+    name.push(".");
+    name.push(suffix);
     fts_dir.with_file_name(name)
 }
 
-fn clean_temp_artifacts(tmp_db_path: &std::path::Path, tmp_fts_dir: &std::path::Path) {
+fn clean_temp_artifacts(
+    tmp_db_path: &std::path::Path,
+    tmp_fts_dir: &std::path::Path,
+    backup_fts_dir: &std::path::Path,
+) {
     if tmp_db_path.exists()
         && let Err(e) = std::fs::remove_file(tmp_db_path)
     {
@@ -128,8 +214,16 @@ fn clean_temp_artifacts(tmp_db_path: &std::path::Path, tmp_fts_dir: &std::path::
             "failed to remove temp FTS dir"
         );
     }
+    if backup_fts_dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(backup_fts_dir)
+    {
+        tracing::warn!(
+            path = %backup_fts_dir.display(),
+            err = %e,
+            "failed to remove FTS backup dir"
+        );
+    }
 }
-
 async fn build_index_in_temp(
     tmp_db_path: &std::path::Path,
     tmp_fts_dir: &std::path::Path,
@@ -657,6 +751,72 @@ mod tests {
             post_results.len(),
             1,
             "FTS must still contain 'zebra' after a failed reindex; live index must not be mutated"
+        );
+    }
+
+    /// Mismatch reindex must succeed and update FTS when the live FTS dir is
+    /// already populated with Tantivy files.
+    ///
+    /// On Linux, rename(2) over a non-empty directory returns ENOTEMPTY.  A
+    /// populated live FTS dir is normal operation, so `reindex_via_temp` must
+    /// vacate the live dir first (backup) and only then rename the temp dir
+    /// into place.
+    #[tokio::test]
+    async fn mismatch_reindex_succeeds_with_populated_fts_dir() {
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
+
+        // Build an initial populated index at dim=384.  This writes Tantivy
+        // files into fts_dir, making it non-empty.
+        {
+            std::fs::write(notes_dir.path().join("note.md"), "# Note\n\nquasar content")
+                .expect("write note");
+
+            let (_db, conn) = db::connect(&db_path, Some(384)).await.expect("connect");
+            let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+            let embedder = embed::Embedder::create_null(384);
+            index::index_directory(&conn, &fts, &embedder, notes_dir.path())
+                .await
+                .expect("initial index");
+        }
+
+        // Sanity: fts_dir must be non-empty (Tantivy has written files).
+        let fts_entry_count = std::fs::read_dir(fts_dir.path())
+            .expect("read fts_dir")
+            .count();
+        assert!(
+            fts_entry_count > 0,
+            "fts_dir must be non-empty before mismatch reindex to trigger the bug"
+        );
+
+        // Run a successful mismatch reindex (dim=1024, no corrupt files).
+        let embedder = embed::Embedder::create_null(1024);
+        let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
+        assert!(
+            result.is_ok(),
+            "mismatch reindex must succeed even when live FTS dir is non-empty: {:?}",
+            result.err()
+        );
+
+        // Both DB and FTS must reflect the new index.
+        let (_db, conn) = db::connect(&db_path, Some(1024))
+            .await
+            .expect("DB must be openable with the new dimension");
+        assert!(
+            db::chunks_table_exists(&conn)
+                .await
+                .expect("check chunks table"),
+            "DB must have chunks table with new dimension"
+        );
+
+        let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let results = fts.search("quasar", 10).await.expect("fts search");
+        assert_eq!(
+            results.len(),
+            1,
+            "FTS must contain the reindexed content after a successful mismatch reindex"
         );
     }
 }
