@@ -6,6 +6,7 @@ mod error;
 mod fts;
 mod hash;
 mod index;
+mod lock;
 mod rank;
 mod similar;
 mod watch;
@@ -304,6 +305,32 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
     }
 }
 
+async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
+    let _lock = lock::IndexLock::try_acquire(&config.db_path)?;
+    let dim = embedder.as_ref().map(Embedder::dim);
+    let (_db, conn) = open_db(&config.db_path, dim).await?;
+    let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
+    let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
+    watch::run_watcher(conn, fts, &embedder, config.notes_dir.clone()).await
+}
+
+async fn run_reindex_command(
+    config: &config::Config,
+    embedder: Option<Embedder>,
+) -> anyhow::Result<()> {
+    let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
+    let _lock = lock::IndexLock::try_acquire(&config.db_path)?;
+    let stats = run_reindex(
+        &config.db_path,
+        &config.tantivy_dir,
+        &embedder,
+        &config.notes_dir,
+    )
+    .await?;
+    tracing::info!(%stats, "reindex complete");
+    Ok(())
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let cli_weights = extract_cli_weights(&cli.command);
     let cli_embed = CliEmbedArgs {
@@ -319,28 +346,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
+    if matches!(cli.command, Command::Watch) {
+        return run_watch(&config, embedder).await;
+    }
+
     if matches!(cli.command, Command::Reindex) {
-        let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-        let stats = run_reindex(
-            &config.db_path,
-            &config.tantivy_dir,
-            &embedder,
-            &config.notes_dir,
-        )
-        .await?;
-        tracing::info!(%stats, "reindex complete");
-        return Ok(());
+        return run_reindex_command(&config, embedder).await;
     }
 
     let dim = embedder.as_ref().map(Embedder::dim);
     let (_db, conn) = open_db(&config.db_path, dim).await?;
 
     match cli.command {
-        Command::Watch => {
-            let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-            let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-            watch::run_watcher(conn, fts, &embedder, config.notes_dir).await?;
-        }
+        Command::Watch | Command::Reindex => unreachable!("handled above"),
         Command::Search {
             query,
             limit,
@@ -403,7 +421,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Reindex => unreachable!("handled above"),
     }
 
     Ok(())
