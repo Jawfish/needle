@@ -21,6 +21,29 @@ use crate::{
     error::NeedleError,
 };
 
+fn is_dimension_mismatch(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NeedleError>()
+        .is_some_and(|e| matches!(e, NeedleError::DimensionMismatch { .. }))
+}
+
+/// Open the database, resetting it first when a dimension mismatch is
+/// encountered and the caller intends to reindex (which rebuilds everything).
+async fn open_db(
+    db_path: &std::path::Path,
+    dim: Option<usize>,
+    allow_reset_on_mismatch: bool,
+) -> anyhow::Result<(libsql::Database, libsql::Connection)> {
+    match db::connect(db_path, dim).await {
+        Ok(pair) => Ok(pair),
+        Err(ref e) if allow_reset_on_mismatch && is_dimension_mismatch(e) => {
+            tracing::warn!("dimension mismatch detected; resetting index for reindex");
+            db::reset(db_path)?;
+            db::connect(db_path, dim).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -70,7 +93,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
     let dim = embedder.as_ref().map(Embedder::dim);
-    let (_db, conn) = db::connect(&config.db_path, dim).await?;
+    let is_reindex = matches!(cli.command, Command::Reindex);
+    let (_db, conn) = open_db(&config.db_path, dim, is_reindex).await?;
 
     match cli.command {
         Command::Watch => {
