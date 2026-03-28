@@ -36,13 +36,16 @@ async fn open_db(
 
 /// Run a full reindex, recovering atomically when there is a dimension mismatch.
 ///
-/// When the stored dimension differs from the embedder dimension the new index
-/// is built into a sibling temp file.  Only after the full reindex succeeds is
-/// the temp file renamed over the original.  On any failure the temp file is
-/// removed and the original DB is left untouched.
+/// When dimensions match, opens the DB and FTS index normally and runs the
+/// reindex in place.
+///
+/// When they differ, both the DB and FTS index are rebuilt into sibling temp
+/// locations.  Only after the full reindex succeeds are both swapped over the
+/// originals with rename(2).  On any failure both temp artifacts are removed
+/// and the originals are left untouched.
 async fn run_reindex(
     db_path: &std::path::Path,
-    fts: &fts::FtsIndex,
+    fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
 ) -> anyhow::Result<index::IndexStats> {
@@ -50,12 +53,13 @@ async fn run_reindex(
 
     match db::connect(db_path, Some(dim)).await {
         Ok((_db, conn)) => {
-            let stats = index::index_directory(&conn, fts, embedder, notes_dir).await?;
+            let fts = fts::FtsIndex::open_or_create(fts_dir)?;
+            let stats = index::index_directory(&conn, &fts, embedder, notes_dir).await?;
             Ok(stats)
         }
         Err(ref e) if is_dimension_mismatch(e) => {
             tracing::warn!("dimension mismatch detected; rebuilding index atomically");
-            reindex_via_temp(db_path, fts, embedder, notes_dir, dim).await
+            reindex_via_temp(db_path, fts_dir, embedder, notes_dir, dim).await
         }
         Err(e) => Err(e),
     }
@@ -63,56 +67,81 @@ async fn run_reindex(
 
 async fn reindex_via_temp(
     db_path: &std::path::Path,
-    fts: &fts::FtsIndex,
+    fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
     dim: usize,
 ) -> anyhow::Result<index::IndexStats> {
-    let tmp_path = db_path.with_extension("reindex-tmp");
+    let tmp_db_path = db_path.with_extension("reindex-tmp");
+    let tmp_fts_dir = sibling_temp_fts_dir(fts_dir);
 
-    // Remove any stale temp file from a previous interrupted attempt.
-    if tmp_path.exists() {
-        std::fs::remove_file(&tmp_path)
-            .with_context(|| format!("removing stale temp DB at {}", tmp_path.display()))?;
-    }
+    clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
 
-    let result = build_index_in_temp(&tmp_path, fts, embedder, notes_dir, dim).await;
+    let result = build_index_in_temp(&tmp_db_path, &tmp_fts_dir, embedder, notes_dir, dim).await;
 
     match result {
         Ok(stats) => {
-            std::fs::rename(&tmp_path, db_path).with_context(|| {
+            std::fs::rename(&tmp_db_path, db_path).with_context(|| {
                 format!(
                     "swapping temp DB {} over {}",
-                    tmp_path.display(),
+                    tmp_db_path.display(),
                     db_path.display()
+                )
+            })?;
+            std::fs::rename(&tmp_fts_dir, fts_dir).with_context(|| {
+                format!(
+                    "swapping temp FTS dir {} over {}",
+                    tmp_fts_dir.display(),
+                    fts_dir.display()
                 )
             })?;
             Ok(stats)
         }
         Err(e) => {
-            if tmp_path.exists()
-                && let Err(rm_err) = std::fs::remove_file(&tmp_path)
-            {
-                tracing::warn!(
-                    path = %tmp_path.display(),
-                    err = %rm_err,
-                    "failed to remove temp DB after reindex failure"
-                );
-            }
+            clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
             Err(e)
         }
     }
 }
 
+fn sibling_temp_fts_dir(fts_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut name = fts_dir
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("fts"))
+        .to_os_string();
+    name.push(".reindex-tmp");
+    fts_dir.with_file_name(name)
+}
+
+fn clean_temp_artifacts(tmp_db_path: &std::path::Path, tmp_fts_dir: &std::path::Path) {
+    if tmp_db_path.exists()
+        && let Err(e) = std::fs::remove_file(tmp_db_path)
+    {
+        tracing::warn!(path = %tmp_db_path.display(), err = %e, "failed to remove temp DB");
+    }
+    if tmp_fts_dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(tmp_fts_dir)
+    {
+        tracing::warn!(
+            path = %tmp_fts_dir.display(),
+            err = %e,
+            "failed to remove temp FTS dir"
+        );
+    }
+}
+
 async fn build_index_in_temp(
-    tmp_path: &std::path::Path,
-    fts: &fts::FtsIndex,
+    tmp_db_path: &std::path::Path,
+    tmp_fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
     dim: usize,
 ) -> anyhow::Result<index::IndexStats> {
-    let (_tmp_db, tmp_conn) = db::connect(tmp_path, Some(dim)).await?;
-    index::index_directory(&tmp_conn, fts, embedder, notes_dir).await
+    std::fs::create_dir_all(tmp_fts_dir)
+        .with_context(|| format!("creating temp FTS dir {}", tmp_fts_dir.display()))?;
+    let (_tmp_db, tmp_conn) = db::connect(tmp_db_path, Some(dim)).await?;
+    let tmp_fts = fts::FtsIndex::open_or_create(tmp_fts_dir)?;
+    index::index_directory(&tmp_conn, &tmp_fts, embedder, notes_dir).await
 }
 
 #[tokio::main]
@@ -165,9 +194,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     if matches!(cli.command, Command::Reindex) {
-        let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
         let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-        let stats = run_reindex(&config.db_path, &fts, &embedder, &config.notes_dir).await?;
+        let stats = run_reindex(
+            &config.db_path,
+            &config.tantivy_dir,
+            &embedder,
+            &config.notes_dir,
+        )
+        .await?;
         tracing::info!(%stats, "reindex complete");
         return Ok(());
     }
@@ -488,9 +522,8 @@ mod tests {
         drop(conn);
         drop(db);
 
-        let fts = fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
         let embedder = embed::Embedder::create_null(1024);
-        let result = run_reindex(&db_path, &fts, &embedder, notes_dir.path()).await;
+        let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
         assert!(
             result.is_ok(),
             "run_reindex must succeed after mismatch: {:?}",
@@ -546,9 +579,8 @@ mod tests {
         }
 
         // Run reindex with dim=1024 (mismatch). The corrupt file should cause failure.
-        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
         let embedder = crate::embed::Embedder::create_null(1024);
-        let result = run_reindex(&db_path, &fts, &embedder, notes_dir.path()).await;
+        let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
         assert!(result.is_err(), "reindex must fail due to corrupt file");
 
         // The original DB file must still be present and contain the prior data.
@@ -563,6 +595,68 @@ mod tests {
         assert!(
             hashes.contains_key("good.md"),
             "prior index content must be intact after failed reindex"
+        );
+    }
+
+    /// Dimension mismatch + reindex failure must not corrupt the live FTS index.
+    ///
+    /// Reproduction of the divergence bug: a temp reindex build fails (corrupt
+    /// file causes `read_to_string` to error), but the old code called fts.rebuild
+    /// on the live index before propagating the error, wiping it. After the fix
+    /// the live FTS must still answer queries for content indexed before the
+    /// failed reindex.
+    #[tokio::test]
+    async fn reindex_failure_preserves_fts_index_on_dimension_mismatch() {
+        use std::io::Write;
+
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
+
+        // Build the initial index with a known searchable term.
+        {
+            let good_md = notes_dir.path().join("good.md");
+            std::fs::write(&good_md, "# Good note\n\nzebra content").expect("write note");
+
+            let (_db, conn) = db::connect(&db_path, Some(384)).await.expect("connect");
+            let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+            let embedder = crate::embed::Embedder::create_null(384);
+            index::index_directory(&conn, &fts, &embedder, notes_dir.path())
+                .await
+                .expect("initial index");
+        }
+
+        // Confirm FTS finds the term before attempting the failing reindex.
+        {
+            let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+            let pre_results = fts.search("zebra", 10).await.expect("pre-reindex search");
+            assert_eq!(
+                pre_results.len(),
+                1,
+                "FTS must contain 'zebra' before the failing reindex"
+            );
+        }
+
+        // Drop a corrupt file so the mismatch reindex fails before completing.
+        let bad_file = notes_dir.path().join("corrupt.md");
+        {
+            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
+            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
+        }
+
+        // Run reindex with dim=1024 (mismatch). Must fail.
+        let embedder = crate::embed::Embedder::create_null(1024);
+        let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
+        assert!(result.is_err(), "reindex must fail due to corrupt file");
+
+        // The live FTS index must still answer queries for the original content.
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let post_results = fts.search("zebra", 10).await.expect("post-reindex search");
+        assert_eq!(
+            post_results.len(),
+            1,
+            "FTS must still contain 'zebra' after a failed reindex; live index must not be mutated"
         );
     }
 }
