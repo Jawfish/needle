@@ -5,7 +5,7 @@ updates:
     schedule:
       interval: daily
     open-pull-requests-limit: 10
-    versioning-strategy: increase
+    versioning-strategy: auto
     groups:
       cargo-dependencies:
         patterns:
