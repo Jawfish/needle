@@ -106,32 +106,20 @@ pub fn plan_directory_index(
     }
 }
 
-pub async fn plan_single_file_index(
-    conn: &Connection,
-    notes_dir: &Path,
-    abs_path: &Path,
-) -> anyhow::Result<SingleFilePlan> {
-    let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
-        |_| abs_path.to_string_lossy().to_string(),
-        |p| p.to_string_lossy().to_string(),
-    );
-
-    let content = tokio::fs::read_to_string(abs_path).await?;
-    let file_hash = hash::content_hash(&content);
-
-    if db::note_hash(conn, &rel_path)
-        .await?
-        .is_some_and(|h| h == file_hash)
-    {
-        return Ok(SingleFilePlan::Unchanged);
+pub fn plan_single_file(
+    rel_path: String,
+    stored_hash: Option<&str>,
+    content: &str,
+) -> SingleFilePlan {
+    let file_hash = hash::content_hash(content);
+    if stored_hash.is_some_and(|h| h == file_hash) {
+        return SingleFilePlan::Unchanged;
     }
-
-    let chunks = embed::chunk_text(&content);
-    Ok(SingleFilePlan::NeedsIndex {
+    SingleFilePlan::NeedsIndex {
         rel_path,
         content_hash: file_hash,
-        chunks,
-    })
+        chunks: embed::chunk_text(content),
+    }
 }
 
 pub async fn execute_directory_plan(
@@ -220,7 +208,13 @@ pub async fn index_single_file(
     notes_dir: &Path,
     abs_path: &Path,
 ) -> anyhow::Result<FtsStatus> {
-    let plan = plan_single_file_index(conn, notes_dir, abs_path).await?;
+    let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
+        |_| abs_path.to_string_lossy().to_string(),
+        |p| p.to_string_lossy().to_string(),
+    );
+    let content = tokio::fs::read_to_string(abs_path).await?;
+    let stored_hash = db::note_hash(conn, &rel_path).await?;
+    let plan = plan_single_file(rel_path, stored_hash.as_deref(), &content);
     execute_single_file_plan(conn, fts, embedder, plan).await
 }
 
@@ -422,6 +416,44 @@ mod tests {
         assert!(plan.to_update.is_empty());
         assert!(plan.to_delete.is_empty());
         assert_eq!(plan.unchanged_count, 0);
+    }
+
+    #[test]
+    fn single_file_plan_is_unchanged_when_hash_matches() {
+        let content = "hello world";
+        let stored = hash::content_hash(content);
+        let plan = plan_single_file("note.md".to_string(), Some(&stored), content);
+        assert!(matches!(plan, SingleFilePlan::Unchanged));
+    }
+
+    #[test]
+    fn single_file_plan_needs_index_when_no_stored_hash() {
+        let content = "hello world";
+        let plan = plan_single_file("note.md".to_string(), None, content);
+        match plan {
+            SingleFilePlan::NeedsIndex {
+                rel_path,
+                content_hash,
+                chunks,
+            } => {
+                assert_eq!(rel_path, "note.md");
+                assert_eq!(content_hash, hash::content_hash(content));
+                assert!(!chunks.is_empty());
+            }
+            SingleFilePlan::Unchanged => panic!("expected NeedsIndex"),
+        }
+    }
+
+    #[test]
+    fn single_file_plan_needs_index_when_hash_differs() {
+        let content = "updated content";
+        let plan = plan_single_file("note.md".to_string(), Some("oldhash"), content);
+        match plan {
+            SingleFilePlan::NeedsIndex { content_hash, .. } => {
+                assert_eq!(content_hash, hash::content_hash(content));
+            }
+            SingleFilePlan::Unchanged => panic!("expected NeedsIndex"),
+        }
     }
 
     #[test]
