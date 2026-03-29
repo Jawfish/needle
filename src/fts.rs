@@ -35,6 +35,26 @@ fn ensure_writer<'a>(
     slot.as_mut().context("writer not initialized")
 }
 
+/// Run `f` against the writer, dropping it from the slot on any error.
+///
+/// Tantivy's `IndexWriter` panics in `Drop` when it holds uncommitted
+/// segments and the internal rollback fails.  If `f` returns `Err` the
+/// writer is in an unknown state, so we evict it before returning.  The
+/// evicted writer's `Drop` then calls `rollback()` on a clean writer
+/// (no in-progress segments from our failed operation), making a second
+/// panic impossible and preventing the double-panic abort.
+fn with_writer(
+    slot: &mut Option<IndexWriter>,
+    index: &tantivy::Index,
+    f: impl FnOnce(&mut IndexWriter) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let result = ensure_writer(slot, index).and_then(|w| f(w));
+    if result.is_err() {
+        *slot = None;
+    }
+    result
+}
+
 impl FtsIndex {
     pub fn open_or_create(index_dir: &Path) -> anyhow::Result<Self> {
         let content_options = TextOptions::default()
@@ -101,20 +121,20 @@ impl FtsIndex {
         #[allow(clippy::significant_drop_tightening)]
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.blocking_lock();
-            let w = ensure_writer(&mut guard, &index)?;
+            with_writer(&mut guard, &index, |w| {
+                let path_term = tantivy::Term::from_field_text(path_field, &path_owned);
+                w.delete_term(path_term);
 
-            let path_term = tantivy::Term::from_field_text(path_field, &path_owned);
-            w.delete_term(path_term);
+                for chunk in &chunks_owned {
+                    let mut doc = TantivyDocument::new();
+                    doc.add_text(path_field, &path_owned);
+                    doc.add_text(content_field, chunk);
+                    w.add_document(doc)?;
+                }
 
-            for chunk in &chunks_owned {
-                let mut doc = TantivyDocument::new();
-                doc.add_text(path_field, &path_owned);
-                doc.add_text(content_field, chunk);
-                w.add_document(doc)?;
-            }
-
-            w.commit()?;
-            anyhow::Ok(())
+                w.commit()?;
+                anyhow::Ok(())
+            })
         })
         .await??;
 
@@ -130,12 +150,12 @@ impl FtsIndex {
         #[allow(clippy::significant_drop_tightening)]
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.blocking_lock();
-            let w = ensure_writer(&mut guard, &index)?;
-
-            let path_term = tantivy::Term::from_field_text(path_field, &path_owned);
-            w.delete_term(path_term);
-            w.commit()?;
-            anyhow::Ok(())
+            with_writer(&mut guard, &index, |w| {
+                let path_term = tantivy::Term::from_field_text(path_field, &path_owned);
+                w.delete_term(path_term);
+                w.commit()?;
+                anyhow::Ok(())
+            })
         })
         .await??;
 
@@ -217,19 +237,19 @@ impl FtsIndex {
         #[allow(clippy::significant_drop_tightening)]
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.blocking_lock();
-            let w = ensure_writer(&mut guard, &index)?;
+            with_writer(&mut guard, &index, |w| {
+                w.delete_all_documents()?;
 
-            w.delete_all_documents()?;
+                for (path, content) in &chunks {
+                    let mut doc = TantivyDocument::new();
+                    doc.add_text(path_field, path);
+                    doc.add_text(content_field, content);
+                    w.add_document(doc)?;
+                }
 
-            for (path, content) in &chunks {
-                let mut doc = TantivyDocument::new();
-                doc.add_text(path_field, path);
-                doc.add_text(content_field, content);
-                w.add_document(doc)?;
-            }
-
-            w.commit()?;
-            anyhow::Ok(())
+                w.commit()?;
+                anyhow::Ok(())
+            })
         })
         .await??;
 
