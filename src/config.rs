@@ -70,9 +70,9 @@ impl Config {
         let embed = resolve_embed_config(cli_embed, &file_config);
 
         let notes_dir = cli_notes_dir
-            .or_else(|| std::env::var("ZK_NOTEBOOK_DIR").ok().map(PathBuf::from))
+            .or_else(|| std::env::var("NEEDLE_DOCS_DIR").ok().map(PathBuf::from))
             .or(file_config.notes_dir)
-            .context("notes directory not specified: use --notes-dir, set ZK_NOTEBOOK_DIR, or set notes_dir in config.toml")?;
+            .context("notes directory not specified: use --notes-dir, set NEEDLE_DOCS_DIR, or set notes_dir in config.toml")?;
 
         if !notes_dir.is_dir() {
             return Err(NeedleError::NotesDirectoryNotFound(notes_dir).into());

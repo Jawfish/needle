@@ -6,7 +6,7 @@ Semantic search for a directory of markdown files. Combines vector similarity, f
 
 ```text
 cargo install --path .
-export ZK_NOTEBOOK_DIR=/path/to/notes
+export NEEDLE_DOCS_DIR=/path/to/notes
 ```
 
 By default, needle uses [fastembed](https://github.com/Anush008/fastembed-rs) for local embeddings (all-MiniLM-L6-v2). No API key needed. The model downloads automatically on first run.
@@ -136,7 +136,7 @@ Environment variables override the config file. CLI flags override everything.
 | Voyage API key      | `VOYAGE_API_KEY`  | `voyage_api_key` |
 | OpenAI API key      | `OPENAI_API_KEY`  | `openai_api_key` |
 | Custom endpoint key | `NEEDLE_API_KEY`  | `needle_api_key` |
-| Notes directory     | `ZK_NOTEBOOK_DIR` | `notes_dir`      |
+| Notes directory     | `NEEDLE_DOCS_DIR` | `notes_dir`      |
 
 ## How it works
 

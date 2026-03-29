@@ -3,7 +3,7 @@ use std::path::PathBuf;
 #[derive(clap::Parser)]
 #[command(name = "needle", about = "Semantic search for markdown notes")]
 pub struct Cli {
-    #[arg(long, env = "ZK_NOTEBOOK_DIR")]
+    #[arg(long, env = "NEEDLE_DOCS_DIR")]
     pub notes_dir: Option<PathBuf>,
 
     #[arg(long, env = "NEEDLE_PROVIDER")]
