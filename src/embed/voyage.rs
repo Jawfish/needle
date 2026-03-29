@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use serde::Serialize;
 
-use super::{EmbeddingResponse, send_with_retry};
+use super::{EmbeddingResponse, HttpTransport, send_with_retry};
 use crate::error::NeedleError;
 
 const DEFAULT_API_URL: &str = "https://api.voyageai.com/v1/embeddings";
@@ -10,7 +12,7 @@ const DEFAULT_DIM: usize = 1024;
 const MAX_BATCH_SIZE: usize = 128;
 
 pub struct VoyageProvider {
-    client: reqwest::Client,
+    transport: Arc<dyn HttpTransport>,
     api_key: String,
     model: String,
     dim: usize,
@@ -28,6 +30,7 @@ impl VoyageProvider {
         api_key: &str,
         model: Option<&str>,
         dim_override: Option<usize>,
+        transport: Arc<dyn HttpTransport>,
     ) -> anyhow::Result<Self> {
         let model_name = model.unwrap_or(DEFAULT_MODEL);
         let dim = dim_override
@@ -37,7 +40,7 @@ impl VoyageProvider {
             })?;
 
         Ok(Self {
-            client: super::build_http_client()?,
+            transport,
             api_key: api_key.to_owned(),
             model: model_name.to_owned(),
             dim,
@@ -71,18 +74,28 @@ impl VoyageProvider {
             input: texts,
             input_type,
         };
-        let json_body = serde_json::to_value(&body)?;
-
+        let json_body = serde_json::to_vec(&body)?;
         let api_key = self.api_key.clone();
-        let response = send_with_retry(|| {
-            self.client
+
+        // A throwaway client is used only to build the `reqwest::Request`
+        // value; actual dispatch goes through the injected transport.
+        let builder_client = reqwest::Client::new();
+
+        let body_bytes = send_with_retry(self.transport.as_ref(), || {
+            Ok(builder_client
                 .post(DEFAULT_API_URL)
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&json_body)
+                .header("Content-Type", "application/json")
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .context("invalid API key characters")?,
+                )
+                .body(json_body.clone())
+                .build()?)
         })
         .await?;
 
-        let parsed: EmbeddingResponse = response.json().await?;
+        let parsed: EmbeddingResponse = serde_json::from_slice(&body_bytes)?;
         let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
         if embeddings.len() != texts.len() {
             return Err(NeedleError::EmbeddingCountMismatch {
