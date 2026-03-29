@@ -372,9 +372,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 std::io::stdin().is_terminal(),
             )?;
             let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
+            let semantic = db::DbSemanticSource::new(conn.clone());
+            let fts_src = fts::FtsFtsSource::new(fts);
+            let path_src = db::DbPathSource::new(conn.clone());
             let results = rank::search(
-                &conn,
-                &fts,
+                &semantic,
+                &fts_src,
+                &path_src,
                 embedder.as_ref(),
                 &query,
                 limit,

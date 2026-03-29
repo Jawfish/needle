@@ -237,6 +237,36 @@ impl FtsIndex {
     }
 }
 
+/// Adapter: implements `FtsSource` against a live `FtsIndex`.
+pub struct FtsFtsSource {
+    index: FtsIndex,
+}
+
+impl FtsFtsSource {
+    pub const fn new(index: FtsIndex) -> Self {
+        Self { index }
+    }
+}
+
+impl crate::rank::FtsSource for FtsFtsSource {
+    fn search_fts<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> crate::rank::SearchFuture<'a, Vec<crate::rank::Candidate>> {
+        Box::pin(async move {
+            let results = self.index.search(query, limit).await?;
+            Ok(results
+                .into_iter()
+                .map(|r| crate::rank::Candidate {
+                    path: r.path,
+                    snippet: r.snippet,
+                })
+                .collect())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

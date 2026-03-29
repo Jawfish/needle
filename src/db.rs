@@ -6,6 +6,8 @@ use std::{
 use anyhow::{Context, bail};
 use libsql::Connection;
 
+use crate::rank::{Candidate, PathSource, SemanticSource};
+
 const BYTES_PER_F32: usize = 4;
 
 pub fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
@@ -409,6 +411,63 @@ pub async fn search_related(
         }
 
         k = k.saturating_mul(2).min(RELATED_MAX_K);
+    }
+}
+
+pub async fn all_note_paths(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    let mut rows = conn.query("SELECT path FROM notes", ()).await?;
+    let mut paths = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let path: String = row.get(0)?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Adapter: implements `SemanticSource` against a live libsql connection.
+pub struct DbSemanticSource {
+    conn: Connection,
+}
+
+impl DbSemanticSource {
+    pub const fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl SemanticSource for DbSemanticSource {
+    fn search_semantic<'a>(
+        &'a self,
+        query_embedding: &'a [f32],
+        limit: usize,
+    ) -> crate::rank::SearchFuture<'a, Vec<Candidate>> {
+        Box::pin(async move {
+            let results = search_semantic(&self.conn, query_embedding, limit).await?;
+            Ok(results
+                .into_iter()
+                .map(|r| Candidate {
+                    path: r.path,
+                    snippet: r.snippet,
+                })
+                .collect())
+        })
+    }
+}
+
+/// Adapter: implements `PathSource` against a live libsql connection.
+pub struct DbPathSource {
+    conn: Connection,
+}
+
+impl DbPathSource {
+    pub const fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl PathSource for DbPathSource {
+    fn all_paths(&self) -> crate::rank::SearchFuture<'_, Vec<String>> {
+        Box::pin(all_note_paths(&self.conn))
     }
 }
 

@@ -1,15 +1,42 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, pin::Pin};
 
-use libsql::Connection;
 use nucleo::{
     Config as NucleoConfig, Matcher, Utf32Str,
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
 };
 
 pub use crate::types::RrfWeights;
-use crate::{db, embed::Embedder, error::NeedleError, fts::FtsIndex};
+use crate::{embed::Embedder, error::NeedleError};
 
 const RRF_K: f64 = 60.0;
+
+pub type SearchFuture<'a, T> =
+    Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
+/// A ranked document candidate returned by any search signal.
+pub struct Candidate {
+    pub path: String,
+    pub snippet: String,
+}
+
+/// Port: produces semantic nearest-neighbour candidates for a query embedding.
+pub trait SemanticSource: Send + Sync {
+    fn search_semantic<'a>(
+        &'a self,
+        query_embedding: &'a [f32],
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<Candidate>>;
+}
+
+/// Port: produces full-text search candidates for a query string.
+pub trait FtsSource: Send + Sync {
+    fn search_fts<'a>(&'a self, query: &'a str, limit: usize) -> SearchFuture<'a, Vec<Candidate>>;
+}
+
+/// Port: returns all indexed note paths (used for filename ranking).
+pub trait PathSource: Send + Sync {
+    fn all_paths(&self) -> SearchFuture<'_, Vec<String>>;
+}
 
 pub struct FusedResult {
     pub path: String,
@@ -18,8 +45,9 @@ pub struct FusedResult {
 }
 
 pub async fn search(
-    conn: &Connection,
-    fts: &FtsIndex,
+    semantic: &dyn SemanticSource,
+    fts: &dyn FtsSource,
+    paths: &dyn PathSource,
     embedder: Option<&Embedder>,
     query: &str,
     limit: usize,
@@ -27,23 +55,25 @@ pub async fn search(
 ) -> anyhow::Result<Vec<FusedResult>> {
     let candidate_limit = limit.saturating_mul(5);
 
-    let semantic_ranked = if weights.semantic > 0.0 {
+    let semantic_candidates = if weights.semantic > 0.0 {
         let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
         let embedding = embedder.embed_query(query).await?;
-        db::search_semantic(conn, &embedding, candidate_limit).await?
+        semantic
+            .search_semantic(&embedding, candidate_limit)
+            .await?
     } else {
         Vec::new()
     };
 
-    let fts_ranked = if weights.fts > 0.0 {
-        search_fts(fts, query, candidate_limit).await?
+    let fts_candidates = if weights.fts > 0.0 {
+        fts.search_fts(query, candidate_limit).await?
     } else {
         Vec::new()
     };
 
-    let all_paths = collect_all_paths(conn).await?;
+    let all_paths = paths.all_paths().await?;
 
-    let filename_ranked = if weights.filename > 0.0 {
+    let filename_candidates = if weights.filename > 0.0 {
         rank_by_filename(query, &all_paths)
     } else {
         Vec::new()
@@ -51,17 +81,9 @@ pub async fn search(
 
     let mut scores: HashMap<String, (f64, String)> = HashMap::new();
 
-    let semantic_items: Vec<RankedItem> = semantic_ranked
-        .into_iter()
-        .map(|r| RankedItem {
-            path: r.path,
-            snippet: r.snippet,
-        })
-        .collect();
-
-    accumulate_rrf(&mut scores, &semantic_items, weights.semantic);
-    accumulate_rrf(&mut scores, &fts_ranked, weights.fts);
-    accumulate_rrf(&mut scores, &filename_ranked, weights.filename);
+    accumulate_rrf(&mut scores, &semantic_candidates, weights.semantic);
+    accumulate_rrf(&mut scores, &fts_candidates, weights.fts);
+    accumulate_rrf(&mut scores, &filename_candidates, weights.filename);
 
     let mut results: Vec<FusedResult> = scores
         .into_iter()
@@ -82,13 +104,12 @@ pub async fn search(
     Ok(results)
 }
 
-struct RankedItem {
-    path: String,
-    snippet: String,
-}
-
-fn accumulate_rrf(scores: &mut HashMap<String, (f64, String)>, items: &[RankedItem], weight: f64) {
-    for (rank, item) in items.iter().enumerate() {
+fn accumulate_rrf(
+    scores: &mut HashMap<String, (f64, String)>,
+    candidates: &[Candidate],
+    weight: f64,
+) {
+    for (rank, item) in candidates.iter().enumerate() {
         #[allow(clippy::cast_precision_loss)]
         let rrf_score = weight / (RRF_K + (rank as f64) + 1.0);
         let entry = scores
@@ -98,18 +119,7 @@ fn accumulate_rrf(scores: &mut HashMap<String, (f64, String)>, items: &[RankedIt
     }
 }
 
-async fn search_fts(fts: &FtsIndex, query: &str, limit: usize) -> anyhow::Result<Vec<RankedItem>> {
-    let results = fts.search(query, limit).await?;
-    Ok(results
-        .into_iter()
-        .map(|r| RankedItem {
-            path: r.path,
-            snippet: r.snippet,
-        })
-        .collect())
-}
-
-fn rank_by_filename(query: &str, paths: &[String]) -> Vec<RankedItem> {
+fn rank_by_filename(query: &str, paths: &[String]) -> Vec<Candidate> {
     let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
     let atom = Atom::new(
         query,
@@ -132,26 +142,26 @@ fn rank_by_filename(query: &str, paths: &[String]) -> Vec<RankedItem> {
 
     scored
         .into_iter()
-        .map(|(_, path)| RankedItem {
+        .map(|(_, path)| Candidate {
             path: path.clone(),
             snippet: path.clone(),
         })
         .collect()
 }
 
-async fn collect_all_paths(conn: &Connection) -> anyhow::Result<Vec<String>> {
-    let mut rows = conn.query("SELECT path FROM notes", ()).await?;
-    let mut paths = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let path: String = row.get(0)?;
-        paths.push(path);
-    }
-    Ok(paths)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidates(paths: &[(&str, &str)]) -> Vec<Candidate> {
+        paths
+            .iter()
+            .map(|(p, s)| Candidate {
+                path: (*p).to_owned(),
+                snippet: (*s).to_owned(),
+            })
+            .collect()
+    }
 
     #[test]
     fn rrf_weights_default_values() {
@@ -164,16 +174,7 @@ mod tests {
     #[test]
     fn accumulate_rrf_scores_first_item_highest() {
         let mut scores = HashMap::new();
-        let items = vec![
-            RankedItem {
-                path: "first.md".to_owned(),
-                snippet: "first".to_owned(),
-            },
-            RankedItem {
-                path: "second.md".to_owned(),
-                snippet: "second".to_owned(),
-            },
-        ];
+        let items = candidates(&[("first.md", "first"), ("second.md", "second")]);
         accumulate_rrf(&mut scores, &items, 1.0);
 
         let first = scores.get("first.md").expect("first should be scored").0;
@@ -186,10 +187,7 @@ mod tests {
 
     #[test]
     fn accumulate_rrf_applies_weight_multiplier() {
-        let items = vec![RankedItem {
-            path: "note.md".to_owned(),
-            snippet: String::new(),
-        }];
+        let items = candidates(&[("note.md", "")]);
 
         let mut scores_low = HashMap::new();
         accumulate_rrf(&mut scores_low, &items, 1.0);
@@ -208,10 +206,7 @@ mod tests {
     #[test]
     fn accumulate_rrf_zero_weight_produces_zero_score() {
         let mut scores = HashMap::new();
-        let items = vec![RankedItem {
-            path: "note.md".to_owned(),
-            snippet: String::new(),
-        }];
+        let items = candidates(&[("note.md", "")]);
         accumulate_rrf(&mut scores, &items, 0.0);
 
         let score = scores.get("note.md").expect("should exist").0;
@@ -224,15 +219,8 @@ mod tests {
     #[test]
     fn accumulate_rrf_sums_scores_for_same_path() {
         let mut scores = HashMap::new();
-
-        let items_a = vec![RankedItem {
-            path: "note.md".to_owned(),
-            snippet: "from signal a".to_owned(),
-        }];
-        let items_b = vec![RankedItem {
-            path: "note.md".to_owned(),
-            snippet: "from signal b".to_owned(),
-        }];
+        let items_a = candidates(&[("note.md", "from signal a")]);
+        let items_b = candidates(&[("note.md", "from signal b")]);
 
         accumulate_rrf(&mut scores, &items_a, 1.0);
         accumulate_rrf(&mut scores, &items_b, 1.0);
@@ -248,16 +236,7 @@ mod tests {
     #[test]
     fn accumulate_rrf_formula_matches_specification() {
         let mut scores = HashMap::new();
-        let items = vec![
-            RankedItem {
-                path: "a.md".to_owned(),
-                snippet: String::new(),
-            },
-            RankedItem {
-                path: "b.md".to_owned(),
-                snippet: String::new(),
-            },
-        ];
+        let items = candidates(&[("a.md", ""), ("b.md", "")]);
         accumulate_rrf(&mut scores, &items, 1.0);
 
         let a = scores.get("a.md").expect("should exist").0;
@@ -272,14 +251,8 @@ mod tests {
     #[test]
     fn accumulate_rrf_keeps_first_snippet_for_path() {
         let mut scores = HashMap::new();
-        let items_a = vec![RankedItem {
-            path: "note.md".to_owned(),
-            snippet: "first snippet".to_owned(),
-        }];
-        let items_b = vec![RankedItem {
-            path: "note.md".to_owned(),
-            snippet: "second snippet".to_owned(),
-        }];
+        let items_a = candidates(&[("note.md", "first snippet")]);
+        let items_b = candidates(&[("note.md", "second snippet")]);
 
         accumulate_rrf(&mut scores, &items_a, 1.0);
         accumulate_rrf(&mut scores, &items_b, 1.0);
@@ -334,6 +307,9 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // Integration tests: wire concrete db/fts adapters to verify the full search
+    // path without touching rank's business logic directly.
+
     #[tokio::test]
     async fn search_fuses_fts_and_filename_signals() {
         let db_dir = tempfile::tempdir().expect("tempdir");
@@ -378,12 +354,16 @@ mod tests {
         .await
         .expect("fts upsert");
 
+        let semantic = crate::db::DbSemanticSource::new(conn.clone());
+        let fts_src = crate::fts::FtsFtsSource::new(fts);
+        let path_src = crate::db::DbPathSource::new(conn.clone());
+
         let weights = RrfWeights {
             semantic: 0.0,
             fts: 1.0,
             filename: 1.0,
         };
-        let results = search(&conn, &fts, None, "rust", 10, &weights)
+        let results = search(&semantic, &fts_src, &path_src, None, "rust", 10, &weights)
             .await
             .expect("search");
 
@@ -415,14 +395,26 @@ mod tests {
             .await
             .expect("fts upsert");
 
+        let semantic = crate::db::DbSemanticSource::new(conn.clone());
+        let fts_src = crate::fts::FtsFtsSource::new(fts);
+        let path_src = crate::db::DbPathSource::new(conn.clone());
+
         let weights = RrfWeights {
             semantic: 0.0,
             fts: 1.0,
             filename: 0.0,
         };
-        let results = search(&conn, &fts, None, "searchable", 10, &weights)
-            .await
-            .expect("search without api key");
+        let results = search(
+            &semantic,
+            &fts_src,
+            &path_src,
+            None,
+            "searchable",
+            10,
+            &weights,
+        )
+        .await
+        .expect("search without api key");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "note.md");
@@ -438,12 +430,19 @@ mod tests {
         let fts_dir = tempfile::tempdir().expect("tempdir");
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
 
+        let semantic = crate::db::DbSemanticSource::new(conn.clone());
+        let fts_src = crate::fts::FtsFtsSource::new(fts);
+        let path_src = crate::db::DbPathSource::new(conn.clone());
+
         let weights = RrfWeights {
             semantic: 1.0,
             fts: 1.0,
             filename: 1.0,
         };
-        let result = search(&conn, &fts, None, "anything", 10, &weights).await;
+        let result = search(
+            &semantic, &fts_src, &path_src, None, "anything", 10, &weights,
+        )
+        .await;
         assert!(result.is_err());
     }
 }

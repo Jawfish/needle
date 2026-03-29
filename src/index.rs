@@ -33,93 +33,84 @@ pub enum FtsStatus {
     Stale,
 }
 
-const FILE_BATCH_SIZE: usize = 50;
-
-struct PendingFile {
-    path: String,
-    content_hash: String,
-    chunks: Vec<String>,
-    is_new: bool,
+#[derive(Debug, PartialEq)]
+pub struct DiskFile {
+    pub content_hash: String,
+    pub chunks: Vec<String>,
 }
 
-pub async fn index_directory(
-    conn: &Connection,
-    fts: &FtsIndex,
-    embedder: &Embedder,
-    notes_dir: &Path,
-) -> anyhow::Result<IndexStats> {
-    let existing_hashes = db::all_note_hashes(conn).await?;
-    let disk_files = collect_markdown_files(notes_dir)?;
+#[derive(Debug, PartialEq)]
+pub struct FileToIndex {
+    pub rel_path: String,
+    pub content_hash: String,
+    pub chunks: Vec<String>,
+    pub is_new: bool,
+}
 
-    let mut pending = Vec::new();
-    let mut unchanged = 0usize;
+#[derive(Debug, PartialEq)]
+pub struct DirectoryIndexPlan {
+    pub to_add: Vec<FileToIndex>,
+    pub to_update: Vec<FileToIndex>,
+    pub to_delete: Vec<String>,
+    pub unchanged_count: usize,
+}
 
-    for (rel_path, abs_path) in &disk_files {
-        let content = tokio::fs::read_to_string(abs_path).await?;
-        let file_hash = hash::content_hash(&content);
+pub enum SingleFilePlan {
+    Unchanged,
+    NeedsIndex {
+        rel_path: String,
+        content_hash: String,
+        chunks: Vec<String>,
+    },
+}
 
-        if existing_hashes
-            .get(rel_path)
-            .is_some_and(|h| *h == file_hash)
-        {
-            unchanged += 1;
-            continue;
+const FILE_BATCH_SIZE: usize = 50;
+
+pub fn plan_directory_index(
+    existing_hashes: &HashMap<String, String>,
+    disk_files: &HashMap<String, DiskFile>,
+) -> DirectoryIndexPlan {
+    let mut to_add = Vec::new();
+    let mut to_update = Vec::new();
+    let mut unchanged_count = 0usize;
+
+    for (rel_path, disk_file) in disk_files {
+        match existing_hashes.get(rel_path) {
+            None => to_add.push(FileToIndex {
+                rel_path: rel_path.clone(),
+                content_hash: disk_file.content_hash.clone(),
+                chunks: disk_file.chunks.clone(),
+                is_new: true,
+            }),
+            Some(stored) if stored != &disk_file.content_hash => to_update.push(FileToIndex {
+                rel_path: rel_path.clone(),
+                content_hash: disk_file.content_hash.clone(),
+                chunks: disk_file.chunks.clone(),
+                is_new: false,
+            }),
+            _ => unchanged_count += 1,
         }
-
-        let is_new = !existing_hashes.contains_key(rel_path);
-        let chunks = embed::chunk_text(&content);
-
-        pending.push(PendingFile {
-            path: rel_path.clone(),
-            content_hash: file_hash,
-            chunks,
-            is_new,
-        });
     }
 
-    let deleted_paths: Vec<String> = existing_hashes
+    let to_delete = existing_hashes
         .keys()
         .filter(|p| !disk_files.contains_key(p.as_str()))
         .cloned()
         .collect();
 
-    for path in &deleted_paths {
-        db::delete_note(conn, path).await?;
-        tracing::info!(path, "deleted from index");
+    DirectoryIndexPlan {
+        to_add,
+        to_update,
+        to_delete,
+        unchanged_count,
     }
-
-    // Embed and write pending files (may fail partway through)
-    let embed_result = if pending.is_empty() {
-        Ok(())
-    } else {
-        embed_and_write_pending(conn, embedder, &pending).await
-    };
-
-    // Always rebuild FTS from authoritative DB state
-    let all_chunks = db::all_chunks(conn).await?;
-    fts.rebuild(all_chunks).await?;
-
-    // Propagate embedding error after FTS is reconciled
-    embed_result?;
-
-    let added = pending.iter().filter(|f| f.is_new).count();
-    let updated = pending.len() - added;
-
-    Ok(IndexStats {
-        added,
-        updated,
-        deleted: deleted_paths.len(),
-        unchanged,
-    })
 }
 
-pub async fn index_single_file(
+pub async fn plan_single_file_index(
     conn: &Connection,
-    fts: &FtsIndex,
-    embedder: &Embedder,
     notes_dir: &Path,
     abs_path: &Path,
-) -> anyhow::Result<FtsStatus> {
+) -> anyhow::Result<SingleFilePlan> {
     let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
         |_| abs_path.to_string_lossy().to_string(),
         |p| p.to_string_lossy().to_string(),
@@ -132,38 +123,133 @@ pub async fn index_single_file(
         .await?
         .is_some_and(|h| h == file_hash)
     {
-        return Ok(FtsStatus::Current);
+        return Ok(SingleFilePlan::Unchanged);
     }
 
     let chunks = embed::chunk_text(&content);
-    let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
-    let embeddings = embedder.embed_documents(&chunk_refs).await?;
-
-    let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
-    db::upsert_note(conn, &rel_path, &file_hash, &paired).await?;
-
-    let fts_chunks: Vec<String> = paired.into_iter().map(|(text, _)| text).collect();
-    let status = if fts.upsert(&rel_path, &fts_chunks).await.is_ok() {
-        FtsStatus::Current
-    } else {
-        tracing::warn!(path = rel_path, "FTS upsert failed");
-        FtsStatus::Stale
-    };
-
-    tracing::info!(path = rel_path, "indexed");
-    Ok(status)
+    Ok(SingleFilePlan::NeedsIndex {
+        rel_path,
+        content_hash: file_hash,
+        chunks,
+    })
 }
 
-async fn embed_and_write_pending(
+pub async fn execute_directory_plan(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    plan: DirectoryIndexPlan,
+) -> anyhow::Result<IndexStats> {
+    let added_count = plan.to_add.len();
+    let updated_count = plan.to_update.len();
+
+    for path in &plan.to_delete {
+        db::delete_note(conn, path).await?;
+        tracing::info!(path, "deleted from index");
+    }
+
+    let to_embed: Vec<&FileToIndex> = plan.to_add.iter().chain(plan.to_update.iter()).collect();
+
+    let embed_result = if to_embed.is_empty() {
+        Ok(())
+    } else {
+        embed_and_upsert(conn, embedder, &to_embed).await
+    };
+
+    let all_chunks = db::all_chunks(conn).await?;
+    fts.rebuild(all_chunks).await?;
+
+    embed_result?;
+
+    Ok(IndexStats {
+        added: added_count,
+        updated: updated_count,
+        deleted: plan.to_delete.len(),
+        unchanged: plan.unchanged_count,
+    })
+}
+
+pub async fn execute_single_file_plan(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    plan: SingleFilePlan,
+) -> anyhow::Result<FtsStatus> {
+    match plan {
+        SingleFilePlan::Unchanged => Ok(FtsStatus::Current),
+        SingleFilePlan::NeedsIndex {
+            rel_path,
+            content_hash,
+            chunks,
+        } => {
+            let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+            let embeddings = embedder.embed_documents(&chunk_refs).await?;
+            let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
+            db::upsert_note(conn, &rel_path, &content_hash, &paired).await?;
+
+            let fts_chunks: Vec<String> = paired.into_iter().map(|(text, _)| text).collect();
+            let status = if fts.upsert(&rel_path, &fts_chunks).await.is_ok() {
+                FtsStatus::Current
+            } else {
+                tracing::warn!(path = rel_path, "FTS upsert failed");
+                FtsStatus::Stale
+            };
+
+            tracing::info!(path = rel_path, "indexed");
+            Ok(status)
+        }
+    }
+}
+
+pub async fn index_directory(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    notes_dir: &Path,
+) -> anyhow::Result<IndexStats> {
+    let existing_hashes = db::all_note_hashes(conn).await?;
+    let disk_files = read_disk_hashes(notes_dir).await?;
+    let plan = plan_directory_index(&existing_hashes, &disk_files);
+    execute_directory_plan(conn, fts, embedder, plan).await
+}
+
+pub async fn index_single_file(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    notes_dir: &Path,
+    abs_path: &Path,
+) -> anyhow::Result<FtsStatus> {
+    let plan = plan_single_file_index(conn, notes_dir, abs_path).await?;
+    execute_single_file_plan(conn, fts, embedder, plan).await
+}
+
+async fn read_disk_hashes(dir: &Path) -> anyhow::Result<HashMap<String, DiskFile>> {
+    let files = collect_markdown_files(dir)?;
+    let mut out = HashMap::with_capacity(files.len());
+    for (rel_path, abs_path) in files {
+        let content = tokio::fs::read_to_string(&abs_path).await?;
+        out.insert(
+            rel_path,
+            DiskFile {
+                content_hash: hash::content_hash(&content),
+                chunks: embed::chunk_text(&content),
+            },
+        );
+    }
+    Ok(out)
+}
+
+async fn embed_and_upsert(
     conn: &Connection,
     embedder: &Embedder,
-    pending: &[PendingFile],
+    files: &[&FileToIndex],
 ) -> anyhow::Result<()> {
-    let total_chunks: usize = pending.iter().map(|f| f.chunks.len()).sum();
-    tracing::info!(files = pending.len(), chunks = total_chunks, "embedding");
+    let total_chunks: usize = files.iter().map(|f| f.chunks.len()).sum();
+    tracing::info!(files = files.len(), chunks = total_chunks, "embedding");
 
-    for file_batch in pending.chunks(FILE_BATCH_SIZE) {
-        let batch_texts: Vec<&str> = file_batch
+    for batch in files.chunks(FILE_BATCH_SIZE) {
+        let batch_texts: Vec<&str> = batch
             .iter()
             .flat_map(|f| f.chunks.iter().map(String::as_str))
             .collect();
@@ -171,8 +257,8 @@ async fn embed_and_write_pending(
         let batch_embeddings = embedder.embed_documents(&batch_texts).await?;
 
         let mut offset = 0;
-        for file in file_batch {
-            let file_chunks: Vec<(String, Vec<f32>)> = file
+        for file in batch {
+            let paired: Vec<(String, Vec<f32>)> = file
                 .chunks
                 .iter()
                 .enumerate()
@@ -187,10 +273,10 @@ async fn embed_and_write_pending(
 
             offset += file.chunks.len();
 
-            db::upsert_note(conn, &file.path, &file.content_hash, &file_chunks).await?;
+            db::upsert_note(conn, &file.rel_path, &file.content_hash, &paired).await?;
 
             let action = if file.is_new { "indexed" } else { "updated" };
-            tracing::info!(path = file.path, action);
+            tracing::info!(path = file.rel_path, action);
         }
     }
 
@@ -247,19 +333,102 @@ fn collect_recursive(
 mod tests {
     use super::*;
 
-    fn create_file(dir: &Path, relative: &str) {
+    fn create_file(dir: &Path, relative: &str, content: &str) {
         let path = dir.join(relative);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("failed to create parent dirs");
         }
-        std::fs::write(&path, "# Test note").expect("failed to write file");
+        std::fs::write(&path, content).expect("failed to write file");
+    }
+
+    fn disk_files_from(entries: &[(&str, &str)]) -> HashMap<String, DiskFile> {
+        entries
+            .iter()
+            .map(|(rel, h)| {
+                (
+                    rel.to_string(),
+                    DiskFile {
+                        content_hash: h.to_string(),
+                        chunks: vec![rel.to_string()],
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn assert_file_to_index(f: &FileToIndex, rel_path: &str, is_new: bool) {
+        assert_eq!(f.rel_path, rel_path);
+        assert_eq!(f.is_new, is_new);
+    }
+
+    #[test]
+    fn plan_marks_all_disk_files_as_new_when_db_is_empty() {
+        let disk = disk_files_from(&[("a.md", "h1"), ("b.md", "h2")]);
+        let plan = plan_directory_index(&HashMap::new(), &disk);
+
+        assert_eq!(plan.to_add.len(), 2);
+        assert!(plan.to_add.iter().all(|f| f.is_new));
+        assert!(plan.to_update.is_empty());
+        assert!(plan.to_delete.is_empty());
+        assert_eq!(plan.unchanged_count, 0);
+    }
+
+    #[test]
+    fn plan_marks_unchanged_files_correctly() {
+        let disk = disk_files_from(&[("a.md", "hash1")]);
+        let existing = HashMap::from([("a.md".to_string(), "hash1".to_string())]);
+
+        let plan = plan_directory_index(&existing, &disk);
+
+        assert!(plan.to_add.is_empty());
+        assert!(plan.to_update.is_empty());
+        assert!(plan.to_delete.is_empty());
+        assert_eq!(plan.unchanged_count, 1);
+    }
+
+    #[test]
+    fn plan_marks_changed_files_for_update() {
+        let disk = disk_files_from(&[("a.md", "newhash")]);
+        let existing = HashMap::from([("a.md".to_string(), "oldhash".to_string())]);
+
+        let plan = plan_directory_index(&existing, &disk);
+
+        assert!(plan.to_add.is_empty());
+        assert_eq!(plan.to_update.len(), 1);
+        assert_file_to_index(&plan.to_update[0], "a.md", false);
+        assert!(plan.to_delete.is_empty());
+        assert_eq!(plan.unchanged_count, 0);
+    }
+
+    #[test]
+    fn plan_marks_removed_paths_for_deletion() {
+        let disk = disk_files_from(&[("kept.md", "h1")]);
+        let existing = HashMap::from([
+            ("kept.md".to_string(), "h1".to_string()),
+            ("gone.md".to_string(), "h2".to_string()),
+        ]);
+
+        let plan = plan_directory_index(&existing, &disk);
+
+        assert_eq!(plan.to_delete, vec!["gone.md".to_string()]);
+        assert_eq!(plan.unchanged_count, 1);
+    }
+
+    #[test]
+    fn plan_is_empty_when_disk_and_db_are_both_empty() {
+        let plan = plan_directory_index(&HashMap::new(), &HashMap::new());
+
+        assert!(plan.to_add.is_empty());
+        assert!(plan.to_update.is_empty());
+        assert!(plan.to_delete.is_empty());
+        assert_eq!(plan.unchanged_count, 0);
     }
 
     #[test]
     fn collects_markdown_files_from_root() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        create_file(dir.path(), "note1.md");
-        create_file(dir.path(), "note2.md");
+        create_file(dir.path(), "note1.md", "");
+        create_file(dir.path(), "note2.md", "");
 
         let files = collect_markdown_files(dir.path()).expect("collect failed");
         assert_eq!(files.len(), 2);
@@ -270,7 +439,7 @@ mod tests {
     #[test]
     fn collects_markdown_from_subdirectories() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        create_file(dir.path(), "sub/deep/note.md");
+        create_file(dir.path(), "sub/deep/note.md", "");
 
         let files = collect_markdown_files(dir.path()).expect("collect failed");
         assert_eq!(files.len(), 1);
@@ -280,10 +449,10 @@ mod tests {
     #[test]
     fn ignores_non_markdown_files() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        create_file(dir.path(), "note.md");
-        create_file(dir.path(), "readme.txt");
-        create_file(dir.path(), "image.png");
-        create_file(dir.path(), "data.json");
+        create_file(dir.path(), "note.md", "");
+        create_file(dir.path(), "readme.txt", "");
+        create_file(dir.path(), "image.png", "");
+        create_file(dir.path(), "data.json", "");
 
         let files = collect_markdown_files(dir.path()).expect("collect failed");
         assert_eq!(files.len(), 1);
@@ -293,9 +462,9 @@ mod tests {
     #[test]
     fn skips_dot_directories() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        create_file(dir.path(), "visible/note.md");
-        create_file(dir.path(), ".hidden/secret.md");
-        create_file(dir.path(), ".git/objects/ab.md");
+        create_file(dir.path(), "visible/note.md", "");
+        create_file(dir.path(), ".hidden/secret.md", "");
+        create_file(dir.path(), ".git/objects/ab.md", "");
 
         let files = collect_markdown_files(dir.path()).expect("collect failed");
         assert_eq!(files.len(), 1);
@@ -312,7 +481,7 @@ mod tests {
     #[test]
     fn relative_paths_do_not_have_leading_slash() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        create_file(dir.path(), "notes/topic.md");
+        create_file(dir.path(), "notes/topic.md", "");
 
         let files = collect_markdown_files(dir.path()).expect("collect failed");
         for key in files.keys() {
@@ -326,9 +495,9 @@ mod tests {
     #[tokio::test]
     async fn index_directory_indexes_new_files() {
         let notes_dir = tempfile::tempdir().expect("tempdir");
-        create_file(notes_dir.path(), "alpha.md");
-        create_file(notes_dir.path(), "sub/beta.md");
-        create_file(notes_dir.path(), ".hidden/secret.md");
+        create_file(notes_dir.path(), "alpha.md", "# Alpha");
+        create_file(notes_dir.path(), "sub/beta.md", "# Beta");
+        create_file(notes_dir.path(), ".hidden/secret.md", "# Secret");
 
         let db_dir = tempfile::tempdir().expect("tempdir");
         let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
@@ -357,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn index_directory_detects_unchanged_files() {
         let notes_dir = tempfile::tempdir().expect("tempdir");
-        create_file(notes_dir.path(), "note.md");
+        create_file(notes_dir.path(), "note.md", "# Note");
 
         let db_dir = tempfile::tempdir().expect("tempdir");
         let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
@@ -384,8 +553,8 @@ mod tests {
     #[tokio::test]
     async fn index_directory_detects_deleted_files() {
         let notes_dir = tempfile::tempdir().expect("tempdir");
-        create_file(notes_dir.path(), "keep.md");
-        create_file(notes_dir.path(), "remove.md");
+        create_file(notes_dir.path(), "keep.md", "# Keep");
+        create_file(notes_dir.path(), "remove.md", "# Remove");
 
         let db_dir = tempfile::tempdir().expect("tempdir");
         let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
@@ -419,9 +588,9 @@ mod tests {
         let root = Path::new("/notes");
         assert!(!is_in_hidden_dir(Path::new("/notes/note.md"), root));
         assert!(!is_in_hidden_dir(Path::new("/notes/sub/note.md"), root));
-        assert!(!is_in_hidden_dir(Path::new("/notes/.dotfile.md"), root,));
-        assert!(is_in_hidden_dir(Path::new("/notes/.hidden/note.md"), root,));
-        assert!(is_in_hidden_dir(Path::new("/notes/sub/.git/note.md"), root,));
+        assert!(!is_in_hidden_dir(Path::new("/notes/.dotfile.md"), root));
+        assert!(is_in_hidden_dir(Path::new("/notes/.hidden/note.md"), root));
+        assert!(is_in_hidden_dir(Path::new("/notes/sub/.git/note.md"), root));
     }
 
     #[test]
