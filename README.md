@@ -13,46 +13,6 @@ By default, needle uses [fastembed](https://github.com/Anush008/fastembed-rs) fo
 
 For a smaller binary without the local model, build with `--no-default-features` and use an API provider instead.
 
-### Embedding Providers
-
-Needle supports three embedding backends. It infers which to use from available API keys, or you can set `NEEDLE_PROVIDER` explicitly.
-
-**Local (default):** No setup needed. Uses fastembed with ONNX models in-process.
-
-**OpenAI-compatible:** Works with OpenAI, Ollama, vLLM, text-embeddings-inference, or any server that speaks the `/v1/embeddings` API.
-
-```text
-export OPENAI_API_KEY=sk-...
-needle reindex
-```
-
-For a local server like Ollama:
-
-```text
-export NEEDLE_PROVIDER=openai
-export NEEDLE_API_BASE=http://localhost:11434/v1
-export NEEDLE_MODEL=nomic-embed-text
-export NEEDLE_DIM=768
-needle reindex
-```
-
-For an authenticated OpenAI-compatible endpoint (not `api.openai.com`), use `NEEDLE_API_KEY` instead of `OPENAI_API_KEY`. `OPENAI_API_KEY` is scoped to the default OpenAI base URL and is never forwarded to a custom `NEEDLE_API_BASE`:
-
-```text
-export NEEDLE_PROVIDER=openai
-export NEEDLE_API_BASE=https://my-gateway.example/v1
-export NEEDLE_API_KEY=my-gateway-key
-export NEEDLE_MODEL=text-embedding-3-small
-needle reindex
-```
-
-**Voyage AI:**
-
-```text
-export VOYAGE_API_KEY=your-key
-needle reindex
-```
-
 ## Usage
 
 Index your notes, then search:
@@ -138,11 +98,45 @@ Environment variables override the config file. CLI flags override everything.
 | Custom endpoint key | `NEEDLE_API_KEY`  | `needle_api_key` |
 | Notes directory     | `NEEDLE_DOCS_DIR` | `notes_dir`      |
 
-## How it works
+### Embedding Providers
 
-Needle chunks each markdown file, embeds it with your chosen provider, and stores the vectors in a local SQLite database with a vector index (libsql). Full-text search uses Tantivy. The search command fuses all ranking signals with reciprocal rank fusion.
+Needle supports three embedding backends. It infers which to use from available API keys, or you can set `NEEDLE_PROVIDER` explicitly.
 
-Switching providers requires a reindex since embedding dimensions may differ.
+**Local (default):** No setup needed. Uses fastembed with ONNX models in-process.
+
+**OpenAI-compatible:** Works with OpenAI, Ollama, vLLM, text-embeddings-inference, or any server that speaks the `/v1/embeddings` API.
+
+```text
+export OPENAI_API_KEY=sk-...
+needle reindex
+```
+
+For a local server like Ollama:
+
+```text
+export NEEDLE_PROVIDER=openai
+export NEEDLE_API_BASE=http://localhost:11434/v1
+export NEEDLE_MODEL=nomic-embed-text
+export NEEDLE_DIM=768
+needle reindex
+```
+
+For an authenticated OpenAI-compatible endpoint (not `api.openai.com`), use `NEEDLE_API_KEY` instead of `OPENAI_API_KEY`. `OPENAI_API_KEY` is scoped to the default OpenAI base URL and is never forwarded to a custom `NEEDLE_API_BASE`:
+
+```text
+export NEEDLE_PROVIDER=openai
+export NEEDLE_API_BASE=https://my-gateway.example/v1
+export NEEDLE_API_KEY=my-gateway-key
+export NEEDLE_MODEL=text-embedding-3-small
+needle reindex
+```
+
+**Voyage AI:**
+
+```text
+export VOYAGE_API_KEY=your-key
+needle reindex
+```
 
 ## License
 
