@@ -274,7 +274,9 @@ async fn build_index_in_temp(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("needle=info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     run(Cli::parse()).await
 }
 
