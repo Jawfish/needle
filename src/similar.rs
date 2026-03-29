@@ -17,13 +17,18 @@ pub trait NoteEmbeddingsSource: Send + Sync {
     fn chunk_embeddings_for_path<'a>(&'a self, path: &'a str) -> SimilarFuture<'a, Vec<Vec<f32>>>;
 }
 
+pub struct RelatedResult {
+    pub path: String,
+    pub similarity: f64,
+}
+
 pub trait RelatedSearchSource: Send + Sync {
     fn search_related<'a>(
         &'a self,
         embedding: &'a [f32],
         exclude_path: &'a str,
         limit: usize,
-    ) -> SimilarFuture<'a, Vec<crate::db::RelatedResult>>;
+    ) -> SimilarFuture<'a, Vec<RelatedResult>>;
 }
 
 pub struct SimilarPair {
@@ -225,7 +230,7 @@ pub async fn find_related(
     related_source: &dyn RelatedSearchSource,
     path: &str,
     limit: usize,
-) -> anyhow::Result<Vec<crate::db::RelatedResult>> {
+) -> anyhow::Result<Vec<RelatedResult>> {
     let chunks = note_source.chunk_embeddings_for_path(path).await?;
     let mut avg =
         average_embeddings(&chunks).ok_or_else(|| NeedleError::NoteNotEmbedded(path.to_owned()))?;

@@ -8,7 +8,7 @@ use libsql::Connection;
 
 use crate::{
     rank::{Candidate, PathSource, SemanticSource},
-    similar::{AllChunkEmbeddingsSource, NoteEmbeddingsSource, RelatedSearchSource},
+    similar::{AllChunkEmbeddingsSource, NoteEmbeddingsSource, RelatedResult, RelatedSearchSource},
 };
 
 const BYTES_PER_F32: usize = 4;
@@ -34,11 +34,6 @@ pub fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
 pub struct SearchResult {
     pub path: String,
     pub snippet: String,
-}
-
-pub struct RelatedResult {
-    pub path: String,
-    pub similarity: f64,
 }
 
 pub async fn connect(
