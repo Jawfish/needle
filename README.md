@@ -1,6 +1,6 @@
 # Needle
 
-Semantic search for a directory of markdown files. Combines vector similarity, full-text search, and filename matching into a single ranked result set.
+Semantic search for a directory of markdown files. Combines vector similarity, full-text search, and filename matching into a single ranked result set. Reads queries from stdin and emits tab-separated results, so it composes naturally in pipelines.
 
 ## Install
 
