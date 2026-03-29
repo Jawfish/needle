@@ -33,13 +33,13 @@ pub enum FtsStatus {
     Stale,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DiskFile {
     pub content_hash: String,
     pub chunks: Vec<String>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FileToIndex {
     pub rel_path: String,
     pub content_hash: String,
@@ -47,7 +47,7 @@ pub struct FileToIndex {
     pub is_new: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DirectoryIndexPlan {
     pub to_add: Vec<FileToIndex>,
     pub to_update: Vec<FileToIndex>,
