@@ -7,9 +7,13 @@ updates:
     open-pull-requests-limit: 10
     versioning-strategy: increase
     groups:
-      all-dependencies:
+      cargo-dependencies:
         patterns:
           - "*"
+        update-types:
+          - major
+          - minor
+          - patch
 
   - package-ecosystem: github-actions
     directory: /
@@ -17,6 +21,10 @@ updates:
       interval: daily
     open-pull-requests-limit: 10
     groups:
-      all-actions:
+      github-actions:
         patterns:
           - "*"
+        update-types:
+          - major
+          - minor
+          - patch
