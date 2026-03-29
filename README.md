@@ -2,8 +2,6 @@
 
 Semantic search for a directory of markdown files. Combines vector similarity, full-text search, and filename matching into a single ranked result set.
 
-Useful if you keep a folder of notes (Zettelkasten, engineering journal, docs repo) and want to find things by meaning rather than exact keywords.
-
 ## Install
 
 ```text
