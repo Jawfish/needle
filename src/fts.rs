@@ -48,7 +48,7 @@ fn with_writer(
     index: &tantivy::Index,
     f: impl FnOnce(&mut IndexWriter) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let result = ensure_writer(slot, index).and_then(|w| f(w));
+    let result = ensure_writer(slot, index).and_then(f);
     if result.is_err() {
         *slot = None;
     }

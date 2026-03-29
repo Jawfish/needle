@@ -440,7 +440,7 @@ mod tests {
                 assert_eq!(content_hash, hash::content_hash(content));
                 assert!(!chunks.is_empty());
             }
-            SingleFilePlan::Unchanged => panic!("expected NeedsIndex"),
+            SingleFilePlan::Unchanged => unreachable!("expected NeedsIndex"),
         }
     }
 
@@ -452,7 +452,7 @@ mod tests {
             SingleFilePlan::NeedsIndex { content_hash, .. } => {
                 assert_eq!(content_hash, hash::content_hash(content));
             }
-            SingleFilePlan::Unchanged => panic!("expected NeedsIndex"),
+            SingleFilePlan::Unchanged => unreachable!("expected NeedsIndex"),
         }
     }
 
