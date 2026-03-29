@@ -4,9 +4,9 @@ Semantic search for a directory of markdown files. Combines vector similarity, f
 
 ## Install
 
-```text
+```bash
 cargo install --path .
-export NEEDLE_DOCS_DIR=/path/to/notes
+export NEEDLE_DOCS_DIR=/path/to/notes # alternatively, set notes_dir in config (see below)
 ```
 
 By default, needle uses [fastembed](https://github.com/Anush008/fastembed-rs) for local embeddings (all-MiniLM-L6-v2). No API key needed. The model downloads automatically on first run.
@@ -17,14 +17,14 @@ For a smaller binary without the local model, build with `--no-default-features`
 
 Index your notes, then search:
 
-```text
+```bash
 needle reindex
 needle search "error handling patterns"
 ```
 
 Search output is tab-separated (`score \t path \t snippet`), so it works well in pipelines:
 
-```text
+```bash
 needle search "authentication" -p | xargs bat
 echo "query from clipboard" | needle search
 ```
@@ -33,7 +33,7 @@ echo "query from clipboard" | needle search
 
 Given a note, find others like it using the vector index:
 
-```text
+```bash
 needle related "design/auth-flow.md"
 needle related "design/auth-flow.md" -p | head -5
 ```
@@ -42,7 +42,7 @@ needle related "design/auth-flow.md" -p | head -5
 
 Compare all documents pairwise to surface near-duplicates:
 
-```text
+```bash
 needle similar
 needle similar --threshold 0.9 --group
 needle similar -p | sort -u | wc -l
@@ -52,7 +52,7 @@ needle similar -p | sort -u | wc -l
 
 Keep the index up to date as you edit:
 
-```text
+```bash
 needle watch
 ```
 
@@ -64,7 +64,7 @@ needle watch
 
 Search ranking weights are tunable per-query or through config:
 
-```text
+```bash
 needle search "topic" --w-semantic 2.0 --w-fts 0.5 --w-filename 0
 ```
 
@@ -106,14 +106,14 @@ Needle supports three embedding backends. It infers which to use from available 
 
 **OpenAI-compatible:** Works with OpenAI, Ollama, vLLM, text-embeddings-inference, or any server that speaks the `/v1/embeddings` API.
 
-```text
+```bash
 export OPENAI_API_KEY=sk-...
 needle reindex
 ```
 
 For a local server like Ollama:
 
-```text
+```bash
 export NEEDLE_PROVIDER=openai
 export NEEDLE_API_BASE=http://localhost:11434/v1
 export NEEDLE_MODEL=nomic-embed-text
@@ -123,7 +123,7 @@ needle reindex
 
 For an authenticated OpenAI-compatible endpoint (not `api.openai.com`), use `NEEDLE_API_KEY` instead of `OPENAI_API_KEY`. `OPENAI_API_KEY` is scoped to the default OpenAI base URL and is never forwarded to a custom `NEEDLE_API_BASE`:
 
-```text
+```bash
 export NEEDLE_PROVIDER=openai
 export NEEDLE_API_BASE=https://my-gateway.example/v1
 export NEEDLE_API_KEY=my-gateway-key
@@ -133,7 +133,7 @@ needle reindex
 
 **Voyage AI:**
 
-```text
+```bash
 export VOYAGE_API_KEY=your-key
 needle reindex
 ```
