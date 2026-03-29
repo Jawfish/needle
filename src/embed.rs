@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 
 use serde::Deserialize;
 
-use crate::{config::EmbedConfig, error::NeedleError};
+use crate::{error::NeedleError, types::EmbedConfig};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;

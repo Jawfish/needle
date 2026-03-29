@@ -9,6 +9,7 @@ mod index;
 mod lock;
 mod rank;
 mod similar;
+mod types;
 mod watch;
 
 use std::io::{IsTerminal, Read};

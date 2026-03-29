@@ -3,7 +3,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{error::NeedleError, hash, rank::RrfWeights};
+use crate::{
+    error::NeedleError,
+    hash,
+    types::{EmbedConfig, RrfWeights},
+};
 
 pub struct CliEmbedArgs {
     pub provider: Option<String>,
@@ -17,16 +21,6 @@ pub struct Config {
     pub tantivy_dir: PathBuf,
     pub embed: EmbedConfig,
     pub weights: RrfWeights,
-}
-
-pub struct EmbedConfig {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub api_base: Option<String>,
-    pub dim: Option<usize>,
-    pub voyage_api_key: Option<String>,
-    pub openai_api_key: Option<String>,
-    pub needle_api_key: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

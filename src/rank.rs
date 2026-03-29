@@ -6,25 +6,10 @@ use nucleo::{
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
 };
 
+pub use crate::types::RrfWeights;
 use crate::{db, embed::Embedder, error::NeedleError, fts::FtsIndex};
 
 const RRF_K: f64 = 60.0;
-
-pub struct RrfWeights {
-    pub semantic: f64,
-    pub fts: f64,
-    pub filename: f64,
-}
-
-impl Default for RrfWeights {
-    fn default() -> Self {
-        Self {
-            semantic: 1.5,
-            fts: 1.0,
-            filename: 0.7,
-        }
-    }
-}
 
 pub struct FusedResult {
     pub path: String,
