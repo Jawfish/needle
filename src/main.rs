@@ -407,7 +407,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             paths_only,
         } => {
             let pair_limit = if group { None } else { Some(limit) };
-            let pairs = similar::find_similar(&conn, threshold, pair_limit).await?;
+            let source = db::DbAllChunkEmbeddingsSource::new(conn);
+            let pairs = similar::find_similar(&source, threshold, pair_limit).await?;
             print_similar(pairs, limit, group, paths_only);
         }
         Command::Related {
@@ -415,7 +416,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             limit,
             paths_only,
         } => {
-            let results = similar::find_related(&conn, &path, limit).await?;
+            let note_source = db::DbNoteEmbeddingsSource::new(conn.clone());
+            let related_source = db::DbRelatedSearchSource::new(conn);
+            let results =
+                similar::find_related(&note_source, &related_source, &path, limit).await?;
             if paths_only {
                 for r in &results {
                     println!("{}", r.path);

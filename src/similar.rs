@@ -1,8 +1,30 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    pin::Pin,
+};
 
-use libsql::Connection;
+use crate::error::NeedleError;
 
-use crate::{db, error::NeedleError};
+pub type SimilarFuture<'a, T> =
+    Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
+pub trait AllChunkEmbeddingsSource: Send + Sync {
+    fn has_embeddings(&self) -> SimilarFuture<'_, bool>;
+    fn all_chunk_embeddings(&self) -> SimilarFuture<'_, Vec<(String, Vec<f32>)>>;
+}
+
+pub trait NoteEmbeddingsSource: Send + Sync {
+    fn chunk_embeddings_for_path<'a>(&'a self, path: &'a str) -> SimilarFuture<'a, Vec<Vec<f32>>>;
+}
+
+pub trait RelatedSearchSource: Send + Sync {
+    fn search_related<'a>(
+        &'a self,
+        embedding: &'a [f32],
+        exclude_path: &'a str,
+        limit: usize,
+    ) -> SimilarFuture<'a, Vec<crate::db::RelatedResult>>;
+}
 
 pub struct SimilarPair {
     pub similarity: f64,
@@ -170,36 +192,21 @@ pub fn group_pairs(pairs: Vec<SimilarPair>) -> Vec<SimilarGroup> {
 }
 
 pub async fn find_similar(
-    conn: &Connection,
+    source: &dyn AllChunkEmbeddingsSource,
     threshold: f64,
     limit: Option<usize>,
 ) -> anyhow::Result<Vec<SimilarPair>> {
-    if !db::chunks_table_exists(conn).await? {
+    if !source.has_embeddings().await? {
         return Ok(vec![]);
     }
 
-    let mut rows = conn
-        .query(
-            "SELECT path, embedding FROM chunks WHERE embedding IS NOT NULL ORDER BY path",
-            (),
-        )
-        .await?;
+    let rows = source.all_chunk_embeddings().await?;
 
     let mut docs: Vec<(String, Vec<f32>)> = Vec::new();
     let mut current_path = String::new();
     let mut current_chunks: Vec<Vec<f32>> = Vec::new();
 
-    while let Some(row) = rows.next().await? {
-        let path: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        let embedding = match db::decode_embedding(&blob) {
-            Ok(emb) => emb,
-            Err(err) => {
-                tracing::warn!(path, %err, "skipping chunk with corrupt embedding");
-                continue;
-            }
-        };
-
+    for (path, embedding) in rows {
         if path != current_path {
             flush_document(&mut docs, &mut current_path, &mut current_chunks);
             current_path = path;
@@ -213,6 +220,19 @@ pub async fn find_similar(
     Ok(find_similar_pairs(&docs, threshold, limit))
 }
 
+pub async fn find_related(
+    note_source: &dyn NoteEmbeddingsSource,
+    related_source: &dyn RelatedSearchSource,
+    path: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::db::RelatedResult>> {
+    let chunks = note_source.chunk_embeddings_for_path(path).await?;
+    let mut avg =
+        average_embeddings(&chunks).ok_or_else(|| NeedleError::NoteNotEmbedded(path.to_owned()))?;
+    normalize(&mut avg);
+    related_source.search_related(&avg, path, limit).await
+}
+
 fn flush_document(
     docs: &mut Vec<(String, Vec<f32>)>,
     path: &mut String,
@@ -223,18 +243,6 @@ fn flush_document(
         docs.push((std::mem::take(path), avg));
     }
     chunks.clear();
-}
-
-pub async fn find_related(
-    conn: &Connection,
-    path: &str,
-    limit: usize,
-) -> anyhow::Result<Vec<db::RelatedResult>> {
-    let chunks = db::chunk_embeddings_for_path(conn, path).await?;
-    let mut avg =
-        average_embeddings(&chunks).ok_or_else(|| NeedleError::NoteNotEmbedded(path.to_owned()))?;
-    normalize(&mut avg);
-    db::search_related(conn, &avg, path, limit).await
 }
 
 #[cfg(test)]
@@ -482,15 +490,14 @@ mod tests {
 
     #[tokio::test]
     async fn find_similar_on_fresh_db_without_embedder_returns_empty() {
-        // Regression: similar must not error when run on a fresh DB that was opened
-        // without an embedder dim (i.e. no chunks table exists yet).
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path, None)
+        let (_db, conn) = crate::db::connect(&db_path, None)
             .await
             .expect("connect without dim should succeed");
 
-        let pairs = find_similar(&conn, 0.9, Some(10))
+        let source = crate::db::DbAllChunkEmbeddingsSource::new(conn);
+        let pairs = find_similar(&source, 0.9, Some(10))
             .await
             .expect("find_similar on fresh db should return empty, not error");
         assert!(pairs.is_empty());
@@ -500,7 +507,7 @@ mod tests {
     async fn find_similar_with_test_database() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+        let (_db, conn) = crate::db::connect(&db_path, Some(EMBEDDING_DIM))
             .await
             .expect("connect failed");
 
@@ -509,17 +516,18 @@ mod tests {
         let mut emb_c = vec![0.0_f32; EMBEDDING_DIM];
         emb_c[0] = 1.0;
 
-        db::upsert_note(&conn, "a.md", "h1", &[("content a".to_owned(), emb_a)])
+        crate::db::upsert_note(&conn, "a.md", "h1", &[("content a".to_owned(), emb_a)])
             .await
             .expect("upsert failed");
-        db::upsert_note(&conn, "b.md", "h2", &[("content b".to_owned(), emb_b)])
+        crate::db::upsert_note(&conn, "b.md", "h2", &[("content b".to_owned(), emb_b)])
             .await
             .expect("upsert failed");
-        db::upsert_note(&conn, "c.md", "h3", &[("content c".to_owned(), emb_c)])
+        crate::db::upsert_note(&conn, "c.md", "h3", &[("content c".to_owned(), emb_c)])
             .await
             .expect("upsert failed");
 
-        let pairs = find_similar(&conn, 0.9, Some(50))
+        let source = crate::db::DbAllChunkEmbeddingsSource::new(conn);
+        let pairs = find_similar(&source, 0.9, Some(50))
             .await
             .expect("find failed");
         assert_eq!(pairs.len(), 1);
@@ -532,7 +540,7 @@ mod tests {
     async fn find_related_returns_similar_documents() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+        let (_db, conn) = crate::db::connect(&db_path, Some(EMBEDDING_DIM))
             .await
             .expect("connect failed");
 
@@ -541,17 +549,21 @@ mod tests {
         let mut emb_c = vec![0.0_f32; EMBEDDING_DIM];
         emb_c[0] = 1.0;
 
-        db::upsert_note(&conn, "a.md", "h1", &[("content a".to_owned(), emb_a)])
+        crate::db::upsert_note(&conn, "a.md", "h1", &[("content a".to_owned(), emb_a)])
             .await
             .expect("upsert failed");
-        db::upsert_note(&conn, "b.md", "h2", &[("content b".to_owned(), emb_b)])
+        crate::db::upsert_note(&conn, "b.md", "h2", &[("content b".to_owned(), emb_b)])
             .await
             .expect("upsert failed");
-        db::upsert_note(&conn, "c.md", "h3", &[("content c".to_owned(), emb_c)])
+        crate::db::upsert_note(&conn, "c.md", "h3", &[("content c".to_owned(), emb_c)])
             .await
             .expect("upsert failed");
 
-        let results = find_related(&conn, "a.md", 10).await.expect("find failed");
+        let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
+        let related_source = crate::db::DbRelatedSearchSource::new(conn);
+        let results = find_related(&note_source, &related_source, "a.md", 10)
+            .await
+            .expect("find failed");
         assert!(!results.is_empty());
         assert_eq!(results[0].path, "b.md");
         assert!(results[0].similarity > 0.99);
@@ -561,16 +573,20 @@ mod tests {
     async fn find_related_excludes_self() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+        let (_db, conn) = crate::db::connect(&db_path, Some(EMBEDDING_DIM))
             .await
             .expect("connect failed");
 
         let emb = vec![1.0_f32; EMBEDDING_DIM];
-        db::upsert_note(&conn, "a.md", "h1", &[("content".to_owned(), emb)])
+        crate::db::upsert_note(&conn, "a.md", "h1", &[("content".to_owned(), emb)])
             .await
             .expect("upsert failed");
 
-        let results = find_related(&conn, "a.md", 10).await.expect("find failed");
+        let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
+        let related_source = crate::db::DbRelatedSearchSource::new(conn);
+        let results = find_related(&note_source, &related_source, "a.md", 10)
+            .await
+            .expect("find failed");
         assert!(
             results.iter().all(|r| r.path != "a.md"),
             "should not include the queried document"
@@ -581,11 +597,13 @@ mod tests {
     async fn find_related_errors_for_missing_path() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
-        let (_db, conn) = db::connect(&db_path, Some(EMBEDDING_DIM))
+        let (_db, conn) = crate::db::connect(&db_path, Some(EMBEDDING_DIM))
             .await
             .expect("connect failed");
 
-        let result = find_related(&conn, "nonexistent.md", 10).await;
+        let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
+        let related_source = crate::db::DbRelatedSearchSource::new(conn);
+        let result = find_related(&note_source, &related_source, "nonexistent.md", 10).await;
         assert!(result.is_err());
     }
 }

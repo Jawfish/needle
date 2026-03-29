@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, bail};
 use libsql::Connection;
 
-use crate::rank::{Candidate, PathSource, SemanticSource};
+use crate::{
+    rank::{Candidate, PathSource, SemanticSource},
+    similar::{AllChunkEmbeddingsSource, NoteEmbeddingsSource, RelatedSearchSource},
+};
 
 const BYTES_PER_F32: usize = 4;
 
@@ -468,6 +471,84 @@ impl DbPathSource {
 impl PathSource for DbPathSource {
     fn all_paths(&self) -> crate::rank::SearchFuture<'_, Vec<String>> {
         Box::pin(all_note_paths(&self.conn))
+    }
+}
+
+pub struct DbAllChunkEmbeddingsSource {
+    conn: Connection,
+}
+
+impl DbAllChunkEmbeddingsSource {
+    pub const fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl AllChunkEmbeddingsSource for DbAllChunkEmbeddingsSource {
+    fn has_embeddings(&self) -> crate::similar::SimilarFuture<'_, bool> {
+        Box::pin(chunks_table_exists(&self.conn))
+    }
+
+    fn all_chunk_embeddings(&self) -> crate::similar::SimilarFuture<'_, Vec<(String, Vec<f32>)>> {
+        Box::pin(async move {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT path, embedding FROM chunks WHERE embedding IS NOT NULL ORDER BY path",
+                    (),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let path: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                match decode_embedding(&blob) {
+                    Ok(emb) => out.push((path, emb)),
+                    Err(err) => tracing::warn!(path, %err, "skipping chunk with corrupt embedding"),
+                }
+            }
+            Ok(out)
+        })
+    }
+}
+
+pub struct DbNoteEmbeddingsSource {
+    conn: Connection,
+}
+
+impl DbNoteEmbeddingsSource {
+    pub const fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl NoteEmbeddingsSource for DbNoteEmbeddingsSource {
+    fn chunk_embeddings_for_path<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> crate::similar::SimilarFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(chunk_embeddings_for_path(&self.conn, path))
+    }
+}
+
+pub struct DbRelatedSearchSource {
+    conn: Connection,
+}
+
+impl DbRelatedSearchSource {
+    pub const fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl RelatedSearchSource for DbRelatedSearchSource {
+    fn search_related<'a>(
+        &'a self,
+        embedding: &'a [f32],
+        exclude_path: &'a str,
+        limit: usize,
+    ) -> crate::similar::SimilarFuture<'a, Vec<RelatedResult>> {
+        Box::pin(search_related(&self.conn, embedding, exclude_path, limit))
     }
 }
 
