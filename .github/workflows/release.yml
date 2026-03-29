@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            platform: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build full binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Preserve full binary (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/needle needle-full
+
+      - name: Preserve full binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item target\${{ matrix.target }}\release\needle.exe needle-full.exe
+
+      - name: Build slim binary
+        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          TAG=${{ github.ref_name }}
+
+          cp needle-full needle
+          tar czf "needle-${TAG}-${{ matrix.platform }}.tar.gz" needle
+          rm needle
+
+          cp target/${{ matrix.target }}/release/needle needle
+          tar czf "needle-${TAG}-${{ matrix.platform }}-slim.tar.gz" needle
+          rm needle
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $TAG = "${{ github.ref_name }}"
+
+          Copy-Item needle-full.exe needle.exe
+          Compress-Archive -Path needle.exe -DestinationPath "needle-${TAG}-${{ matrix.platform }}.zip"
+          Remove-Item needle.exe
+
+          Copy-Item target\${{ matrix.target }}\release\needle.exe needle.exe
+          Compress-Archive -Path needle.exe -DestinationPath "needle-${TAG}-${{ matrix.platform }}-slim.zip"
+          Remove-Item needle.exe
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2.6.1
+        with:
+          generate_release_notes: true
+          files: |
+            needle-*.tar.gz
+            needle-*.zip
