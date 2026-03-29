@@ -12,15 +12,16 @@ pub struct LocalProvider {
 }
 
 impl LocalProvider {
-    pub fn new(model_name: Option<&str>) -> anyhow::Result<Self> {
-        let (model_enum, dim) = resolve_model(model_name)?;
-        let model =
-            TextEmbedding::try_new(InitOptions::new(model_enum).with_show_download_progress(true))
-                .context("failed to initialize local embedding model")?;
-        Ok(Self {
+    /// Constructs a `LocalProvider` with a pre-initialised `TextEmbedding`.
+    ///
+    /// Callers are responsible for constructing the model at the composition
+    /// boundary (e.g. `Embedder::from_config`), which keeps the concrete
+    /// `fastembed` type out of this unit and allows substitution in tests.
+    pub fn new(model: TextEmbedding, dim: usize) -> Self {
+        Self {
             model: Arc::new(Mutex::new(model)),
             dim,
-        })
+        }
     }
 
     pub const fn dim(&self) -> usize {
@@ -48,6 +49,16 @@ impl LocalProvider {
             .next()
             .context("local model returned no embeddings")
     }
+}
+
+/// Resolves a model name to a `(TextEmbedding, dim)` pair, downloading
+/// weights as needed.  Called at the composition boundary in `embed.rs`.
+pub fn init_model(name: Option<&str>) -> anyhow::Result<(TextEmbedding, usize)> {
+    let (model_enum, dim) = resolve_model(name)?;
+    let model =
+        TextEmbedding::try_new(InitOptions::new(model_enum).with_show_download_progress(true))
+            .context("failed to initialize local embedding model")?;
+    Ok((model, dim))
 }
 
 fn resolve_model(name: Option<&str>) -> anyhow::Result<(EmbeddingModel, usize)> {
