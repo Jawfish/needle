@@ -20,9 +20,9 @@ reqwest = { version = "0.13.2", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
-tantivy = "0.25"
+tantivy = "0.26"
 thiserror = "2.0.18"
-toml = "1.1.0"
+toml = "1.1.1"
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "signal", "fs", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
