@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub struct RrfWeights {
     pub semantic: f64,
     pub fts: f64,
@@ -14,6 +15,7 @@ impl Default for RrfWeights {
     }
 }
 
+#[derive(Debug)]
 pub struct EmbedConfig {
     pub provider: Option<String>,
     pub model: Option<String>,

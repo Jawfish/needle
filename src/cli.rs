@@ -3,8 +3,8 @@ use std::path::PathBuf;
 #[derive(clap::Parser)]
 #[command(name = "needle", about = "Semantic search for markdown notes")]
 pub struct Cli {
-    #[arg(long, env = "NEEDLE_DOCS_DIR")]
-    pub notes_dir: Option<PathBuf>,
+    #[arg(long = "docs-dir", action = clap::ArgAction::Append)]
+    pub docs_dirs: Vec<PathBuf>,
 
     #[arg(long, env = "NEEDLE_PROVIDER")]
     pub provider: Option<String>,

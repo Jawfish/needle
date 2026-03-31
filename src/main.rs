@@ -7,7 +7,9 @@ mod fts;
 mod hash;
 mod index;
 mod lock;
+mod query;
 mod rank;
+mod search_merge;
 mod similar;
 mod types;
 mod watch;
@@ -22,18 +24,13 @@ use crate::{
     config::{CliEmbedArgs, CliWeights, Config},
     embed::Embedder,
     error::NeedleError,
+    rank::FusedResult,
+    similar::RelatedResult,
 };
 
 fn is_dimension_mismatch(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NeedleError>()
         .is_some_and(|e| matches!(e, NeedleError::DimensionMismatch { .. }))
-}
-
-async fn open_db(
-    db_path: &std::path::Path,
-    dim: Option<usize>,
-) -> anyhow::Result<(libsql::Database, libsql::Connection)> {
-    db::connect(db_path, dim).await
 }
 
 /// Run a full reindex, recovering atomically when there is a dimension mismatch.
@@ -309,12 +306,33 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
 }
 
 async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
-    let _lock = lock::IndexLock::try_acquire(&config.db_path)?;
-    let dim = embedder.as_ref().map(Embedder::dim);
-    let (_db, conn) = open_db(&config.db_path, dim).await?;
-    let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-    watch::run_watcher(conn, fts, &embedder, config.notes_dir.clone()).await
+    let dim = Some(embedder.dim());
+
+    let mut open_stores: Vec<watch::OpenStore> = Vec::with_capacity(config.docs_dirs.len());
+    // Locks are held for the watcher's lifetime and released on drop when
+    // run_watch returns. The Vec is intentionally write-only.
+    #[allow(clippy::collection_is_never_read)]
+    let mut held_locks: Vec<lock::IndexLock> = Vec::with_capacity(config.docs_dirs.len());
+
+    for store in &config.docs_dirs {
+        let lock = lock::IndexLock::try_acquire(&store.db_path)?;
+        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        let fts = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
+
+        tracing::info!(dir = %store.notes_dir.display(), "initial indexing");
+        let stats = index::index_directory(&conn, &fts, &embedder, &store.notes_dir).await?;
+        tracing::info!(%stats, dir = %store.notes_dir.display(), "initial index complete");
+
+        held_locks.push(lock);
+        open_stores.push(watch::OpenStore {
+            notes_dir: store.notes_dir.clone(),
+            conn,
+            fts,
+        });
+    }
+
+    watch::run_watcher(open_stores, &embedder).await
 }
 
 async fn run_reindex_command(
@@ -322,16 +340,166 @@ async fn run_reindex_command(
     embedder: Option<Embedder>,
 ) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-    let _lock = lock::IndexLock::try_acquire(&config.db_path)?;
-    let stats = run_reindex(
-        &config.db_path,
-        &config.tantivy_dir,
-        &embedder,
-        &config.notes_dir,
-    )
-    .await?;
-    tracing::info!(%stats, "reindex complete");
+    for store in &config.docs_dirs {
+        let _lock = lock::IndexLock::try_acquire(&store.db_path)?;
+        let stats = run_reindex(
+            &store.db_path,
+            &store.tantivy_dir,
+            &embedder,
+            &store.notes_dir,
+        )
+        .await?;
+        tracing::info!(%stats, dir = %store.notes_dir.display(), "reindex complete");
+    }
     Ok(())
+}
+
+async fn open_search_adapters(
+    stores: &[config::DirectoryStore],
+    dim: Option<usize>,
+) -> anyhow::Result<Vec<(db::DbSemanticSource, fts::FtsFtsSource, db::DbPathSource)>> {
+    let mut out = Vec::with_capacity(stores.len());
+    for store in stores {
+        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
+        out.push((
+            db::DbSemanticSource::new(conn.clone()),
+            fts::FtsFtsSource::new(fts_index),
+            db::DbPathSource::new(conn),
+        ));
+    }
+    Ok(out)
+}
+
+async fn run_search(
+    config: &Config,
+    embedder: Option<&Embedder>,
+    query: Option<String>,
+    limit: usize,
+    paths_only: bool,
+) -> anyhow::Result<()> {
+    let query_str = resolve_query(
+        query,
+        &mut std::io::stdin().lock(),
+        std::io::stdin().is_terminal(),
+    )?;
+    let dim = embedder.map(Embedder::dim);
+    let adapters = open_search_adapters(&config.docs_dirs, dim).await?;
+    let store_ports: Vec<query::SearchStorePorts<'_>> = config
+        .docs_dirs
+        .iter()
+        .zip(adapters.iter())
+        .map(|(store, (semantic, fts, paths))| query::SearchStorePorts {
+            notes_dir: &store.notes_dir,
+            semantic,
+            fts,
+            paths,
+        })
+        .collect();
+    let per_store =
+        query::query_search(&store_ports, embedder, &query_str, limit, &config.weights).await?;
+    let results = search_merge::merge_fused_results(per_store, limit);
+    print_search(&results, paths_only);
+    Ok(())
+}
+
+async fn run_similar(
+    config: &Config,
+    dim: Option<usize>,
+    threshold: f64,
+    limit: usize,
+    group: bool,
+    paths_only: bool,
+) -> anyhow::Result<()> {
+    let pair_limit = if group { None } else { Some(limit) };
+
+    let mut embeddings_sources: Vec<db::DbAllChunkEmbeddingsSource> =
+        Vec::with_capacity(config.docs_dirs.len());
+    for store in &config.docs_dirs {
+        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        embeddings_sources.push(db::DbAllChunkEmbeddingsSource::new(conn));
+    }
+
+    let store_ports: Vec<query::SimilarStorePorts<'_>> = config
+        .docs_dirs
+        .iter()
+        .zip(embeddings_sources.iter())
+        .map(|(store, embeddings)| query::SimilarStorePorts {
+            notes_dir: &store.notes_dir,
+            embeddings,
+        })
+        .collect();
+
+    let per_store = query::query_similar(&store_ports, threshold, pair_limit).await?;
+    let pairs = search_merge::merge_similar_pairs(per_store, pair_limit);
+    print_similar(pairs, limit, group, paths_only);
+    Ok(())
+}
+
+async fn run_related(
+    config: &Config,
+    dim: Option<usize>,
+    path: String,
+    limit: usize,
+    paths_only: bool,
+) -> anyhow::Result<()> {
+    let store = search_merge::owning_store(&config.docs_dirs, &path).ok_or_else(|| {
+        if std::path::Path::new(&path).is_absolute() {
+            anyhow::anyhow!("no configured docs directory contains the path: {path}")
+        } else {
+            anyhow::anyhow!(
+                "relative path '{path}' is ambiguous with multiple docs dirs configured; \
+                 pass an absolute path or use --docs-dir to specify a single directory"
+            )
+        }
+    })?;
+    // DB keys are always store-relative; strip the notes_dir prefix if the
+    // caller passed an absolute path (required when multiple stores are configured).
+    let rel_path = store.to_relative(&path)?;
+    let (_db, conn) = db::connect(&store.db_path, dim).await?;
+    let note_embeddings = db::DbNoteEmbeddingsSource::new(conn.clone());
+    let related_search = db::DbRelatedSearchSource::new(conn);
+    let ports = query::RelatedStorePorts {
+        note_embeddings: &note_embeddings,
+        related_search: &related_search,
+    };
+    let mut results = query::query_related(&ports, &rel_path, limit).await?;
+    if config.docs_dirs.len() > 1 {
+        for result in &mut results {
+            result.path = store.to_absolute(&result.path);
+        }
+    }
+    print_related(&results, paths_only);
+    Ok(())
+}
+
+fn print_search(results: &[FusedResult], paths_only: bool) {
+    if paths_only {
+        for result in results {
+            println!("{}", result.path);
+        }
+    } else {
+        for result in results {
+            println!(
+                "{:.4}\t{}\t{}",
+                result.score,
+                result.path,
+                first_line(&result.snippet)
+            );
+        }
+    }
+}
+
+fn print_related(results: &[RelatedResult], paths_only: bool) {
+    if paths_only {
+        for r in results {
+            println!("{}", r.path);
+        }
+    } else {
+        for r in results {
+            println!("{:.4}\t{}", r.similarity, r.path);
+        }
+    }
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -341,7 +509,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         model: cli.model,
         api_base: cli.api_base,
     };
-    let config = Config::resolve(cli.notes_dir, cli_weights, cli_embed)?;
+    let config = Config::resolve(cli.docs_dirs, cli_weights, cli_embed)?;
 
     let embedder = if search_needs_embedder(&cli.command, &config.weights) {
         Some(Embedder::from_config(&config.embed)?)
@@ -349,92 +517,33 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
-    if matches!(cli.command, Command::Watch) {
-        return run_watch(&config, embedder).await;
-    }
-
-    if matches!(cli.command, Command::Reindex) {
-        return run_reindex_command(&config, embedder).await;
-    }
-
-    let dim = embedder.as_ref().map(Embedder::dim);
-    let (_db, conn) = open_db(&config.db_path, dim).await?;
-
     match cli.command {
-        Command::Watch | Command::Reindex => unreachable!("handled above"),
+        Command::Watch => run_watch(&config, embedder).await,
+        Command::Reindex => run_reindex_command(&config, embedder).await,
         Command::Search {
             query,
             limit,
             paths_only,
             ..
-        } => {
-            let query = resolve_query(
-                query,
-                &mut std::io::stdin().lock(),
-                std::io::stdin().is_terminal(),
-            )?;
-            let fts = fts::FtsIndex::open_or_create(&config.tantivy_dir)?;
-            let semantic = db::DbSemanticSource::new(conn.clone());
-            let fts_src = fts::FtsFtsSource::new(fts);
-            let path_src = db::DbPathSource::new(conn.clone());
-            let results = rank::search(
-                &semantic,
-                &fts_src,
-                &path_src,
-                embedder.as_ref(),
-                &query,
-                limit,
-                &config.weights,
-            )
-            .await?;
-            if paths_only {
-                for result in &results {
-                    println!("{}", result.path);
-                }
-            } else {
-                for result in &results {
-                    println!(
-                        "{:.4}\t{}\t{}",
-                        result.score,
-                        result.path,
-                        first_line(&result.snippet)
-                    );
-                }
-            }
-        }
+        } => run_search(&config, embedder.as_ref(), query, limit, paths_only).await,
         Command::Similar {
             threshold,
             limit,
             group,
             paths_only,
         } => {
-            let pair_limit = if group { None } else { Some(limit) };
-            let source = db::DbAllChunkEmbeddingsSource::new(conn);
-            let pairs = similar::find_similar(&source, threshold, pair_limit).await?;
-            print_similar(pairs, limit, group, paths_only);
+            let dim = embedder.as_ref().map(Embedder::dim);
+            run_similar(&config, dim, threshold, limit, group, paths_only).await
         }
         Command::Related {
             path,
             limit,
             paths_only,
         } => {
-            let note_source = db::DbNoteEmbeddingsSource::new(conn.clone());
-            let related_source = db::DbRelatedSearchSource::new(conn);
-            let results =
-                similar::find_related(&note_source, &related_source, &path, limit).await?;
-            if paths_only {
-                for r in &results {
-                    println!("{}", r.path);
-                }
-            } else {
-                for r in &results {
-                    println!("{:.4}\t{}", r.similarity, r.path);
-                }
-            }
+            let dim = embedder.as_ref().map(Embedder::dim);
+            run_related(&config, dim, path, limit, paths_only).await
         }
     }
-
-    Ok(())
 }
 
 fn first_line(s: &str) -> &str {
@@ -639,7 +748,7 @@ mod tests {
     async fn open_db_succeeds_when_dimensions_match() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
-        let result = open_db(&path, Some(384)).await;
+        let result = db::connect(&path, Some(384)).await;
         assert!(result.is_ok());
     }
 
@@ -652,7 +761,7 @@ mod tests {
         drop(conn);
         drop(db);
 
-        let result = open_db(&path, Some(1024)).await;
+        let result = db::connect(&path, Some(1024)).await;
         assert!(result.is_err());
         assert!(
             is_dimension_mismatch(&result.expect_err("should fail")),
