@@ -6,7 +6,19 @@ Semantic search for a directory of markdown files. Combines vector similarity, f
 
 ```bash
 cargo install --path .
-export NEEDLE_DOCS_DIR=/path/to/notes # alternatively, set notes_dir in config (see below)
+```
+
+Add your docs directories to `~/.config/needle/config.toml`:
+
+```toml
+notes_dirs = ["/path/to/notes"]
+```
+
+Or pass `--docs-dir` before the subcommand to override for one invocation:
+
+```bash
+needle --docs-dir ~/notes search "query"
+needle --docs-dir ~/notes --docs-dir ~/work/docs search "query"
 ```
 
 By default, needle uses [fastembed](https://github.com/Anush008/fastembed-rs) for local embeddings (all-MiniLM-L6-v2). No API key needed. The model downloads automatically on first run.
@@ -56,6 +68,8 @@ Keep the index up to date as you edit:
 needle watch
 ```
 
+All configured directories are watched simultaneously. Changes in any directory trigger re-indexing of the affected file only.
+
 ## Flags
 
 `-p` / `--paths-only` on `search`, `similar`, and `related` emits bare paths, one per line.
@@ -73,7 +87,7 @@ needle search "topic" --w-semantic 2.0 --w-fts 0.5 --w-filename 0
 Optional config file at `~/.config/needle/config.toml`:
 
 ```toml
-notes_dir = "/home/you/notes"
+notes_dirs = ["/home/you/notes"]
 provider = "openai"
 model = "text-embedding-3-small"
 api_base = "http://localhost:11434/v1"
@@ -87,16 +101,28 @@ w_filename = 0.7
 
 Environment variables override the config file. CLI flags override everything.
 
-| Setting             | Env var           | Config key       |
-| ------------------- | ----------------- | ---------------- |
-| Provider            | `NEEDLE_PROVIDER` | `provider`       |
-| Model               | `NEEDLE_MODEL`    | `model`          |
-| API base URL        | `NEEDLE_API_BASE` | `api_base`       |
-| Dimension override  | `NEEDLE_DIM`      | `dim`            |
-| Voyage API key      | `VOYAGE_API_KEY`  | `voyage_api_key` |
-| OpenAI API key      | `OPENAI_API_KEY`  | `openai_api_key` |
-| Custom endpoint key | `NEEDLE_API_KEY`  | `needle_api_key` |
-| Notes directory     | `NEEDLE_DOCS_DIR` | `notes_dir`      |
+| Setting             | Env var           | Config key        |
+| ------------------- | ----------------- | ----------------- |
+| Provider            | `NEEDLE_PROVIDER` | `provider`        |
+| Model               | `NEEDLE_MODEL`    | `model`           |
+| API base URL        | `NEEDLE_API_BASE` | `api_base`        |
+| Dimension override  | `NEEDLE_DIM`      | `dim`             |
+| Voyage API key      | `VOYAGE_API_KEY`  | `voyage_api_key`  |
+| OpenAI API key      | `OPENAI_API_KEY`  | `openai_api_key`  |
+| Custom endpoint key | `NEEDLE_API_KEY`  | `needle_api_key`  |
+| Docs directories    | (use `--docs-dir`)| `notes_dirs`      |
+
+Docs directories can be specified as a TOML array in `notes_dirs`, or overridden per-invocation with one or more `--docs-dir <PATH>` flags. When `--docs-dir` is passed, the config file directories are ignored for that invocation.
+
+### Migrating from `notes_dir`
+
+If you previously used `notes_dir = "/path"` in config or `NEEDLE_DOCS_DIR`, replace with:
+
+```toml
+notes_dirs = ["/path"]
+```
+
+Remove any `NEEDLE_DOCS_DIR` exports from your shell profile.
 
 ### Embedding Providers
 

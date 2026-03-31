@@ -1,9 +1,10 @@
-use std::path::PathBuf;
-
 #[derive(Debug, thiserror::Error)]
 pub enum NeedleError {
-    #[error("notes directory not found: {0}")]
-    NotesDirectoryNotFound(PathBuf),
+    #[error("docs directories not found:\n{0}")]
+    MissingDirectories(String),
+
+    #[error("docs directories overlap (configure non-overlapping paths):\n{0}")]
+    OverlappingDirectories(String),
 
     #[error("missing API key: {0}")]
     MissingApiKey(String),
