@@ -17,6 +17,7 @@ pub trait NoteEmbeddingsSource: Send + Sync {
     fn chunk_embeddings_for_path<'a>(&'a self, path: &'a str) -> SimilarFuture<'a, Vec<Vec<f32>>>;
 }
 
+#[derive(serde::Serialize)]
 pub struct RelatedResult {
     pub path: String,
     pub similarity: f64,
@@ -31,6 +32,7 @@ pub trait RelatedSearchSource: Send + Sync {
     ) -> SimilarFuture<'a, Vec<RelatedResult>>;
 }
 
+#[derive(serde::Serialize)]
 pub struct SimilarPair {
     pub similarity: f64,
     pub path_a: String,
@@ -115,6 +117,7 @@ fn find_similar_pairs(
     pairs
 }
 
+#[derive(serde::Serialize)]
 pub struct SimilarGroup {
     pub paths: Vec<String>,
     pub pairs: Vec<SimilarPair>,

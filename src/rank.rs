@@ -38,6 +38,7 @@ pub trait PathSource: Send + Sync {
     fn all_paths(&self) -> SearchFuture<'_, Vec<String>>;
 }
 
+#[derive(serde::Serialize)]
 pub struct FusedResult {
     pub path: String,
     pub score: f64,
