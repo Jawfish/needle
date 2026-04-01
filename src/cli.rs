@@ -15,6 +15,9 @@ pub struct Cli {
     #[arg(long, env = "NEEDLE_API_BASE")]
     pub api_base: Option<String>,
 
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
