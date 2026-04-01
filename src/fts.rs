@@ -177,7 +177,10 @@ impl FtsIndex {
             let (parsed_query, _errors) = query_parser.parse_query_lenient(&query_owned);
 
             let candidate_limit = limit.saturating_mul(3);
-            let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(candidate_limit))?;
+            let top_docs = searcher.search(
+                &parsed_query,
+                &TopDocs::with_limit(candidate_limit).order_by_score(),
+            )?;
 
             let snippet_generator =
                 SnippetGenerator::create(&searcher, &parsed_query, content_field)?;
