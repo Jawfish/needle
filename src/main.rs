@@ -7,6 +7,7 @@ mod fts;
 mod hash;
 mod index;
 mod lock;
+mod output;
 mod query;
 mod rank;
 mod search_merge;
@@ -14,7 +15,7 @@ mod similar;
 mod types;
 mod watch;
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 
 use anyhow::Context;
 use clap::Parser;
@@ -24,8 +25,7 @@ use crate::{
     config::{CliEmbedArgs, CliWeights, Config},
     embed::Embedder,
     error::NeedleError,
-    rank::FusedResult,
-    similar::RelatedResult,
+    output::OutputMode,
 };
 
 fn is_dimension_mismatch(err: &anyhow::Error) -> bool {
@@ -376,7 +376,8 @@ async fn run_search(
     embedder: Option<&Embedder>,
     query: Option<String>,
     limit: usize,
-    paths_only: bool,
+    mode: OutputMode,
+    writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     let query_str = resolve_query(
         query,
@@ -399,7 +400,7 @@ async fn run_search(
     let per_store =
         query::query_search(&store_ports, embedder, &query_str, limit, &config.weights).await?;
     let results = search_merge::merge_fused_results(per_store, limit);
-    print_search(&results, paths_only);
+    output::print_search(&results, mode, writer)?;
     Ok(())
 }
 
@@ -409,7 +410,8 @@ async fn run_similar(
     threshold: f64,
     limit: usize,
     group: bool,
-    paths_only: bool,
+    mode: OutputMode,
+    writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     let pair_limit = if group { None } else { Some(limit) };
 
@@ -432,7 +434,7 @@ async fn run_similar(
 
     let per_store = query::query_similar(&store_ports, threshold, pair_limit).await?;
     let pairs = search_merge::merge_similar_pairs(per_store, pair_limit);
-    print_similar(pairs, limit, group, paths_only);
+    output::print_similar(pairs, limit, group, mode, writer)?;
     Ok(())
 }
 
@@ -441,7 +443,8 @@ async fn run_related(
     dim: Option<usize>,
     path: String,
     limit: usize,
-    paths_only: bool,
+    mode: OutputMode,
+    writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     let store = search_merge::owning_store(&config.docs_dirs, &path).ok_or_else(|| {
         if std::path::Path::new(&path).is_absolute() {
@@ -469,37 +472,8 @@ async fn run_related(
             result.path = store.to_absolute(&result.path);
         }
     }
-    print_related(&results, paths_only);
+    output::print_related(&results, mode, writer)?;
     Ok(())
-}
-
-fn print_search(results: &[FusedResult], paths_only: bool) {
-    if paths_only {
-        for result in results {
-            println!("{}", result.path);
-        }
-    } else {
-        for result in results {
-            println!(
-                "{:.4}\t{}\t{}",
-                result.score,
-                result.path,
-                first_line(&result.snippet)
-            );
-        }
-    }
-}
-
-fn print_related(results: &[RelatedResult], paths_only: bool) {
-    if paths_only {
-        for r in results {
-            println!("{}", r.path);
-        }
-    } else {
-        for r in results {
-            println!("{:.4}\t{}", r.similarity, r.path);
-        }
-    }
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -525,7 +499,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             limit,
             paths_only,
             ..
-        } => run_search(&config, embedder.as_ref(), query, limit, paths_only).await,
+        } => {
+            let mode = if cli.json {
+                OutputMode::Json
+            } else {
+                OutputMode::Human { paths_only }
+            };
+            run_search(
+                &config,
+                embedder.as_ref(),
+                query,
+                limit,
+                mode,
+                &mut std::io::stdout(),
+            )
+            .await
+        }
         Command::Similar {
             threshold,
             limit,
@@ -533,7 +522,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             paths_only,
         } => {
             let dim = embedder.as_ref().map(Embedder::dim);
-            run_similar(&config, dim, threshold, limit, group, paths_only).await
+            let mode = if cli.json {
+                OutputMode::Json
+            } else {
+                OutputMode::Human { paths_only }
+            };
+            run_similar(
+                &config,
+                dim,
+                threshold,
+                limit,
+                group,
+                mode,
+                &mut std::io::stdout(),
+            )
+            .await
         }
         Command::Related {
             path,
@@ -541,47 +544,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             paths_only,
         } => {
             let dim = embedder.as_ref().map(Embedder::dim);
-            run_related(&config, dim, path, limit, paths_only).await
-        }
-    }
-}
-
-fn first_line(s: &str) -> &str {
-    s.lines().next().unwrap_or("")
-}
-
-fn print_similar(pairs: Vec<similar::SimilarPair>, limit: usize, group: bool, paths_only: bool) {
-    if group {
-        let mut groups = similar::group_pairs(pairs);
-        groups.truncate(limit);
-        if paths_only {
-            for g in &groups {
-                for path in &g.paths {
-                    println!("{path}");
-                }
-            }
-        } else {
-            for (i, g) in groups.iter().enumerate() {
-                if i > 0 {
-                    println!();
-                }
-                println!("Group {} ({} documents):", i + 1, g.paths.len());
-                for pair in &g.pairs {
-                    println!(
-                        "  {:.4}  {} <> {}",
-                        pair.similarity, pair.path_a, pair.path_b
-                    );
-                }
-            }
-        }
-    } else if paths_only {
-        for pair in &pairs {
-            println!("{}", pair.path_a);
-            println!("{}", pair.path_b);
-        }
-    } else {
-        for pair in &pairs {
-            println!("{:.4}\t{}\t{}", pair.similarity, pair.path_a, pair.path_b);
+            let mode = if cli.json {
+                OutputMode::Json
+            } else {
+                OutputMode::Human { paths_only }
+            };
+            run_related(&config, dim, path, limit, mode, &mut std::io::stdout()).await
         }
     }
 }
