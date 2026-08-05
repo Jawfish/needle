@@ -137,6 +137,42 @@ pub async fn execute_directory_plan(
 
     db::apply_directory_changes(conn, &plan.to_delete, &upserts).await?;
 
+    if !plan.to_delete.is_empty() || !upserts.is_empty() {
+        let incremental_result = async {
+            for path in &plan.to_delete {
+                fts.delete(path)
+                    .await
+                    .with_context(|| format!("failed to delete {path} from FTS"))?;
+            }
+            for (path, _, chunks) in &upserts {
+                let texts: Vec<String> = chunks.iter().map(|(text, _)| text.clone()).collect();
+                fts.upsert(path, &texts)
+                    .await
+                    .with_context(|| format!("failed to upsert {path} into FTS"))?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+
+        if let Err(incremental_error) = incremental_result {
+            tracing::warn!(error = %incremental_error, "incremental FTS update failed; rebuilding");
+            let recovery_result = async {
+                let chunks = db::all_chunks(conn)
+                    .await
+                    .context("failed to read committed DB chunks for FTS recovery")?;
+                fts.rebuild(chunks)
+                    .await
+                    .context("failed to rebuild FTS from committed DB chunks")
+            }
+            .await;
+            if let Err(recovery_error) = recovery_result {
+                return Err(anyhow::anyhow!(
+                    "incremental FTS update failed: {incremental_error:#}; FTS recovery failed: {recovery_error:#}"
+                ));
+            }
+        }
+    }
+
     for path in &plan.to_delete {
         tracing::info!(path, "deleted from index");
     }
@@ -144,9 +180,6 @@ pub async fn execute_directory_plan(
         let action = if file.is_new { "indexed" } else { "updated" };
         tracing::info!(path = file.rel_path, action);
     }
-
-    let all_chunks = db::all_chunks(conn).await?;
-    fts.rebuild(all_chunks).await?;
 
     Ok(IndexStats {
         added: added_count,
@@ -931,6 +964,137 @@ mod tests {
                 .await
                 .expect("hash")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_directory_scan_makes_no_fts_mutations() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "unchanged content");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let embedder = Embedder::create_null(1024);
+
+        index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect("initial index");
+        fts.reset_mutation_count();
+
+        index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect("unchanged index");
+
+        assert_eq!(fts.mutation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn directory_scan_incrementally_applies_add_update_and_delete() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "keep.md", "keep token");
+        create_file(notes_dir.path(), "update.md", "before token");
+        create_file(notes_dir.path(), "remove.md", "remove token");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let embedder = Embedder::create_null(1024);
+
+        index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect("initial index");
+        create_file(notes_dir.path(), "update.md", "after token");
+        create_file(notes_dir.path(), "add.md", "add token");
+        std::fs::remove_file(notes_dir.path().join("remove.md")).expect("remove");
+        fts.reset_mutation_count();
+
+        let stats = index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect("mixed index");
+
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.updated, 1);
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(fts.mutation_count(), 3);
+        assert_eq!(
+            fts.search("after", 10).await.expect("search")[0].path,
+            "update.md"
+        );
+        assert_eq!(
+            fts.search("add", 10).await.expect("search")[0].path,
+            "add.md"
+        );
+        assert!(fts.search("remove", 10).await.expect("search").is_empty());
+    }
+
+    #[tokio::test]
+    async fn incremental_fts_failure_rebuilds_from_committed_db_chunks() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "before token");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let embedder = Embedder::create_null(1024);
+
+        index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect("initial index");
+        create_file(notes_dir.path(), "note.md", "after token");
+        fts.reset_mutation_count();
+        fts.fail_next_mutations(1);
+
+        index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect("recovery index");
+
+        assert_eq!(fts.mutation_count(), 2);
+        assert_eq!(
+            db::all_chunks(&conn).await.expect("chunks")[0].1,
+            "after token"
+        );
+        assert_eq!(
+            fts.search("after", 10).await.expect("search")[0].path,
+            "note.md"
+        );
+        assert!(fts.search("before", 10).await.expect("search").is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_fts_recovery_returns_incremental_and_recovery_context() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "before token");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let embedder = Embedder::create_null(1024);
+
+        index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect("initial index");
+        create_file(notes_dir.path(), "note.md", "after token");
+        fts.fail_next_mutations(2);
+
+        let error = index_directory(&conn, &fts, &embedder, notes_dir.path())
+            .await
+            .expect_err("recovery failure should fail indexing")
+            .to_string();
+
+        assert!(error.contains("incremental FTS update failed"));
+        assert!(error.contains("FTS recovery failed"));
+        assert_eq!(
+            db::all_chunks(&conn).await.expect("chunks")[0].1,
+            "after token"
         );
     }
 

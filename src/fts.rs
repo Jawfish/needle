@@ -1,5 +1,8 @@
 use std::{path::Path, sync::Arc};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::Context;
 use tantivy::{
     IndexReader, IndexWriter, ReloadPolicy, TantivyDocument,
@@ -23,6 +26,14 @@ pub struct FtsIndex {
     writer: Arc<Mutex<Option<IndexWriter>>>,
     path_field: Field,
     content_field: Field,
+    #[cfg(test)]
+    mutations: Arc<MutationState>,
+}
+
+#[cfg(test)]
+struct MutationState {
+    count: AtomicUsize,
+    failures_remaining: AtomicUsize,
 }
 
 fn ensure_writer<'a>(
@@ -100,6 +111,11 @@ impl FtsIndex {
             writer: Arc::new(Mutex::new(None)),
             path_field,
             content_field,
+            #[cfg(test)]
+            mutations: Arc::new(MutationState {
+                count: AtomicUsize::new(0),
+                failures_remaining: AtomicUsize::new(0),
+            }),
         })
     }
 
@@ -110,7 +126,39 @@ impl FtsIndex {
         searcher.num_docs() == 0
     }
 
+    #[cfg(test)]
+    pub(crate) fn mutation_count(&self) -> usize {
+        self.mutations.count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_mutation_count(&self) {
+        self.mutations.count.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_mutations(&self, count: usize) {
+        self.mutations
+            .failures_remaining
+            .store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn before_mutation(&self) -> anyhow::Result<()> {
+        self.mutations.count.fetch_add(1, Ordering::SeqCst);
+        let remaining = self.mutations.failures_remaining.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.mutations
+                .failures_remaining
+                .fetch_sub(1, Ordering::SeqCst);
+            anyhow::bail!("injected FTS mutation failure");
+        }
+        Ok(())
+    }
+
     pub async fn upsert(&self, path: &str, chunks: &[String]) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.before_mutation()?;
         let path_field = self.path_field;
         let content_field = self.content_field;
         let path_owned = path.to_owned();
@@ -142,6 +190,9 @@ impl FtsIndex {
     }
 
     pub async fn delete(&self, path: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.before_mutation()?;
+
         let path_field = self.path_field;
         let path_owned = path.to_owned();
         let writer = Arc::clone(&self.writer);
@@ -232,6 +283,9 @@ impl FtsIndex {
     }
 
     pub async fn rebuild(&self, chunks: Vec<(String, String)>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.before_mutation()?;
+
         let path_field = self.path_field;
         let content_field = self.content_field;
         let writer = Arc::clone(&self.writer);
