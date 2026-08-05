@@ -44,7 +44,7 @@ pub struct FusedResult {
     pub path: String,
     pub score: f64,
     pub snippet: String,
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub locator: Option<String>,
 }
 
@@ -256,19 +256,25 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_rrf_keeps_first_snippet_for_path() {
+    fn accumulate_rrf_keeps_first_snippet_and_its_locator_for_path() {
         let mut scores = HashMap::new();
-        let items_a = candidates(&[("note.md", "first snippet")]);
-        let items_b = candidates(&[("note.md", "second snippet")]);
+        let items_a = vec![Candidate {
+            path: "note.md".to_owned(),
+            snippet: "first snippet".to_owned(),
+            locator: Some("First heading".to_owned()),
+        }];
+        let items_b = vec![Candidate {
+            path: "note.md".to_owned(),
+            snippet: "second snippet".to_owned(),
+            locator: Some("Second heading".to_owned()),
+        }];
 
         accumulate_rrf(&mut scores, &items_a, 1.0);
         accumulate_rrf(&mut scores, &items_b, 1.0);
 
-        let snippet = &scores.get("note.md").expect("should exist").1;
-        assert_eq!(
-            snippet, "first snippet",
-            "should keep the first snippet seen"
-        );
+        let result = scores.get("note.md").expect("should exist");
+        assert_eq!(result.1, "first snippet");
+        assert_eq!(result.2.as_deref(), Some("First heading"));
     }
 
     #[test]

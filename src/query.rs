@@ -181,12 +181,87 @@ mod tests {
         }
     }
 
+    fn candidate(path: &str, snippet: &str, locator: Option<&str>) -> Candidate {
+        Candidate {
+            path: path.to_owned(),
+            snippet: snippet.to_owned(),
+            locator: locator.map(str::to_owned),
+        }
+    }
+
     fn default_weights() -> RrfWeights {
         RrfWeights {
             semantic: 0.0,
             fts: 1.0,
             filename: 0.0,
         }
+    }
+
+    #[tokio::test]
+    async fn search_results_keep_locators_with_their_selected_chunks() {
+        let notes_dir = PathBuf::from("/docs");
+        let paths = FakePathSource(vec![]);
+        let embedder = Embedder::create_null(2);
+        let semantic = FakeSemanticSource(vec![candidate(
+            "semantic.md",
+            "semantic chunk",
+            Some("Semantic heading"),
+        )]);
+        let fts = FakeFtsSource(vec![
+            candidate("fts.md", "fts chunk", Some("p. 12")),
+            candidate("semantic.md", "full-text chunk", Some("Full-text heading")),
+        ]);
+        let stores = [SearchStorePorts {
+            notes_dir: &notes_dir,
+            semantic: &semantic,
+            fts: &fts,
+            paths: &paths,
+        }];
+
+        let semantic_only = query_search(
+            &stores,
+            Some(&embedder),
+            "anything",
+            10,
+            &RrfWeights {
+                semantic: 1.0,
+                fts: 0.0,
+                filename: 0.0,
+            },
+        )
+        .await
+        .expect("semantic search must succeed");
+        assert_eq!(semantic_only[0][0].snippet, "semantic chunk");
+        assert_eq!(
+            semantic_only[0][0].locator.as_deref(),
+            Some("Semantic heading")
+        );
+
+        let fts_only = query_search(&stores, None, "anything", 10, &default_weights())
+            .await
+            .expect("full-text search must succeed");
+        assert_eq!(fts_only[0][0].snippet, "fts chunk");
+        assert_eq!(fts_only[0][0].locator.as_deref(), Some("p. 12"));
+
+        let fused = query_search(
+            &stores,
+            Some(&embedder),
+            "anything",
+            10,
+            &RrfWeights {
+                semantic: 1.0,
+                fts: 1.0,
+                filename: 0.0,
+            },
+        )
+        .await
+        .expect("fused search must succeed");
+        let result = fused[0]
+            .iter()
+            .find(|result| result.path == "semantic.md")
+            .expect("semantic result must exist");
+        assert_eq!(result.snippet, "semantic chunk");
+        assert_eq!(result.locator.as_deref(), Some("Semantic heading"));
     }
 
     #[tokio::test]
