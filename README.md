@@ -37,10 +37,11 @@ needle search "authentication" -p | xargs bat
 echo "query from clipboard" | needle search
 ```
 
-Search every configured directory by default, or repeat `--namespace` to search the union of selected groups:
+Search and similarity include every configured directory by default. Repeat `--namespace` to target the union of selected groups:
 
 ```bash
 needle search "authentication" --namespace notes --namespace work
+needle similar --namespace notes --namespace work
 ```
 
 ### Discover documentation namespaces

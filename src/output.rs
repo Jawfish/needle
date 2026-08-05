@@ -455,6 +455,75 @@ mod tests {
     }
 
     #[test]
+    fn similar_flat_human_output_is_unchanged() {
+        let pairs = vec![
+            make_pair(0.95, "a.md", "b.md"),
+            make_pair(0.90, "b.md", "c.md"),
+        ];
+        let output = write_to_string(|writer| {
+            print_similar(
+                pairs,
+                10,
+                false,
+                OutputMode::Human { paths_only: false },
+                writer,
+            )
+        });
+        assert_eq!(output, "0.9500\ta.md\tb.md\n0.9000\tb.md\tc.md\n");
+    }
+
+    #[test]
+    fn similar_grouped_human_output_is_unchanged() {
+        let pairs = vec![
+            make_pair(0.95, "a.md", "b.md"),
+            make_pair(0.90, "b.md", "c.md"),
+        ];
+        let output = write_to_string(|writer| {
+            print_similar(
+                pairs,
+                10,
+                true,
+                OutputMode::Human { paths_only: false },
+                writer,
+            )
+        });
+        assert_eq!(
+            output,
+            "Group 1 (3 documents):\n  0.9500  a.md <> b.md\n  0.9000  b.md <> c.md\n"
+        );
+    }
+
+    #[test]
+    fn similar_paths_only_outputs_are_unchanged() {
+        let flat = write_to_string(|writer| {
+            print_similar(
+                vec![
+                    make_pair(0.95, "a.md", "b.md"),
+                    make_pair(0.90, "b.md", "c.md"),
+                ],
+                10,
+                false,
+                OutputMode::Human { paths_only: true },
+                writer,
+            )
+        });
+        let grouped = write_to_string(|writer| {
+            print_similar(
+                vec![
+                    make_pair(0.95, "a.md", "b.md"),
+                    make_pair(0.90, "b.md", "c.md"),
+                ],
+                10,
+                true,
+                OutputMode::Human { paths_only: true },
+                writer,
+            )
+        });
+        assert_eq!(flat, "a.md\nb.md\nb.md\nc.md\n");
+        assert_eq!(grouped, "a.md\nb.md\nc.md\n");
+    }
+
+    #[test]
     fn similar_flat_json_has_correct_fields() {
         let pairs = vec![make_pair(0.95, "a.md", "b.md")];
         let out = write_to_string(|w| print_similar(pairs, 10, false, OutputMode::Json, w));

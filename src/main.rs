@@ -496,24 +496,24 @@ async fn run_search(
 
 async fn run_similar(
     config: &Config,
-    dim: Option<usize>,
+    namespaces: &[String],
     threshold: f64,
     limit: usize,
     group: bool,
     mode: OutputMode,
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
+    let stores = config.select_stores(namespaces)?;
     let pair_limit = if group { None } else { Some(limit) };
 
     let mut embeddings_sources: Vec<db::DbAllChunkEmbeddingsSource> =
-        Vec::with_capacity(config.docs_dirs.len());
-    for store in &config.docs_dirs {
-        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        Vec::with_capacity(stores.len());
+    for store in &stores {
+        let (_db, conn) = db::connect(&store.db_path, None).await?;
         embeddings_sources.push(db::DbAllChunkEmbeddingsSource::new(conn));
     }
 
-    let store_ports: Vec<query::SimilarStorePorts<'_>> = config
-        .docs_dirs
+    let store_ports: Vec<query::SimilarStorePorts<'_>> = stores
         .iter()
         .zip(embeddings_sources.iter())
         .map(|(store, embeddings)| query::SimilarStorePorts {
@@ -632,15 +632,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Command::Similar {
+            namespaces,
             threshold,
             limit,
             group,
             paths_only,
         } => {
-            let dim = embedder.as_ref().map(Embedder::dim);
             run_similar(
                 &config,
-                dim,
+                &namespaces,
                 threshold,
                 limit,
                 group,
@@ -861,6 +861,7 @@ mod tests {
         };
         assert!(!search_needs_embedder(
             &Command::Similar {
+                namespaces: Vec::new(),
                 threshold: 0.85,
                 limit: 50,
                 group: false,

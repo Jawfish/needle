@@ -53,6 +53,8 @@ pub enum Command {
     },
     /// Find similar document pairs based on embeddings
     Similar {
+        #[arg(long = "namespace")]
+        namespaces: Vec<String>,
         #[arg(long, default_value = "0.85")]
         threshold: f64,
         #[arg(short, long, default_value = "50")]
@@ -120,6 +122,37 @@ mod tests {
         let cli = Cli::try_parse_from(["needle", "search", "query"]).expect("parse");
         let namespaces = match cli.command {
             Command::Search { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(namespaces, Some(Vec::new()));
+    }
+
+    #[test]
+    fn similar_accepts_repeated_namespace_options() {
+        let cli = Cli::try_parse_from([
+            "needle",
+            "similar",
+            "--namespace",
+            "alpha",
+            "--namespace",
+            "shared",
+        ])
+        .expect("parse");
+        let namespaces = match cli.command {
+            Command::Similar { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(
+            namespaces,
+            Some(vec!["alpha".to_owned(), "shared".to_owned()])
+        );
+    }
+
+    #[test]
+    fn similar_without_namespace_options_is_unscoped() {
+        let cli = Cli::try_parse_from(["needle", "similar"]).expect("parse");
+        let namespaces = match cli.command {
+            Command::Similar { namespaces, .. } => Some(namespaces),
             _ => None,
         };
         assert_eq!(namespaces, Some(Vec::new()));
