@@ -123,6 +123,54 @@ impl Config {
             weights,
         })
     }
+
+    pub fn select_stores(&self, selected_names: &[String]) -> anyhow::Result<Vec<&DirectoryStore>> {
+        if selected_names.is_empty() {
+            return Ok(self.docs_dirs.iter().collect());
+        }
+
+        let mut available: Vec<&str> = self
+            .namespaces
+            .iter()
+            .map(|namespace| namespace.name.as_str())
+            .collect();
+        available.sort_unstable();
+        for name in selected_names {
+            if !self
+                .namespaces
+                .iter()
+                .any(|namespace| namespace.name == *name)
+            {
+                return Err(NeedleError::UnknownNamespace {
+                    name: name.clone(),
+                    available: available.join(", "),
+                }
+                .into());
+            }
+        }
+
+        Ok(self
+            .docs_dirs
+            .iter()
+            .filter(|store| {
+                self.namespaces.iter().any(|namespace| {
+                    selected_names.iter().any(|name| name == &namespace.name)
+                        && namespace.paths.contains(&store.notes_dir)
+                })
+            })
+            .collect())
+    }
+
+    pub fn namespace_names_for(&self, path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .namespaces
+            .iter()
+            .filter(|namespace| namespace.paths.iter().any(|configured| configured == path))
+            .map(|namespace| namespace.name.clone())
+            .collect();
+        names.sort_unstable();
+        names
+    }
 }
 
 fn resolve_namespaces(file_config: &FileConfig) -> anyhow::Result<(Vec<Namespace>, Vec<PathBuf>)> {
@@ -479,6 +527,79 @@ mod tests {
             Some("Project A documentation")
         );
         assert_eq!(config.namespaces[0].paths, config.namespaces[1].paths);
+    }
+
+    #[test]
+    fn unscoped_selection_returns_all_configured_stores() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let first = base.path().join("first");
+        let shared = base.path().join("shared");
+        let second = base.path().join("second");
+        for path in [&first, &shared, &second] {
+            std::fs::create_dir(path).expect("create directory");
+        }
+        let config = resolve(vec![
+            namespace(Some("alpha"), Some(vec![first.clone(), shared.clone()])),
+            namespace(Some("beta"), Some(vec![second.clone()])),
+        ])
+        .expect("must resolve");
+
+        let stores = config.select_stores(&[]).expect("must select");
+        assert_eq!(
+            stores
+                .iter()
+                .map(|store| store.notes_dir.as_path())
+                .collect::<Vec<_>>(),
+            vec![first.as_path(), shared.as_path(), second.as_path()]
+        );
+    }
+
+    #[test]
+    fn selected_namespaces_use_a_deduplicated_directory_union() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let first = base.path().join("first");
+        let shared = base.path().join("shared");
+        let second = base.path().join("second");
+        for path in [&first, &shared, &second] {
+            std::fs::create_dir(path).expect("create directory");
+        }
+        let config = resolve(vec![
+            namespace(Some("alpha"), Some(vec![first.clone(), shared.clone()])),
+            namespace(Some("beta"), Some(vec![shared.clone(), second.clone()])),
+        ])
+        .expect("must resolve");
+        let selected = vec!["beta".to_owned(), "alpha".to_owned(), "beta".to_owned()];
+
+        let stores = config.select_stores(&selected).expect("must select");
+        assert_eq!(
+            stores
+                .iter()
+                .map(|store| store.notes_dir.as_path())
+                .collect::<Vec<_>>(),
+            vec![first.as_path(), shared.as_path(), second.as_path()]
+        );
+        assert_eq!(config.namespace_names_for(&shared), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn unknown_namespace_reports_sorted_available_names() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let alpha = base.path().join("alpha");
+        let beta = base.path().join("beta");
+        std::fs::create_dir(&alpha).expect("create alpha");
+        std::fs::create_dir(&beta).expect("create beta");
+        let config = resolve(vec![
+            namespace(Some("beta"), Some(vec![beta])),
+            namespace(Some("alpha"), Some(vec![alpha])),
+        ])
+        .expect("must resolve");
+
+        let error = config
+            .select_stores(&["missing".to_owned()])
+            .expect_err("must fail")
+            .to_string();
+        assert!(error.contains("unknown namespace 'missing'"));
+        assert!(error.contains("available namespaces: alpha, beta"));
     }
 
     #[test]

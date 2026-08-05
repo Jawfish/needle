@@ -37,6 +37,12 @@ needle search "authentication" -p | xargs bat
 echo "query from clipboard" | needle search
 ```
 
+Search every configured directory by default, or repeat `--namespace` to search the union of selected groups:
+
+```bash
+needle search "authentication" --namespace notes --namespace work
+```
+
 ### Discover documentation namespaces
 
 List the configured documentation groups before searching:

@@ -8,6 +8,9 @@ pub enum NeedleError {
     #[error("invalid documentation namespace: {0}")]
     InvalidNamespace(String),
 
+    #[error("unknown namespace '{name}'; available namespaces: {available}")]
+    UnknownNamespace { name: String, available: String },
+
     #[error("docs directories not found:\n{0}")]
     MissingDirectories(String),
 

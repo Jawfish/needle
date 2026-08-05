@@ -399,11 +399,12 @@ async fn run_reindex_command(
     Ok(())
 }
 
-async fn open_search_adapters(
-    stores: &[config::DirectoryStore],
+async fn open_search_adapters<'a>(
+    stores: impl IntoIterator<Item = &'a config::DirectoryStore>,
     profile: Option<&types::IndexProfile>,
 ) -> anyhow::Result<Vec<server::SearchAdapter>> {
-    let mut out = Vec::with_capacity(stores.len());
+    let stores = stores.into_iter();
+    let mut out = Vec::with_capacity(stores.size_hint().0);
     for store in stores {
         let (_db, conn) = match profile {
             Some(profile) => db::connect_with_profile(&store.db_path, profile).await?,
@@ -428,14 +429,40 @@ fn run_namespaces(
     output::print_namespaces(namespaces, mode, writer)
 }
 
+fn search_result_memberships(
+    config: &Config,
+    stores: &[&config::DirectoryStore],
+    results: &[rank::FusedResult],
+) -> anyhow::Result<Vec<Vec<String>>> {
+    results
+        .iter()
+        .map(|result| {
+            let store = match stores {
+                [store] => *store,
+                _ => search_merge::owning_store(&config.docs_dirs, &result.path).with_context(
+                    || {
+                        format!(
+                            "search result {} has no configured source directory",
+                            result.path
+                        )
+                    },
+                )?,
+            };
+            Ok(config.namespace_names_for(&store.notes_dir))
+        })
+        .collect()
+}
+
 async fn run_search(
     config: &Config,
+    namespaces: &[String],
     embedder: Option<&Embedder>,
     query: Option<String>,
     limit: usize,
     mode: OutputMode,
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
+    let stores = config.select_stores(namespaces)?;
     let query_str = resolve_query(
         query,
         &mut std::io::stdin().lock(),
@@ -443,9 +470,8 @@ async fn run_search(
     )?;
     let preparer = document::DefaultPreparer::default();
     let profile = embedder.map(|embedder| index_profile(embedder, &preparer));
-    let adapters = open_search_adapters(&config.docs_dirs, profile.as_ref()).await?;
-    let store_ports: Vec<query::SearchStorePorts<'_>> = config
-        .docs_dirs
+    let adapters = open_search_adapters(stores.iter().copied(), profile.as_ref()).await?;
+    let store_ports: Vec<query::SearchStorePorts<'_>> = stores
         .iter()
         .zip(adapters.iter())
         .map(|(store, adapter)| query::SearchStorePorts {
@@ -457,7 +483,13 @@ async fn run_search(
         .collect();
     let per_store =
         query::query_search(&store_ports, embedder, &query_str, limit, &config.weights).await?;
-    let results = search_merge::merge_fused_results(per_store, limit);
+    let fused_results = search_merge::merge_fused_results(per_store, limit);
+    let memberships = search_result_memberships(config, &stores, &fused_results)?;
+    let results = fused_results
+        .into_iter()
+        .zip(memberships)
+        .map(|(fused, namespaces)| output::SearchResult { fused, namespaces })
+        .collect::<Vec<_>>();
     output::print_search(&results, mode, writer)?;
     Ok(())
 }
@@ -567,12 +599,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Reindex => run_reindex_command(&config, embedder).await,
         Command::Search {
             query,
+            namespaces,
             limit,
             paths_only,
             ..
         } => {
             run_search(
                 &config,
+                &namespaces,
                 embedder.as_ref(),
                 query,
                 limit,
@@ -586,7 +620,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let profile = embedder
                 .as_ref()
                 .map(|value| index_profile(value, &preparer));
-            let adapters = open_search_adapters(&config.docs_dirs, profile.as_ref()).await?;
+            let adapters = open_search_adapters(config.docs_dirs.iter(), profile.as_ref()).await?;
             server::run(
                 host,
                 port,
@@ -761,6 +795,7 @@ mod tests {
     fn search_command(w_semantic: Option<f64>) -> Command {
         Command::Search {
             query: None,
+            namespaces: Vec::new(),
             limit: 10,
             paths_only: false,
             w_semantic,

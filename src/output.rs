@@ -21,6 +21,21 @@ struct NamespaceOutput {
     paths: Vec<String>,
 }
 
+pub struct SearchResult {
+    pub fused: FusedResult,
+    pub namespaces: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct JsonSearchResult<'a> {
+    path: &'a str,
+    score: f64,
+    snippet: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locator: Option<&'a str>,
+    namespaces: &'a [String],
+}
+
 pub fn print_namespaces(
     namespaces: &[Namespace],
     mode: OutputMode,
@@ -75,22 +90,33 @@ fn namespace_output(namespaces: &[Namespace]) -> Vec<NamespaceOutput> {
 ///
 /// Returns an error if serialization fails or if writing to `writer` fails.
 pub fn print_search(
-    results: &[FusedResult],
+    results: &[SearchResult],
     mode: OutputMode,
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     match mode {
         OutputMode::Json => {
-            let json_str = serde_json::to_string(results)?;
-            writeln!(writer, "{json_str}")?;
+            let json_results: Vec<JsonSearchResult<'_>> = results
+                .iter()
+                .map(|result| JsonSearchResult {
+                    path: &result.fused.path,
+                    score: result.fused.score,
+                    snippet: &result.fused.snippet,
+                    locator: result.fused.locator.as_deref(),
+                    namespaces: &result.namespaces,
+                })
+                .collect();
+            let json = serde_json::to_string(&json_results)?;
+            writeln!(writer, "{json}")?;
         }
         OutputMode::Human { paths_only } => {
             if paths_only {
-                for result in results {
-                    writeln!(writer, "{}", result.path)?;
+                for search_result in results {
+                    writeln!(writer, "{}", search_result.fused.path)?;
                 }
             } else {
-                for result in results {
+                for search_result in results {
+                    let result = &search_result.fused;
                     if let Some(locator) = &result.locator {
                         writeln!(
                             writer,
@@ -231,12 +257,15 @@ mod tests {
         }
     }
 
-    fn make_fused(path: &str, score: f64, snippet: &str) -> FusedResult {
-        FusedResult {
-            path: path.to_owned(),
-            score,
-            snippet: snippet.to_owned(),
-            locator: None,
+    fn make_fused(path: &str, score: f64, snippet: &str) -> SearchResult {
+        SearchResult {
+            fused: FusedResult {
+                path: path.to_owned(),
+                score,
+                snippet: snippet.to_owned(),
+                locator: None,
+            },
+            namespaces: Vec::new(),
         }
     }
 
@@ -245,12 +274,15 @@ mod tests {
         score: f64,
         snippet: &str,
         locator: &str,
-    ) -> FusedResult {
-        FusedResult {
-            path: path.to_owned(),
-            score,
-            snippet: snippet.to_owned(),
-            locator: Some(locator.to_owned()),
+    ) -> SearchResult {
+        SearchResult {
+            fused: FusedResult {
+                path: path.to_owned(),
+                score,
+                snippet: snippet.to_owned(),
+                locator: Some(locator.to_owned()),
+            },
+            namespaces: Vec::new(),
         }
     }
 
@@ -328,6 +360,18 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(out.trim()).expect("output should parse as JSON");
         assert!(value.is_array(), "output should be a JSON array");
+    }
+
+    #[test]
+    fn search_json_includes_all_namespace_memberships() {
+        let mut result = make_fused("a.md", 0.9, "snippet");
+        result.namespaces = vec!["alpha".to_owned(), "shared".to_owned()];
+        let out = write_to_string(|writer| print_search(&[result], OutputMode::Json, writer));
+        let value: serde_json::Value =
+            serde_json::from_str(out.trim()).expect("output should parse as JSON");
+        let namespaces = value[0]["namespaces"].as_array().expect("namespaces array");
+        assert_eq!(namespaces[0], "alpha");
+        assert_eq!(namespaces[1], "shared");
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub enum Command {
     /// Search notes using fused ranking (semantic + FTS + filename)
     Search {
         query: Option<String>,
+        #[arg(long = "namespace")]
+        namespaces: Vec<String>,
         #[arg(short, long, default_value = "10")]
         limit: usize,
         #[arg(short, long)]
@@ -89,6 +91,38 @@ mod tests {
         let cli = Cli::try_parse_from(["needle", "--json", "namespaces"]).expect("parse");
         assert!(cli.json);
         assert!(matches!(cli.command, Command::Namespaces));
+    }
+
+    #[test]
+    fn search_accepts_repeated_namespace_options() {
+        let cli = Cli::try_parse_from([
+            "needle",
+            "search",
+            "query",
+            "--namespace",
+            "alpha",
+            "--namespace",
+            "shared",
+        ])
+        .expect("parse");
+        let namespaces = match cli.command {
+            Command::Search { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(
+            namespaces,
+            Some(vec!["alpha".to_owned(), "shared".to_owned()])
+        );
+    }
+
+    #[test]
+    fn search_without_namespace_options_is_unscoped() {
+        let cli = Cli::try_parse_from(["needle", "search", "query"]).expect("parse");
+        let namespaces = match cli.command {
+            Command::Search { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(namespaces, Some(Vec::new()));
     }
 
     #[test]
