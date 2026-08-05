@@ -25,3 +25,4 @@ target
 
 /target
 .fastembed_cache
+.direnv/
