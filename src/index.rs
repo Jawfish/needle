@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use anyhow::Context;
 use libsql::Connection;
@@ -17,14 +20,15 @@ pub struct IndexStats {
     pub updated: usize,
     pub deleted: usize,
     pub unchanged: usize,
+    pub failed: usize,
 }
 
 impl std::fmt::Display for IndexStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "added={}, updated={}, deleted={}, unchanged={}",
-            self.added, self.updated, self.deleted, self.unchanged
+            "added={}, updated={}, deleted={}, unchanged={}, failed={}",
+            self.added, self.updated, self.deleted, self.unchanged, self.failed
         )
     }
 }
@@ -54,6 +58,7 @@ pub struct DirectoryIndexPlan {
     pub to_update: Vec<FileToIndex>,
     pub to_delete: Vec<String>,
     pub unchanged_count: usize,
+    pub failed_count: usize,
 }
 
 struct SourceFile {
@@ -75,7 +80,9 @@ const FILE_BATCH_SIZE: usize = 50;
 
 pub fn plan_directory_index(
     existing_hashes: &HashMap<String, String>,
+    failed_hashes: &HashMap<String, String>,
     disk_files: &HashMap<String, DiskFile>,
+    failed_paths: &HashSet<String>,
 ) -> DirectoryIndexPlan {
     let mut to_add = Vec::new();
     let mut to_update = Vec::new();
@@ -101,8 +108,11 @@ pub fn plan_directory_index(
 
     let to_delete = existing_hashes
         .keys()
-        .filter(|p| !disk_files.contains_key(p.as_str()))
+        .chain(failed_hashes.keys())
+        .filter(|p| !disk_files.contains_key(p.as_str()) && !failed_paths.contains(p.as_str()))
         .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect();
 
     DirectoryIndexPlan {
@@ -110,6 +120,7 @@ pub fn plan_directory_index(
         to_update,
         to_delete,
         unchanged_count,
+        failed_count: failed_paths.len(),
     }
 }
 
@@ -193,6 +204,7 @@ pub async fn execute_directory_plan(
         updated: updated_count,
         deleted: plan.to_delete.len(),
         unchanged: plan.unchanged_count,
+        failed: plan.failed_count,
     })
 }
 
@@ -261,10 +273,12 @@ pub async fn index_directory_with_preparer(
     preparer: &dyn DocumentPreparer,
 ) -> anyhow::Result<IndexStats> {
     let existing_hashes = db::all_note_hashes(conn).await?;
-    let source_files = read_disk_sources(notes_dir, preparer).await?;
+    let failed_hashes = db::all_failed_file_hashes(conn).await?;
+    let (source_files, mut failed_paths) = read_disk_sources(notes_dir, preparer).await?;
     let mut disk_files = HashMap::with_capacity(source_files.len());
     for (rel_path, source_file) in source_files {
         if existing_hashes.get(&rel_path) == Some(&source_file.content_hash) {
+            db::clear_failed_file(conn, &rel_path).await?;
             disk_files.insert(
                 rel_path,
                 DiskFile {
@@ -274,15 +288,38 @@ pub async fn index_directory_with_preparer(
             );
             continue;
         }
-        disk_files.insert(
-            rel_path,
-            DiskFile {
-                content_hash: source_file.content_hash,
-                chunks: preparer.prepare(&source_file.abs_path, &source_file.source)?,
-            },
-        );
+        if failed_hashes.get(&rel_path) == Some(&source_file.content_hash) {
+            tracing::warn!(
+                path = rel_path,
+                "skipping file with unchanged preparation failure"
+            );
+            failed_paths.insert(rel_path);
+            continue;
+        }
+        match preparer.prepare(&source_file.abs_path, &source_file.source) {
+            Ok(chunks) => {
+                disk_files.insert(
+                    rel_path,
+                    DiskFile {
+                        content_hash: source_file.content_hash,
+                        chunks,
+                    },
+                );
+            }
+            Err(error) => {
+                db::record_failed_file(
+                    conn,
+                    &rel_path,
+                    &source_file.content_hash,
+                    &error.to_string(),
+                )
+                .await?;
+                tracing::warn!(path = rel_path, error = %error, "failed to prepare file");
+                failed_paths.insert(rel_path);
+            }
+        }
     }
-    let plan = plan_directory_index(&existing_hashes, &disk_files);
+    let plan = plan_directory_index(&existing_hashes, &failed_hashes, &disk_files, &failed_paths);
     execute_directory_plan(conn, fts, embedder, plan).await
 }
 
@@ -302,39 +339,64 @@ pub async fn index_single_file_with_preparer(
         |_| abs_path.to_string_lossy().to_string(),
         |p| p.to_string_lossy().to_string(),
     );
-    let source = tokio::fs::read(abs_path).await?;
-    let stored_hash = db::note_hash(conn, &rel_path).await?;
+    let source = match tokio::fs::read(abs_path).await {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(path = %abs_path.display(), error = %error, "failed to read file");
+            return Ok(FtsStatus::Current);
+        }
+    };
     let content_hash = hash::content_hash_bytes(&source);
+    let stored_hash = db::note_hash(conn, &rel_path).await?;
     if stored_hash.as_deref() == Some(content_hash.as_str()) {
+        db::clear_failed_file(conn, &rel_path).await?;
         return execute_single_file_plan(conn, fts, embedder, SingleFilePlan::Unchanged).await;
     }
-    let plan = plan_single_file(
-        rel_path,
-        stored_hash.as_deref(),
-        content_hash,
-        preparer.prepare(abs_path, &source)?,
-    );
+    if db::failed_file_hash(conn, &rel_path).await?.as_deref() == Some(content_hash.as_str()) {
+        tracing::warn!(
+            path = rel_path,
+            "skipping file with unchanged preparation failure"
+        );
+        return Ok(FtsStatus::Current);
+    }
+    let chunks = match preparer.prepare(abs_path, &source) {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            db::record_failed_file(conn, &rel_path, &content_hash, &error.to_string()).await?;
+            tracing::warn!(path = rel_path, error = %error, "failed to prepare file");
+            return Ok(FtsStatus::Current);
+        }
+    };
+    let plan = plan_single_file(rel_path, stored_hash.as_deref(), content_hash, chunks);
     execute_single_file_plan(conn, fts, embedder, plan).await
 }
 
 async fn read_disk_sources(
     dir: &Path,
     preparer: &dyn DocumentPreparer,
-) -> anyhow::Result<HashMap<String, SourceFile>> {
+) -> anyhow::Result<(HashMap<String, SourceFile>, HashSet<String>)> {
     let files = collect_supported_files(dir, preparer)?;
-    let mut out = HashMap::with_capacity(files.len());
+    let mut sources = HashMap::with_capacity(files.len());
+    let mut failed_paths = HashSet::new();
     for (rel_path, abs_path) in files {
-        let source = tokio::fs::read(&abs_path).await?;
-        out.insert(
-            rel_path,
-            SourceFile {
-                abs_path,
-                content_hash: hash::content_hash_bytes(&source),
-                source,
-            },
-        );
+        match tokio::fs::read(&abs_path).await {
+            Ok(source) => {
+                sources.insert(
+                    rel_path,
+                    SourceFile {
+                        abs_path,
+                        content_hash: hash::content_hash_bytes(&source),
+                        source,
+                    },
+                );
+            }
+            Err(error) => {
+                tracing::warn!(path = rel_path, error = %error, "failed to read file");
+                failed_paths.insert(rel_path);
+            }
+        }
     }
-    Ok(out)
+    Ok((sources, failed_paths))
 }
 
 async fn embed_files(
@@ -518,6 +580,31 @@ mod tests {
         }
     }
 
+    struct FailingContentPreparer;
+
+    impl DocumentPreparer for FailingContentPreparer {
+        fn supports_path(&self, source_path: &Path) -> bool {
+            source_path
+                .extension()
+                .is_some_and(|extension| extension == "md")
+        }
+
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
+            anyhow::ensure!(source != b"corrupt", "test preparation failure");
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
+        }
+
+        fn profile(&self) -> &'static str {
+            "failing-content-v1"
+        }
+    }
+
     struct NotePreparer;
 
     impl DocumentPreparer for NotePreparer {
@@ -545,7 +632,7 @@ mod tests {
     #[test]
     fn plan_marks_all_disk_files_as_new_when_db_is_empty() {
         let disk = disk_files_from(&[("a.md", "h1"), ("b.md", "h2")]);
-        let plan = plan_directory_index(&HashMap::new(), &disk);
+        let plan = plan_directory_index(&HashMap::new(), &HashMap::new(), &disk, &HashSet::new());
 
         assert_eq!(plan.to_add.len(), 2);
         assert!(plan.to_add.iter().all(|f| f.is_new));
@@ -559,7 +646,7 @@ mod tests {
         let disk = disk_files_from(&[("a.md", "hash1")]);
         let existing = HashMap::from([("a.md".to_string(), "hash1".to_string())]);
 
-        let plan = plan_directory_index(&existing, &disk);
+        let plan = plan_directory_index(&existing, &HashMap::new(), &disk, &HashSet::new());
 
         assert!(plan.to_add.is_empty());
         assert!(plan.to_update.is_empty());
@@ -572,7 +659,7 @@ mod tests {
         let disk = disk_files_from(&[("a.md", "newhash")]);
         let existing = HashMap::from([("a.md".to_string(), "oldhash".to_string())]);
 
-        let plan = plan_directory_index(&existing, &disk);
+        let plan = plan_directory_index(&existing, &HashMap::new(), &disk, &HashSet::new());
 
         assert!(plan.to_add.is_empty());
         assert_eq!(plan.to_update.len(), 1);
@@ -589,7 +676,7 @@ mod tests {
             ("gone.md".to_string(), "h2".to_string()),
         ]);
 
-        let plan = plan_directory_index(&existing, &disk);
+        let plan = plan_directory_index(&existing, &HashMap::new(), &disk, &HashSet::new());
 
         assert_eq!(plan.to_delete, vec!["gone.md".to_string()]);
         assert_eq!(plan.unchanged_count, 1);
@@ -597,7 +684,12 @@ mod tests {
 
     #[test]
     fn plan_is_empty_when_disk_and_db_are_both_empty() {
-        let plan = plan_directory_index(&HashMap::new(), &HashMap::new());
+        let plan = plan_directory_index(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         assert!(plan.to_add.is_empty());
         assert!(plan.to_update.is_empty());
@@ -888,6 +980,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn directory_index_continues_after_a_file_fails_preparation() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "healthy.md", "healthy content");
+        create_file(notes_dir.path(), "corrupt.md", "corrupt");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let stats = index_directory_with_preparer(
+            &conn,
+            &fts,
+            &Embedder::create_null(1024),
+            notes_dir.path(),
+            &FailingContentPreparer,
+        )
+        .await
+        .expect("index");
+
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.failed, 1);
+        assert!(
+            db::note_hash(&conn, "healthy.md")
+                .await
+                .expect("hash")
+                .is_some()
+        );
+        assert!(
+            db::note_hash(&conn, "corrupt.md")
+                .await
+                .expect("hash")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_index_skips_unchanged_preparation_failures_and_clears_after_success() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "broken.md", "broken");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failing = CountingPreparer {
+            calls: Arc::clone(&calls),
+            fails: true,
+        };
+        let embedder = Embedder::create_null(1024);
+
+        let first =
+            index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &failing)
+                .await
+                .expect("first index");
+        let second =
+            index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &failing)
+                .await
+                .expect("second index");
+        assert_eq!(first.failed, 1);
+        assert_eq!(second.failed, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        create_file(notes_dir.path(), "broken.md", "fixed");
+        let working = CountingPreparer {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fails: false,
+        };
+        let stats =
+            index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &working)
+                .await
+                .expect("retry index");
+        assert_eq!(stats.added, 1);
+        assert!(
+            db::failed_file_hash(&conn, "broken.md")
+                .await
+                .expect("failure hash")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_index_removes_failed_record_for_deleted_unindexed_file() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "broken.md", "broken");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let failing = CountingPreparer {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fails: true,
+        };
+        let embedder = Embedder::create_null(1024);
+
+        index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &failing)
+            .await
+            .expect("failed index");
+        std::fs::remove_file(notes_dir.path().join("broken.md")).expect("remove");
+        let stats =
+            index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &failing)
+                .await
+                .expect("delete index");
+
+        assert_eq!(stats.deleted, 1);
+        assert!(
+            db::failed_file_hash(&conn, "broken.md")
+                .await
+                .expect("failure hash")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn index_directory_indexes_new_files() {
         let notes_dir = tempfile::tempdir().expect("tempdir");
         create_file(notes_dir.path(), "alpha.md", "# Alpha");
@@ -1037,7 +1248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_preparation_or_embedding_preserves_existing_note() {
+    async fn failed_preparation_and_embedding_preserve_existing_note() {
         let notes_dir = tempfile::tempdir().expect("tempdir");
         create_file(notes_dir.path(), "note.md", "before");
         create_file(notes_dir.path(), "gone.md", "gone");
@@ -1069,33 +1280,38 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             fails: true,
         };
-        assert!(
-            index_directory_with_preparer(
-                &conn,
-                &fts,
-                &Embedder::create_null(1024),
-                notes_dir.path(),
-                &failed_preparer,
-            )
-            .await
-            .is_err()
-        );
+        let stats = index_directory_with_preparer(
+            &conn,
+            &fts,
+            &Embedder::create_null(1024),
+            notes_dir.path(),
+            &failed_preparer,
+        )
+        .await
+        .expect("tolerant index");
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.deleted, 1);
         assert_eq!(
             db::note_hash(&conn, "note.md").await.expect("hash"),
             old_hash
         );
         assert_old_note_content(&conn).await;
+        assert_eq!(
+            fts.search("before", 10).await.expect("search")[0].path,
+            "note.md"
+        );
         assert!(
             db::note_hash(&conn, "gone.md")
                 .await
                 .expect("hash")
-                .is_some()
+                .is_none()
         );
 
         let working_preparer = CountingPreparer {
             calls: Arc::new(AtomicUsize::new(0)),
             fails: false,
         };
+        create_file(notes_dir.path(), "note.md", "after retry");
         let (failing_embedder, _) = Embedder::create_counting(1024, true);
         assert!(
             index_directory_with_preparer(
@@ -1117,7 +1333,7 @@ mod tests {
             db::note_hash(&conn, "gone.md")
                 .await
                 .expect("hash")
-                .is_some()
+                .is_none()
         );
     }
 
@@ -1259,10 +1475,11 @@ mod tests {
             updated: 3,
             deleted: 1,
             unchanged: 10,
+            failed: 2,
         };
         assert_eq!(
             stats.to_string(),
-            "added=5, updated=3, deleted=1, unchanged=10"
+            "added=5, updated=3, deleted=1, unchanged=10, failed=2"
         );
     }
 }

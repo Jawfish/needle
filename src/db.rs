@@ -82,6 +82,12 @@ async fn init_schema(
             path TEXT PRIMARY KEY,
             content_hash TEXT NOT NULL,
             updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS failed_files (
+            path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            error TEXT NOT NULL
         );",
     )
     .await?;
@@ -312,6 +318,50 @@ pub async fn note_hash(conn: &Connection, path: &str) -> anyhow::Result<Option<S
     }
 }
 
+pub async fn all_failed_file_hashes(conn: &Connection) -> anyhow::Result<HashMap<String, String>> {
+    let mut rows = conn
+        .query("SELECT path, content_hash FROM failed_files", ())
+        .await?;
+    let mut hashes = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        hashes.insert(row.get(0)?, row.get(1)?);
+    }
+    Ok(hashes)
+}
+
+pub async fn failed_file_hash(conn: &Connection, path: &str) -> anyhow::Result<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT content_hash FROM failed_files WHERE path = ?1",
+            [path],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+pub async fn record_failed_file(
+    conn: &Connection,
+    path: &str,
+    content_hash: &str,
+    error: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO failed_files (path, content_hash, error) VALUES (?1, ?2, ?3)",
+        [path, content_hash, error],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_failed_file(conn: &Connection, path: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM failed_files WHERE path = ?1", [path])
+        .await?;
+    Ok(())
+}
+
 pub async fn upsert_note<T>(
     conn: &Connection,
     path: &str,
@@ -331,6 +381,8 @@ where
         [path, hash],
     )
     .await?;
+    tx.execute("DELETE FROM failed_files WHERE path = ?1", [path])
+        .await?;
 
     for (i, (chunk, embedding)) in chunks.iter().enumerate() {
         let chunk: PreparedChunk = chunk.clone().into();
@@ -364,6 +416,8 @@ pub async fn apply_directory_changes(
             .await?;
         tx.execute("DELETE FROM notes WHERE path = ?1", [path.as_str()])
             .await?;
+        tx.execute("DELETE FROM failed_files WHERE path = ?1", [path.as_str()])
+            .await?;
     }
 
     for (path, hash, chunks) in upserts {
@@ -374,6 +428,8 @@ pub async fn apply_directory_changes(
             [path.as_str(), hash.as_str()],
         )
         .await?;
+        tx.execute("DELETE FROM failed_files WHERE path = ?1", [path.as_str()])
+            .await?;
 
         for (i, (chunk, embedding)) in chunks.iter().enumerate() {
             let embedding_json = serde_json::to_string(embedding)?;
@@ -1047,6 +1103,7 @@ mod tests {
 
         assert!(tables.contains(&"notes".to_owned()));
         assert!(tables.contains(&"chunks".to_owned()));
+        assert!(tables.contains(&"failed_files".to_owned()));
     }
 
     #[tokio::test]
@@ -1074,6 +1131,32 @@ mod tests {
             .expect("upsert failed");
         let hash = note_hash(&conn, "note.md").await.expect("query failed");
         assert_eq!(hash, Some("abc123".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn failed_file_helpers_record_and_clear_failures() {
+        let (_dir, _db, conn) = test_db().await;
+        record_failed_file(&conn, "broken.md", "hash", "bad document")
+            .await
+            .expect("record");
+        assert_eq!(
+            failed_file_hash(&conn, "broken.md").await.expect("hash"),
+            Some("hash".to_owned())
+        );
+        assert_eq!(
+            all_failed_file_hashes(&conn)
+                .await
+                .expect("hashes")
+                .get("broken.md"),
+            Some(&"hash".to_owned())
+        );
+        clear_failed_file(&conn, "broken.md").await.expect("clear");
+        assert!(
+            failed_file_hash(&conn, "broken.md")
+                .await
+                .expect("hash")
+                .is_none()
+        );
     }
 
     #[tokio::test]
