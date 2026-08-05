@@ -504,6 +504,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_query_renders_home_state() {
+        let body = response(app(vec![]), "/?q=%20%20").await.1;
+        assert!(body.contains("Search your indexed documents."));
+    }
+
+    #[tokio::test]
+    async fn results_show_path_snippet_and_locator() {
+        let body = response(
+            app(vec![store("/notes", vec![candidate("note.md")], &[])]),
+            "/?q=note",
+        )
+        .await
+        .1;
+        assert!(
+            body.contains("note.md")
+                && body.contains("snippet note.md")
+                && body.contains("locator note.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn results_are_limited_to_twenty() {
+        let results = (0..25)
+            .map(|index| candidate(&format!("note-{index}.md")))
+            .collect();
+        let body = response(app(vec![store("/notes", results, &[])]), "/?q=note")
+            .await
+            .1;
+        assert_eq!(body.matches("class=\"path\"").count(), RESULT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn no_match_and_failure_states_are_distinct() {
+        let no_match = response(app(vec![store("/notes", vec![], &[])]), "/?q=none")
+            .await
+            .1;
+        let failure = response(
+            app(vec![(
+                PathBuf::from("/notes"),
+                vec![],
+                HashMap::new(),
+                true,
+            )]),
+            "/?q=fail",
+        )
+        .await
+        .1;
+        assert!(no_match.contains("No indexed documents matched"));
+        assert!(failure.contains("Search is temporarily unavailable"));
+    }
+
+    #[tokio::test]
+    async fn document_renders_ordered_chunks_and_locators() {
+        let chunks = vec![
+            PreparedChunk {
+                content: "first chunk".to_owned(),
+                locator: Some("First heading".to_owned()),
+            },
+            PreparedChunk {
+                content: "second chunk".to_owned(),
+                locator: None,
+            },
+        ];
+        let body = response(
+            app(vec![store("/notes", vec![], &[("note.md", chunks)])]),
+            "/document?store=0&path=note.md&q=second",
+        )
+        .await
+        .1;
+        let first = body.find("first chunk").expect("first chunk");
+        let second = body
+            .find("<mark>second</mark> chunk")
+            .expect("highlighted second chunk");
+        assert!(first < second);
+        assert!(body.contains("First heading") && body.contains("id=\"match\""));
+    }
+
+    #[tokio::test]
     async fn results_link_to_encoded_store_relative_documents() {
         let body = response(
             app(vec![store(
@@ -602,6 +680,7 @@ mod tests {
             "/document?store=x&path=note.md",
             "/document?store=0&path=../note.md",
             "/document?store=0&path=%2Fetc%2Fpasswd",
+            "/document?store=0&path=note%00md",
             "/document?store=3&path=note.md",
             "/document?store=0&path=stale.md",
         ] {
