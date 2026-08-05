@@ -1,6 +1,6 @@
 # Needle
 
-Semantic search for directories of Markdown, plain-text, PDF, EPUB, HTML, and Word (`.docx`) documents. Combines vector similarity, full-text search, and filename matching into a single ranked result set. Reads queries from stdin and emits tab-separated results, so it composes naturally in pipelines.
+Semantic search for directories of Markdown, plain-text, PDF, EPUB, HTML, and Word (`.docx`) documents. Needle fuses vector similarity, full-text search, and filename matching into one ranked result list. It reads queries from stdin and writes tab-separated lines, so it fits into shell pipelines.
 
 ## Install
 
@@ -8,7 +8,7 @@ Semantic search for directories of Markdown, plain-text, PDF, EPUB, HTML, and Wo
 cargo install --path .
 ```
 
-Add a documentation namespace to `~/.config/needle/config.toml`:
+Tell needle where your documents live by adding a namespace to `~/.config/needle/config.toml`:
 
 ```toml
 [[namespaces]]
@@ -17,36 +17,36 @@ description = "Personal notes"
 paths = ["/path/to/notes"]
 ```
 
-By default, needle uses [fastembed](https://github.com/Anush008/fastembed-rs) for local embeddings (all-MiniLM-L6-v2). No API key needed. The model downloads automatically on first run.
+Embeddings run locally by default using [fastembed](https://github.com/Anush008/fastembed-rs) (all-MiniLM-L6-v2). It needs no API key. The model downloads on first run.
 
-The default build enables the `local` and `documents` Cargo features. `documents` uses Xberg to prepare Markdown (`.md`, `.markdown`), plain text (`.txt`), PDF (`.pdf`), EPUB (`.epub`), HTML (`.html`, `.htm`), and Word (`.docx`) documents. For a smaller binary without the local model and document preparation, build with `--no-default-features` and use an API provider instead. This build indexes Markdown only.
+The default build enables the `local` and `documents` Cargo features. `documents` uses Xberg to prepare Markdown (`.md`, `.markdown`), plain text (`.txt`), PDF (`.pdf`), EPUB (`.epub`), HTML (`.html`, `.htm`), and Word (`.docx`) files. For a smaller binary without the local model and document preparation, build with `--no-default-features` and use an API provider instead. That build indexes Markdown only.
 
 ## Usage
 
-Index your notes, then search:
+Index your documents, then search:
 
 ```bash
 needle reindex
 needle search "error handling patterns"
 ```
 
-Search output is tab-separated (`score \t path \t snippet`), so it works well in pipelines:
+Each result is one line: `score \t path \t snippet`. That makes results easy to pipe:
 
 ```bash
 needle search "authentication" -p | xargs bat
 echo "query from clipboard" | needle search
 ```
 
-Search and similarity include every configured directory by default. Repeat `--namespace` to target the union of selected groups:
+Search and similarity cover every configured directory by default. Repeat `--namespace` to target the union of selected groups:
 
 ```bash
 needle search "authentication" --namespace notes --namespace work
 needle similar --namespace notes --namespace work
 ```
 
-### Discover documentation namespaces
+### List namespaces
 
-List the configured documentation groups before searching:
+See the configured documentation groups before searching:
 
 ```bash
 needle namespaces
@@ -55,7 +55,7 @@ needle --json namespaces
 
 ### Browse indexed documents
 
-Start the browser interface and select any combination of configured namespaces. Browser search links preserve the selected namespaces.
+Start the browser interface (default `127.0.0.1:8080`, adjustable with `--host` and `--port`). You can select any combination of configured namespaces, and search links preserve the selection:
 
 ```bash
 needle serve
@@ -63,7 +63,7 @@ needle serve
 
 ### Find related documents
 
-Given a note, find others like it using the vector index:
+Given a document, find others like it using the vector index:
 
 ```bash
 needle related "design/auth-flow.md"
@@ -72,7 +72,7 @@ needle related "design/auth-flow.md" -p | head -5
 
 ### Find duplicates and clusters
 
-Compare all documents pairwise to surface near-duplicates:
+Compare all documents pairwise to surface near-duplicates. The similarity threshold defaults to 0.85:
 
 ```bash
 needle similar
@@ -82,29 +82,31 @@ needle similar -p | sort -u | wc -l
 
 ### Watch for changes
 
-Keep the index up to date as you edit:
+Keep the index current as you edit:
 
 ```bash
 needle watch
 ```
 
-All configured directories are watched simultaneously. Changes in any directory trigger re-indexing of the affected file only.
+Needle watches every configured directory at once. A change re-indexes only the affected file.
 
-## Flags
+## Output and flags
 
-`-p` / `--paths-only` on `search`, `similar`, and `related` emits bare paths, one per line.
+- `-p` / `--paths-only` on `search`, `similar`, and `related` prints bare paths, one per line.
+- `--json` on any command prints a JSON array instead of tab-separated lines.
+- `-l` / `--limit` controls result count: default 10 for `search` and `related`, 50 for `similar`.
 
-`-l` / `--limit` controls result count (default 10 for search/related, 50 for similar).
-
-Search ranking weights are tunable per-query or through config:
+Search blends three rankings (semantic, full-text, and filename) with weights you can tune per query:
 
 ```bash
 needle search "topic" --w-semantic 2.0 --w-fts 0.5 --w-filename 0
 ```
 
+The defaults are 1.5 semantic, 1.0 full-text, 0.7 filename.
+
 ## Config
 
-Optional config file at `~/.config/needle/config.toml`:
+The config file lives at `~/.config/needle/config.toml`. Needle requires at least one namespace. Everything else is optional:
 
 ```toml
 provider = "openai"
@@ -127,6 +129,7 @@ Environment variables override the config file. CLI flags override everything.
 
 | Setting                  | Env var                 | Config key       |
 | ------------------------ | ----------------------- | ---------------- |
+| Documentation namespaces | No environment variable | `[[namespaces]]` |
 | Provider                 | `NEEDLE_PROVIDER`       | `provider`       |
 | Model                    | `NEEDLE_MODEL`          | `model`          |
 | API base URL             | `NEEDLE_API_BASE`       | `api_base`       |
@@ -134,25 +137,19 @@ Environment variables override the config file. CLI flags override everything.
 | Voyage API key           | `VOYAGE_API_KEY`        | `voyage_api_key` |
 | OpenAI API key           | `OPENAI_API_KEY`        | `openai_api_key` |
 | Custom endpoint key      | `NEEDLE_API_KEY`        | `needle_api_key` |
-| Documentation namespaces | No environment variable | `[[namespaces]]` |
+| Semantic weight          | `NEEDLE_W_SEMANTIC`     | `w_semantic`     |
+| Full-text weight         | `NEEDLE_W_FTS`          | `w_fts`          |
+| Filename weight          | `NEEDLE_W_FILENAME`     | `w_filename`     |
 
-Each namespace has a unique, case-sensitive `name`, optional `description`, and one or more `paths`. A directory may belong to several namespaces, but Needle creates and searches one index for its canonical path. Distinct paths must not overlap: for example, configuring both `/docs` and `/docs/project` is invalid.
+Each namespace has a unique, case-sensitive `name`, an optional `description`, and one or more `paths`. A directory may belong to more than one namespace, but Needle creates and searches one index per canonical path. Distinct paths must not overlap: configuring both `/docs` and `/docs/project` is invalid.
 
-### Migrating to namespaces
+Index data lives under `~/.local/share/needle/` (or `$XDG_DATA_HOME/needle/`), one store per directory.
 
-Replace the removed `notes_dirs` setting and `--docs-dir` flag with a namespace:
+### Embedding providers
 
-```toml
-[[namespaces]]
-name = "notes"
-paths = ["/path"]
-```
+Needle supports three embedding backends. It picks one from the API keys it finds, or you can set `NEEDLE_PROVIDER` to `local`, `openai`, or `voyage` explicitly.
 
-### Embedding Providers
-
-Needle supports three embedding backends. It infers which to use from available API keys, or you can set `NEEDLE_PROVIDER` explicitly.
-
-**Local (default):** No setup needed. Uses fastembed with ONNX models in-process.
+**Local (default):** No setup. Runs fastembed with ONNX models in-process.
 
 **OpenAI-compatible:** Works with OpenAI, Ollama, vLLM, text-embeddings-inference, or any server that speaks the `/v1/embeddings` API.
 
@@ -171,7 +168,7 @@ export NEEDLE_DIM=768
 needle reindex
 ```
 
-For an authenticated OpenAI-compatible endpoint (not `api.openai.com`), use `NEEDLE_API_KEY` instead of `OPENAI_API_KEY`. `OPENAI_API_KEY` is scoped to the default OpenAI base URL and is never forwarded to a custom `NEEDLE_API_BASE`:
+For an authenticated OpenAI-compatible endpoint other than `api.openai.com`, use `NEEDLE_API_KEY` instead of `OPENAI_API_KEY`. Needle scopes `OPENAI_API_KEY` to the default OpenAI base URL and never sends it to a custom `NEEDLE_API_BASE`:
 
 ```bash
 export NEEDLE_PROVIDER=openai
