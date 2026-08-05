@@ -1046,15 +1046,17 @@ mod tests {
         assert_eq!(second.failed, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        create_file(notes_dir.path(), "broken.md", "fixed");
+        db::clear_failed_files(&conn).await.expect("clear failures");
+        let working_calls = Arc::new(AtomicUsize::new(0));
         let working = CountingPreparer {
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::clone(&working_calls),
             fails: false,
         };
         let stats =
             index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &working)
                 .await
                 .expect("retry index");
+        assert_eq!(working_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stats.added, 1);
         assert!(
             db::failed_file_hash(&conn, "broken.md")

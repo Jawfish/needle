@@ -72,8 +72,13 @@ pub enum Command {
         #[arg(short, long)]
         paths_only: bool,
     },
+    /// List remembered document preparation failures
+    Failures,
     /// Reindex all supported documents
-    Reindex,
+    Reindex {
+        #[arg(long)]
+        retry_failed: bool,
+    },
 }
 
 #[cfg(test)]
@@ -93,6 +98,30 @@ mod tests {
         let cli = Cli::try_parse_from(["needle", "--json", "namespaces"]).expect("parse");
         assert!(cli.json);
         assert!(matches!(cli.command, Command::Namespaces));
+    }
+
+    #[test]
+    fn failures_command_accepts_json_output() {
+        let cli = Cli::try_parse_from(["needle", "--json", "failures"]).expect("parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Failures));
+    }
+
+    #[test]
+    fn reindex_retry_failed_flag_parses_and_defaults_to_false() {
+        let default = Cli::try_parse_from(["needle", "reindex"]).expect("parse");
+        assert!(matches!(
+            default.command,
+            Command::Reindex {
+                retry_failed: false
+            }
+        ));
+
+        let retry = Cli::try_parse_from(["needle", "reindex", "--retry-failed"]).expect("parse");
+        assert!(matches!(
+            retry.command,
+            Command::Reindex { retry_failed: true }
+        ));
     }
 
     #[test]
