@@ -625,6 +625,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 host,
                 port,
                 &config.docs_dirs,
+                &config.namespaces,
                 adapters,
                 embedder,
                 config.weights,

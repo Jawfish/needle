@@ -49,7 +49,7 @@ impl DirectoryStore {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Namespace {
     pub name: String,
     pub description: Option<String>,
@@ -125,37 +125,15 @@ impl Config {
     }
 
     pub fn select_stores(&self, selected_names: &[String]) -> anyhow::Result<Vec<&DirectoryStore>> {
-        if selected_names.is_empty() {
-            return Ok(self.docs_dirs.iter().collect());
-        }
-
-        let mut available: Vec<&str> = self
-            .namespaces
-            .iter()
-            .map(|namespace| namespace.name.as_str())
-            .collect();
-        available.sort_unstable();
-        for name in selected_names {
-            if !self
-                .namespaces
-                .iter()
-                .any(|namespace| namespace.name == *name)
-            {
-                return Err(NeedleError::UnknownNamespace {
-                    name: name.clone(),
-                    available: available.join(", "),
-                }
-                .into());
-            }
-        }
-
+        let selected_paths = selected_namespace_paths(&self.namespaces, selected_names)?;
         Ok(self
             .docs_dirs
             .iter()
             .filter(|store| {
-                self.namespaces.iter().any(|namespace| {
-                    selected_names.iter().any(|name| name == &namespace.name)
-                        && namespace.paths.contains(&store.notes_dir)
+                selected_paths.as_ref().is_none_or(|paths| {
+                    paths
+                        .iter()
+                        .any(|path| path.as_path() == store.notes_dir.as_path())
                 })
             })
             .collect())
@@ -171,6 +149,38 @@ impl Config {
         names.sort_unstable();
         names
     }
+}
+
+pub fn selected_namespace_paths<'a>(
+    namespaces: &'a [Namespace],
+    selected_names: &[String],
+) -> anyhow::Result<Option<Vec<&'a PathBuf>>> {
+    if selected_names.is_empty() {
+        return Ok(None);
+    }
+
+    let mut available: Vec<&str> = namespaces
+        .iter()
+        .map(|namespace| namespace.name.as_str())
+        .collect();
+    available.sort_unstable();
+    for name in selected_names {
+        if !namespaces.iter().any(|namespace| namespace.name == *name) {
+            return Err(NeedleError::UnknownNamespace {
+                name: name.clone(),
+                available: available.join(", "),
+            }
+            .into());
+        }
+    }
+
+    Ok(Some(
+        namespaces
+            .iter()
+            .filter(|namespace| selected_names.iter().any(|name| name == &namespace.name))
+            .flat_map(|namespace| namespace.paths.iter())
+            .collect(),
+    ))
 }
 
 fn resolve_namespaces(file_config: &FileConfig) -> anyhow::Result<(Vec<Namespace>, Vec<PathBuf>)> {

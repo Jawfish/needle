@@ -53,6 +53,14 @@ needle namespaces
 needle --json namespaces
 ```
 
+### Browse indexed documents
+
+Start the browser interface and select any combination of configured namespaces. Browser search links preserve the selected namespaces.
+
+```bash
+needle serve
+```
+
 ### Find related documents
 
 Given a note, find others like it using the vector index:
