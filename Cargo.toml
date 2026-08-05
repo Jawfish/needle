@@ -6,11 +6,13 @@ license = "MIT"
 publish = false
 
 [features]
-default = ["local"]
+default = ["local", "documents"]
 local = ["dep:fastembed"]
+documents = ["dep:xberg"]
 
 [dependencies]
 fastembed = { version = "5", optional = true }
+xberg = { version = "=1.0.14", optional = true, default-features = false, features = ["chunking", "tokio-runtime", "pdf", "office", "html"] }
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 libsql = "0.9.30"

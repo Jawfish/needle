@@ -33,13 +33,23 @@ pub fn print_search(
                 }
             } else {
                 for result in results {
-                    writeln!(
-                        writer,
-                        "{:.4}\t{}\t{}",
-                        result.score,
-                        result.path,
-                        first_line(&result.snippet)
-                    )?;
+                    if let Some(locator) = &result.locator {
+                        writeln!(
+                            writer,
+                            "{:.4}\t{}\t{locator}: {}",
+                            result.score,
+                            result.path,
+                            first_line(&result.snippet)
+                        )?;
+                    } else {
+                        writeln!(
+                            writer,
+                            "{:.4}\t{}\t{}",
+                            result.score,
+                            result.path,
+                            first_line(&result.snippet)
+                        )?;
+                    }
                 }
             }
         }
@@ -158,6 +168,21 @@ mod tests {
             path: path.to_owned(),
             score,
             snippet: snippet.to_owned(),
+            locator: None,
+        }
+    }
+
+    fn make_fused_with_locator(
+        path: &str,
+        score: f64,
+        snippet: &str,
+        locator: &str,
+    ) -> FusedResult {
+        FusedResult {
+            path: path.to_owned(),
+            score,
+            snippet: snippet.to_owned(),
+            locator: Some(locator.to_owned()),
         }
     }
 
@@ -211,6 +236,51 @@ mod tests {
     }
 
     #[test]
+    fn search_json_includes_locators_and_omits_them_when_absent() {
+        let results = vec![
+            make_fused_with_locator("semantic.md", 0.9, "semantic chunk", "Introduction"),
+            make_fused_with_locator("fts.md", 0.8, "fts chunk", "p. 12"),
+            make_fused_with_locator("fused.md", 0.7, "fused chunk", "Methods"),
+            make_fused("plain.txt", 0.6, "plain chunk"),
+            make_fused_with_locator("/store/note.md", 0.5, "store chunk", "Appendix"),
+        ];
+        let out = write_to_string(|w| print_search(&results, OutputMode::Json, w));
+        let value: serde_json::Value =
+            serde_json::from_str(out.trim()).expect("output should parse as JSON");
+
+        assert_eq!(value[0]["locator"], "Introduction");
+        assert_eq!(value[1]["locator"], "p. 12");
+        assert_eq!(value[2]["locator"], "Methods");
+        assert!(value[3].get("locator").is_none());
+        assert_eq!(value[4]["locator"], "Appendix");
+    }
+
+    #[test]
+    fn search_human_includes_locators_in_snippet_column() {
+        let results = vec![
+            make_fused_with_locator("semantic.md", 0.9, "semantic chunk", "Introduction"),
+            make_fused_with_locator("fts.md", 0.8, "fts chunk", "p. 12"),
+            make_fused_with_locator("fused.md", 0.7, "fused chunk", "Methods"),
+            make_fused("plain.txt", 0.6, "plain chunk"),
+            make_fused_with_locator("/store/note.md", 0.5, "store chunk", "Appendix"),
+        ];
+        let out =
+            write_to_string(|w| print_search(&results, OutputMode::Human { paths_only: false }, w));
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(lines.len(), 5);
+        assert_eq!(
+            lines[0],
+            "0.9000\tsemantic.md\tIntroduction: semantic chunk"
+        );
+        assert_eq!(lines[1], "0.8000\tfts.md\tp. 12: fts chunk");
+        assert_eq!(lines[2], "0.7000\tfused.md\tMethods: fused chunk");
+        assert_eq!(lines[3], "0.6000\tplain.txt\tplain chunk");
+        assert_eq!(lines[4], "0.5000\t/store/note.md\tAppendix: store chunk");
+        assert!(lines.iter().all(|line| line.matches('\t').count() == 2));
+    }
+
+    #[test]
     fn search_json_empty_results_produces_empty_array() {
         let out = write_to_string(|w| print_search(&[], OutputMode::Json, w));
         assert_eq!(out.trim(), "[]");
@@ -218,18 +288,15 @@ mod tests {
 
     #[test]
     fn search_human_paths_only_still_prints_paths() {
-        let results = vec![make_fused("notes/a.md", 0.9, "some snippet")];
+        let results = vec![make_fused_with_locator(
+            "notes/a.md",
+            0.9,
+            "some snippet",
+            "Introduction",
+        )];
         let out =
             write_to_string(|w| print_search(&results, OutputMode::Human { paths_only: true }, w));
-        assert!(out.contains("notes/a.md"), "output should contain the path");
-        assert!(
-            !out.contains("0.9"),
-            "paths-only output should not contain the score"
-        );
-        assert!(
-            !out.contains("some snippet"),
-            "paths-only output should not contain the snippet"
-        );
+        assert_eq!(out, "notes/a.md\n");
     }
 
     #[test]

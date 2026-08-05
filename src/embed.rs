@@ -6,13 +6,18 @@ mod local;
 
 use std::{sync::Arc, time::Duration};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde::Deserialize;
 
-use crate::{error::NeedleError, types::EmbedConfig};
+use crate::{
+    error::NeedleError,
+    types::{EmbedConfig, EmbedderProfile},
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;
-const CHUNK_TARGET_CHARS: usize = 4000; // ~1000 tokens
 
 type SendFuture<'a> = std::pin::Pin<
     Box<
@@ -66,6 +71,12 @@ pub enum Embedder {
     Null {
         dim: usize,
     },
+    #[cfg(test)]
+    Test {
+        dim: usize,
+        calls: Arc<AtomicUsize>,
+        fails: bool,
+    },
 }
 
 impl Embedder {
@@ -102,8 +113,10 @@ impl Embedder {
             }
             #[cfg(feature = "local")]
             ProviderKind::Local => {
-                let (model, dim) = local::init_model(config.model.as_deref())?;
-                Ok(Self::Local(local::LocalProvider::new(model, dim)))
+                let (model, model_name, dim) = local::init_model(config.model.as_deref())?;
+                Ok(Self::Local(local::LocalProvider::new(
+                    model, model_name, dim,
+                )))
             }
             #[cfg(not(feature = "local"))]
             ProviderKind::Local => Err(NeedleError::NoEmbeddingProvider.into()),
@@ -115,6 +128,19 @@ impl Embedder {
         Self::Null { dim }
     }
 
+    #[cfg(test)]
+    pub fn create_counting(dim: usize, fails: bool) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self::Test {
+                dim,
+                calls: Arc::clone(&calls),
+                fails,
+            },
+            calls,
+        )
+    }
+
     pub const fn dim(&self) -> usize {
         match self {
             Self::Voyage(p) => p.dim(),
@@ -122,8 +148,43 @@ impl Embedder {
             #[cfg(feature = "local")]
             Self::Local(p) => p.dim(),
             #[cfg(test)]
-            Self::Null { dim } => *dim,
+            Self::Null { dim } | Self::Test { dim, .. } => *dim,
         }
+    }
+
+    pub fn profile(&self) -> EmbedderProfile {
+        match self {
+            Self::Voyage(p) => EmbedderProfile {
+                provider: "voyage".to_owned(),
+                endpoint: None,
+                model: p.model().to_owned(),
+                dimension: p.dim(),
+            },
+            Self::OpenAi(p) => EmbedderProfile {
+                provider: "openai".to_owned(),
+                endpoint: Some(p.api_base().to_owned()),
+                model: p.model().to_owned(),
+                dimension: p.dim(),
+            },
+            #[cfg(feature = "local")]
+            Self::Local(p) => EmbedderProfile {
+                provider: "local".to_owned(),
+                endpoint: None,
+                model: p.model().to_owned(),
+                dimension: p.dim(),
+            },
+            #[cfg(test)]
+            Self::Null { dim } | Self::Test { dim, .. } => EmbedderProfile {
+                provider: "test-null".to_owned(),
+                endpoint: None,
+                model: "test-null".to_owned(),
+                dimension: *dim,
+            },
+        }
+    }
+
+    pub fn identity(&self) -> EmbedderProfile {
+        self.profile()
     }
 
     pub async fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -134,6 +195,12 @@ impl Embedder {
             Self::Local(p) => p.embed_documents(texts).await,
             #[cfg(test)]
             Self::Null { dim } => Ok(texts.iter().map(|_| vec![0.0; *dim]).collect()),
+            #[cfg(test)]
+            Self::Test { dim, calls, fails } => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::ensure!(!fails, "test embedding failure");
+                Ok(texts.iter().map(|_| vec![0.0; *dim]).collect())
+            }
         }
     }
 
@@ -145,6 +212,12 @@ impl Embedder {
             Self::Local(p) => p.embed_query(query).await,
             #[cfg(test)]
             Self::Null { dim } => Ok(vec![0.0; *dim]),
+            #[cfg(test)]
+            Self::Test { dim, calls, fails } => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::ensure!(!fails, "test embedding failure");
+                Ok(vec![0.0; *dim])
+            }
         }
     }
 }
@@ -227,186 +300,9 @@ async fn send_with_retry(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("embedding request failed")))
 }
 
-// --- Text chunking (provider-independent) ---
-
-pub fn chunk_text(content: &str) -> Vec<String> {
-    let content = strip_frontmatter(content);
-    let paragraphs: Vec<&str> = content.split("\n\n").collect();
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for paragraph in paragraphs {
-        if current.len() + paragraph.len() > CHUNK_TARGET_CHARS && !current.is_empty() {
-            chunks.push(std::mem::take(&mut current));
-        }
-
-        if !current.is_empty() {
-            current.push_str("\n\n");
-        }
-        current.push_str(paragraph);
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-
-    chunks
-}
-
-fn strip_frontmatter(content: &str) -> &str {
-    if !content.starts_with("---") {
-        return content;
-    }
-    let after_open = &content[3..];
-    let Some(close_pos) = after_open.find("\n---") else {
-        return content;
-    };
-
-    let body = after_open[..close_pos].trim();
-    if !is_yaml_frontmatter(body) {
-        return content;
-    }
-
-    content[close_pos + 7..].trim_start()
-}
-
-fn is_yaml_frontmatter(block: &str) -> bool {
-    block.is_empty() || block.lines().any(|line| line.trim().contains(": "))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn small_file_produces_single_chunk() {
-        let chunks = chunk_text("hello world");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "hello world");
-    }
-
-    #[test]
-    fn large_file_splits_on_paragraph_boundaries() {
-        let paragraph = "a".repeat(3000);
-        let content = format!("{paragraph}\n\n{paragraph}\n\n{paragraph}");
-        let chunks = chunk_text(&content);
-        assert!(chunks.len() > 1);
-        for chunk in &chunks {
-            assert!(
-                !chunk.is_empty(),
-                "no chunk should be empty after splitting"
-            );
-        }
-    }
-
-    #[test]
-    fn empty_content_produces_one_chunk() {
-        let chunks = chunk_text("");
-        assert_eq!(chunks.len(), 1);
-    }
-
-    #[test]
-    fn chunk_preserves_all_content() {
-        let content = "paragraph one\n\nparagraph two\n\nparagraph three";
-        let chunks = chunk_text(content);
-        let reassembled = chunks.join("\n\n");
-        assert_eq!(reassembled, content);
-    }
-
-    #[test]
-    fn chunk_never_splits_mid_paragraph() {
-        let short = "short paragraph";
-        let long = "x".repeat(3500);
-        let content = format!("{short}\n\n{long}\n\n{short}");
-        let chunks = chunk_text(&content);
-        for chunk in &chunks {
-            assert!(
-                !chunk.contains("\n\n") || chunk.len() <= CHUNK_TARGET_CHARS,
-                "should only keep multiple paragraphs in one chunk if under target size"
-            );
-        }
-    }
-
-    #[test]
-    fn strip_frontmatter_removes_yaml() {
-        let content = "---\ntitle: Test\ntags: [a, b]\n---\n\n# Actual content";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(stripped, "# Actual content");
-    }
-
-    #[test]
-    fn strip_frontmatter_leaves_content_without_frontmatter() {
-        let content = "# Just a heading\n\nSome text";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(stripped, content);
-    }
-
-    #[test]
-    fn strip_frontmatter_handles_unclosed_frontmatter() {
-        let content = "---\ntitle: Test\nno closing delimiter";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(
-            stripped, content,
-            "unclosed frontmatter should be left as-is"
-        );
-    }
-
-    #[test]
-    fn strip_frontmatter_handles_empty_frontmatter() {
-        let content = "---\n---\n\nBody text";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(stripped, "Body text");
-    }
-
-    #[test]
-    fn chunk_text_strips_frontmatter_before_chunking() {
-        let content = "---\ntitle: Note\n---\n\n# Heading\n\nBody text";
-        let chunks = chunk_text(content);
-        assert_eq!(chunks.len(), 1);
-        assert!(!chunks[0].contains("---"), "frontmatter should be stripped");
-        assert!(chunks[0].contains("Heading"));
-    }
-
-    #[test]
-    fn strip_frontmatter_ignores_dashes_within_yaml_values() {
-        let content = "---\nfoo: a---b\n---\n\nBody";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(stripped, "Body");
-    }
-
-    #[test]
-    fn strip_frontmatter_preserves_leading_horizontal_rule() {
-        let content = "---\n\nSome content after a horizontal rule";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(
-            stripped, content,
-            "horizontal rule should not be treated as frontmatter"
-        );
-    }
-
-    #[test]
-    fn strip_frontmatter_preserves_non_yaml_block() {
-        let content = "---\nthis is not yaml\n---\n\nBody";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(
-            stripped, content,
-            "block without key: value pairs should not be stripped"
-        );
-    }
-
-    #[test]
-    fn strip_frontmatter_with_dashes_in_body() {
-        let content = "No frontmatter\n\n---\n\nSome divider";
-        let stripped = strip_frontmatter(content);
-        assert_eq!(
-            stripped, content,
-            "--- not at start should not be treated as frontmatter"
-        );
-    }
 
     #[test]
     fn infer_voyage_from_api_key() {
@@ -472,6 +368,24 @@ mod tests {
     #[test]
     fn parse_provider_name_rejects_unknown() {
         assert!(parse_provider_name("gemini").is_err());
+    }
+
+    #[test]
+    fn openai_profile_resolves_defaults_and_normalizes_endpoint() {
+        let config = EmbedConfig {
+            provider: Some("openai".to_owned()),
+            model: None,
+            api_base: Some("https://example.test/v1///".to_owned()),
+            dim: Some(768),
+            voyage_api_key: None,
+            openai_api_key: None,
+            needle_api_key: None,
+        };
+        let profile = Embedder::from_config(&config).expect("embedder").profile();
+        assert_eq!(profile.provider, "openai");
+        assert_eq!(profile.endpoint.as_deref(), Some("https://example.test/v1"));
+        assert_eq!(profile.model, "text-embedding-3-small");
+        assert_eq!(profile.dimension, 768);
     }
 
     #[test]

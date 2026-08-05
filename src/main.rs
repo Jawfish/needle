@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod db;
+mod document;
 mod embed;
 mod error;
 mod fts;
@@ -28,9 +29,23 @@ use crate::{
     output::OutputMode,
 };
 
-fn is_dimension_mismatch(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<NeedleError>()
-        .is_some_and(|e| matches!(e, NeedleError::DimensionMismatch { .. }))
+fn requires_reindex(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NeedleError>().is_some_and(|e| {
+        matches!(
+            e,
+            NeedleError::DimensionMismatch { .. } | NeedleError::IndexProfileMismatch { .. }
+        )
+    })
+}
+
+fn index_profile(
+    embedder: &Embedder,
+    preparer: &dyn document::DocumentPreparer,
+) -> types::IndexProfile {
+    types::IndexProfile {
+        embedder: embedder.identity(),
+        preparer: preparer.profile().to_owned(),
+    }
 }
 
 /// Run a full reindex, recovering atomically when there is a dimension mismatch.
@@ -48,17 +63,20 @@ async fn run_reindex(
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
 ) -> anyhow::Result<index::IndexStats> {
-    let dim = embedder.dim();
+    let preparer = document::DefaultPreparer::default();
+    let profile = index_profile(embedder, &preparer);
 
-    match db::connect(db_path, Some(dim)).await {
+    match db::connect_with_profile(db_path, &profile).await {
         Ok((_db, conn)) => {
             let fts = fts::FtsIndex::open_or_create(fts_dir)?;
-            let stats = index::index_directory(&conn, &fts, embedder, notes_dir).await?;
+            let stats =
+                index::index_directory_with_preparer(&conn, &fts, embedder, notes_dir, &preparer)
+                    .await?;
             Ok(stats)
         }
-        Err(ref e) if is_dimension_mismatch(e) => {
-            tracing::warn!("dimension mismatch detected; rebuilding index atomically");
-            reindex_via_temp(db_path, fts_dir, embedder, notes_dir, dim).await
+        Err(ref e) if requires_reindex(e) => {
+            tracing::warn!("index profile mismatch detected; rebuilding index atomically");
+            reindex_via_temp(db_path, fts_dir, embedder, notes_dir, &profile, &preparer).await
         }
         Err(e) => Err(e),
     }
@@ -69,7 +87,8 @@ async fn reindex_via_temp(
     fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
-    dim: usize,
+    profile: &types::IndexProfile,
+    preparer: &dyn document::DocumentPreparer,
 ) -> anyhow::Result<index::IndexStats> {
     let tmp_db_path = db_path.with_extension("reindex-tmp");
     let tmp_fts_dir = sibling_fts_dir(fts_dir, "reindex-tmp");
@@ -82,7 +101,15 @@ async fn reindex_via_temp(
 
     clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
 
-    let result = build_index_in_temp(&tmp_db_path, &tmp_fts_dir, embedder, notes_dir, dim).await;
+    let result = build_index_in_temp(
+        &tmp_db_path,
+        &tmp_fts_dir,
+        embedder,
+        notes_dir,
+        profile,
+        preparer,
+    )
+    .await;
 
     match result {
         Ok(stats) => {
@@ -260,13 +287,14 @@ async fn build_index_in_temp(
     tmp_fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
-    dim: usize,
+    profile: &types::IndexProfile,
+    preparer: &dyn document::DocumentPreparer,
 ) -> anyhow::Result<index::IndexStats> {
     std::fs::create_dir_all(tmp_fts_dir)
         .with_context(|| format!("creating temp FTS dir {}", tmp_fts_dir.display()))?;
-    let (_tmp_db, tmp_conn) = db::connect(tmp_db_path, Some(dim)).await?;
+    let (_tmp_db, tmp_conn) = db::connect_with_profile(tmp_db_path, profile).await?;
     let tmp_fts = fts::FtsIndex::open_or_create(tmp_fts_dir)?;
-    index::index_directory(&tmp_conn, &tmp_fts, embedder, notes_dir).await
+    index::index_directory_with_preparer(&tmp_conn, &tmp_fts, embedder, notes_dir, preparer).await
 }
 
 #[tokio::main]
@@ -307,7 +335,8 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
 
 async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-    let dim = Some(embedder.dim());
+    let preparer = std::sync::Arc::new(document::DefaultPreparer::default());
+    let profile = index_profile(&embedder, preparer.as_ref());
 
     let mut open_stores: Vec<watch::OpenStore> = Vec::with_capacity(config.docs_dirs.len());
     // Locks are held for the watcher's lifetime and released on drop when
@@ -317,11 +346,18 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
 
     for store in &config.docs_dirs {
         let lock = lock::IndexLock::try_acquire(&store.db_path)?;
-        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        let (_db, conn) = db::connect_with_profile(&store.db_path, &profile).await?;
         let fts = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
 
         tracing::info!(dir = %store.notes_dir.display(), "initial indexing");
-        let stats = index::index_directory(&conn, &fts, &embedder, &store.notes_dir).await?;
+        let stats = index::index_directory_with_preparer(
+            &conn,
+            &fts,
+            &embedder,
+            &store.notes_dir,
+            preparer.as_ref(),
+        )
+        .await?;
         tracing::info!(%stats, dir = %store.notes_dir.display(), "initial index complete");
 
         held_locks.push(lock);
@@ -332,7 +368,7 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         });
     }
 
-    watch::run_watcher(open_stores, &embedder).await
+    watch::run_watcher(open_stores, &embedder, preparer).await
 }
 
 async fn run_reindex_command(
@@ -356,11 +392,14 @@ async fn run_reindex_command(
 
 async fn open_search_adapters(
     stores: &[config::DirectoryStore],
-    dim: Option<usize>,
+    profile: Option<&types::IndexProfile>,
 ) -> anyhow::Result<Vec<(db::DbSemanticSource, fts::FtsFtsSource, db::DbPathSource)>> {
     let mut out = Vec::with_capacity(stores.len());
     for store in stores {
-        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        let (_db, conn) = match profile {
+            Some(profile) => db::connect_with_profile(&store.db_path, profile).await?,
+            None => db::connect(&store.db_path, None).await?,
+        };
         let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
         out.push((
             db::DbSemanticSource::new(conn.clone()),
@@ -384,8 +423,9 @@ async fn run_search(
         &mut std::io::stdin().lock(),
         std::io::stdin().is_terminal(),
     )?;
-    let dim = embedder.map(Embedder::dim);
-    let adapters = open_search_adapters(&config.docs_dirs, dim).await?;
+    let preparer = document::DefaultPreparer::default();
+    let profile = embedder.map(|embedder| index_profile(embedder, &preparer));
+    let adapters = open_search_adapters(&config.docs_dirs, profile.as_ref()).await?;
     let store_ports: Vec<query::SearchStorePorts<'_>> = config
         .docs_dirs
         .iter()
@@ -584,6 +624,41 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn xberg_profile_requires_reindex_from_builtin_index() {
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        std::fs::write(notes_dir.path().join("note.md"), "# Note\n\nXberg content")
+            .expect("write note");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
+        let embedder = embed::Embedder::create_null(1024);
+        let xberg_profile = index_profile(&embedder, &document::DefaultPreparer::default());
+        let builtin_profile = types::IndexProfile {
+            embedder: xberg_profile.embedder.clone(),
+            preparer: "markdown-v1".to_owned(),
+        };
+
+        {
+            let (_db, _conn) = db::connect_with_profile(&db_path, &builtin_profile)
+                .await
+                .expect("create builtin index");
+        }
+        let error = db::connect_with_profile(&db_path, &xberg_profile)
+            .await
+            .expect_err("Xberg profile must reject builtin index");
+        assert!(requires_reindex(&error));
+
+        let stats = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path())
+            .await
+            .expect("reindex");
+        assert_eq!(stats.added, 1);
+        db::connect_with_profile(&db_path, &xberg_profile)
+            .await
+            .expect("Xberg profile after reindex");
+    }
+
     #[test]
     fn resolve_query_returns_explicit_argument() {
         let mut reader = Cursor::new(b"");
@@ -732,7 +807,7 @@ mod tests {
         let result = db::connect(&path, Some(1024)).await;
         assert!(result.is_err());
         assert!(
-            is_dimension_mismatch(&result.expect_err("should fail")),
+            requires_reindex(&result.expect_err("should fail")),
             "error must be DimensionMismatch"
         );
     }
@@ -778,6 +853,7 @@ mod tests {
     ///   3. Call `run_reindex` with dimension 1024 (triggers mismatch path).
     ///   4. Assert the original DB file still exists and still contains the old
     ///      data (the prior index is preserved, not destroyed).
+    #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_original_db_on_dimension_mismatch() {
         use std::io::Write;
@@ -836,6 +912,7 @@ mod tests {
     /// on the live index before propagating the error, wiping it. After the fix
     /// the live FTS must still answer queries for content indexed before the
     /// failed reindex.
+    #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_fts_index_on_dimension_mismatch() {
         use std::io::Write;
@@ -1030,6 +1107,7 @@ mod tests {
     /// the live FTS.  When the next reindex attempt starts, it must restore the
     /// backup before cleaning temp artifacts; otherwise deleting the backup
     /// permanently destroys FTS availability even if the new build also fails.
+    #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn interrupted_reindex_restores_fts_backup_on_next_attempt() {
         use std::io::Write;

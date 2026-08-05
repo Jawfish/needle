@@ -79,6 +79,21 @@ mod tests {
             path: path.to_owned(),
             score,
             snippet: String::new(),
+            locator: None,
+        }
+    }
+
+    fn fused_with_chunk(
+        path: &str,
+        score: f64,
+        snippet: &str,
+        locator: Option<&str>,
+    ) -> FusedResult {
+        FusedResult {
+            path: path.to_owned(),
+            score,
+            snippet: snippet.to_owned(),
+            locator: locator.map(str::to_owned),
         }
     }
 
@@ -121,6 +136,25 @@ mod tests {
     #[test]
     fn merge_fused_results_empty_input_returns_empty() {
         assert!(merge_fused_results(vec![], 10).is_empty());
+    }
+
+    #[test]
+    fn merge_fused_results_keeps_locator_with_selected_snippet() {
+        let per_store = vec![
+            vec![fused_with_chunk("note.md", 1.0, "first chunk", None)],
+            vec![fused_with_chunk(
+                "note.md",
+                0.5,
+                "second chunk",
+                Some("Second heading"),
+            )],
+        ];
+
+        let merged = merge_fused_results(per_store, 10);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].snippet, "first chunk");
+        assert_eq!(merged[0].locator, None);
     }
 
     #[test]

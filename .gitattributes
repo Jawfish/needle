@@ -1,0 +1,1 @@
+tests/fixtures/documents/*.pdf -text -whitespace

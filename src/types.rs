@@ -1,3 +1,19 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbedderProfile {
+    pub provider: String,
+    pub endpoint: Option<String>,
+    pub model: String,
+    pub dimension: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexProfile {
+    pub embedder: EmbedderProfile,
+    pub preparer: String,
+}
+
 #[derive(Debug)]
 pub struct RrfWeights {
     pub semantic: f64,

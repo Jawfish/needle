@@ -1,6 +1,6 @@
 # Needle
 
-Semantic search for a directory of markdown files. Combines vector similarity, full-text search, and filename matching into a single ranked result set. Reads queries from stdin and emits tab-separated results, so it composes naturally in pipelines.
+Semantic search for directories of Markdown, plain-text, PDF, EPUB, HTML, and Word (`.docx`) documents. Combines vector similarity, full-text search, and filename matching into a single ranked result set. Reads queries from stdin and emits tab-separated results, so it composes naturally in pipelines.
 
 ## Install
 
@@ -23,7 +23,7 @@ needle --docs-dir ~/notes --docs-dir ~/work/docs search "query"
 
 By default, needle uses [fastembed](https://github.com/Anush008/fastembed-rs) for local embeddings (all-MiniLM-L6-v2). No API key needed. The model downloads automatically on first run.
 
-For a smaller binary without the local model, build with `--no-default-features` and use an API provider instead.
+The default build enables the `local` and `documents` Cargo features. `documents` uses Xberg to prepare Markdown (`.md`, `.markdown`), plain text (`.txt`), PDF (`.pdf`), EPUB (`.epub`), HTML (`.html`, `.htm`), and Word (`.docx`) documents. For a smaller binary without the local model and document preparation, build with `--no-default-features` and use an API provider instead. This build indexes Markdown only.
 
 ## Usage
 

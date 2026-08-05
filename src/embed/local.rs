@@ -8,6 +8,7 @@ const DEFAULT_DIM: usize = 384;
 
 pub struct LocalProvider {
     model: Arc<Mutex<TextEmbedding>>,
+    model_name: String,
     dim: usize,
 }
 
@@ -17,15 +18,20 @@ impl LocalProvider {
     /// Callers are responsible for constructing the model at the composition
     /// boundary (e.g. `Embedder::from_config`), which keeps the concrete
     /// `fastembed` type out of this unit and allows substitution in tests.
-    pub fn new(model: TextEmbedding, dim: usize) -> Self {
+    pub fn new(model: TextEmbedding, model_name: String, dim: usize) -> Self {
         Self {
             model: Arc::new(Mutex::new(model)),
+            model_name,
             dim,
         }
     }
 
     pub const fn dim(&self) -> usize {
         self.dim
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model_name
     }
 
     pub async fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -53,21 +59,25 @@ impl LocalProvider {
 
 /// Resolves a model name to a `(TextEmbedding, dim)` pair, downloading
 /// weights as needed.  Called at the composition boundary in `embed.rs`.
-pub fn init_model(name: Option<&str>) -> anyhow::Result<(TextEmbedding, usize)> {
-    let (model_enum, dim) = resolve_model(name)?;
+pub fn init_model(name: Option<&str>) -> anyhow::Result<(TextEmbedding, String, usize)> {
+    let (model_enum, model_name, dim) = resolve_model(name)?;
     let model =
         TextEmbedding::try_new(InitOptions::new(model_enum).with_show_download_progress(true))
             .context("failed to initialize local embedding model")?;
-    Ok((model, dim))
+    Ok((model, model_name.to_owned(), dim))
 }
 
-fn resolve_model(name: Option<&str>) -> anyhow::Result<(EmbeddingModel, usize)> {
+fn resolve_model(name: Option<&str>) -> anyhow::Result<(EmbeddingModel, &'static str, usize)> {
     match name {
-        None | Some("all-MiniLM-L6-v2") => Ok((DEFAULT_MODEL, DEFAULT_DIM)),
-        Some("nomic-embed-text-v1.5") => Ok((EmbeddingModel::NomicEmbedTextV15, 768)),
-        Some("bge-small-en-v1.5") => Ok((EmbeddingModel::BGESmallENV15, 384)),
-        Some("bge-base-en-v1.5") => Ok((EmbeddingModel::BGEBaseENV15, 768)),
-        Some("bge-large-en-v1.5") => Ok((EmbeddingModel::BGELargeENV15, 1024)),
+        None | Some("all-MiniLM-L6-v2") => Ok((DEFAULT_MODEL, "all-MiniLM-L6-v2", DEFAULT_DIM)),
+        Some("nomic-embed-text-v1.5") => Ok((
+            EmbeddingModel::NomicEmbedTextV15,
+            "nomic-embed-text-v1.5",
+            768,
+        )),
+        Some("bge-small-en-v1.5") => Ok((EmbeddingModel::BGESmallENV15, "bge-small-en-v1.5", 384)),
+        Some("bge-base-en-v1.5") => Ok((EmbeddingModel::BGEBaseENV15, "bge-base-en-v1.5", 768)),
+        Some("bge-large-en-v1.5") => Ok((EmbeddingModel::BGELargeENV15, "bge-large-en-v1.5", 1024)),
         Some(other) => anyhow::bail!("unknown local model: {other}"),
     }
 }

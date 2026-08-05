@@ -7,11 +7,16 @@ use anyhow::{Context, bail};
 use libsql::Connection;
 
 use crate::{
+    document::PreparedChunk,
+    error::NeedleError,
     rank::{Candidate, PathSource, SemanticSource},
     similar::{AllChunkEmbeddingsSource, NoteEmbeddingsSource, RelatedResult, RelatedSearchSource},
+    types::IndexProfile,
 };
 
 const BYTES_PER_F32: usize = 4;
+
+pub type NoteUpsert = (String, String, Vec<(PreparedChunk, Vec<f32>)>);
 
 pub fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
     if !blob.len().is_multiple_of(BYTES_PER_F32) {
@@ -34,19 +39,39 @@ pub fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
 pub struct SearchResult {
     pub path: String,
     pub snippet: String,
+    pub locator: Option<String>,
 }
 
 pub async fn connect(
     db_path: &Path,
     expected_dim: Option<usize>,
 ) -> anyhow::Result<(libsql::Database, Connection)> {
+    connect_inner(db_path, expected_dim, None).await
+}
+
+pub async fn connect_with_profile(
+    db_path: &Path,
+    profile: &IndexProfile,
+) -> anyhow::Result<(libsql::Database, Connection)> {
+    connect_inner(db_path, Some(profile.embedder.dimension), Some(profile)).await
+}
+
+async fn connect_inner(
+    db_path: &Path,
+    expected_dim: Option<usize>,
+    profile: Option<&IndexProfile>,
+) -> anyhow::Result<(libsql::Database, Connection)> {
     let db = libsql::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
-    init_schema(&conn, expected_dim).await?;
+    init_schema(&conn, expected_dim, profile).await?;
     Ok((db, conn))
 }
 
-async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::Result<()> {
+async fn init_schema(
+    conn: &Connection,
+    expected_dim: Option<usize>,
+    profile: Option<&IndexProfile>,
+) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
@@ -60,6 +85,16 @@ async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::
         );",
     )
     .await?;
+
+    if let Some(profile) = profile {
+        if chunks_table_exists(conn).await? && !chunks_have_locator(conn).await? {
+            return Err(NeedleError::IndexProfileMismatch {
+                reason: "index has no chunk locator column".to_owned(),
+            }
+            .into());
+        }
+        resolve_profile(conn, profile).await?;
+    }
 
     // When neither the caller nor stored metadata can supply a dimension (fresh DB
     // opened by a read-only command like `similar`) skip chunks infrastructure
@@ -75,6 +110,7 @@ async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::
             path TEXT NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
+            locator TEXT,
             embedding F32_BLOB({dim})
         )"
     );
@@ -142,6 +178,40 @@ async fn resolve_schema_dim(
     }
 }
 
+async fn resolve_profile(conn: &Connection, expected: &IndexProfile) -> anyhow::Result<()> {
+    let mut rows = conn
+        .query("SELECT value FROM metadata WHERE key = 'index_profile'", ())
+        .await?;
+    let Some(row) = rows.next().await? else {
+        if chunks_table_exists(conn).await? {
+            return Err(NeedleError::IndexProfileMismatch {
+                reason: "legacy index has no profile metadata".to_owned(),
+            }
+            .into());
+        }
+        let value = serde_json::to_string(expected)?;
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('index_profile', ?1)",
+            [value],
+        )
+        .await?;
+        return Ok(());
+    };
+    let value: String = row.get(0)?;
+    let stored: IndexProfile =
+        serde_json::from_str(&value).map_err(|e| NeedleError::IndexProfileMismatch {
+            reason: format!("stored profile metadata is invalid: {e}"),
+        })?;
+    if stored != *expected {
+        return Err(NeedleError::IndexProfileMismatch {
+            reason: "stored profile differs from the configured embedder or document preparer"
+                .to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 async fn stored_dim(conn: &Connection) -> anyhow::Result<Option<usize>> {
     let mut rows = conn
         .query("SELECT value FROM metadata WHERE key = 'embedding_dim'", ())
@@ -174,6 +244,17 @@ pub async fn chunks_table_exists(conn: &Connection) -> anyhow::Result<bool> {
         .next()
         .await?
         .is_some())
+}
+
+async fn chunks_have_locator(conn: &Connection) -> anyhow::Result<bool> {
+    let mut rows = conn.query("PRAGMA table_info(chunks)", ()).await?;
+    while let Some(row) = rows.next().await? {
+        let name: String = row.get(1)?;
+        if name == "locator" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn infer_dim_from_chunks_schema(conn: &Connection) -> anyhow::Result<usize> {
@@ -231,12 +312,15 @@ pub async fn note_hash(conn: &Connection, path: &str) -> anyhow::Result<Option<S
     }
 }
 
-pub async fn upsert_note(
+pub async fn upsert_note<T>(
     conn: &Connection,
     path: &str,
     hash: &str,
-    chunks: &[(String, Vec<f32>)],
-) -> anyhow::Result<()> {
+    chunks: &[(T, Vec<f32>)],
+) -> anyhow::Result<()>
+where
+    T: Clone + Into<PreparedChunk> + Sync,
+{
     let tx = conn.transaction().await?;
 
     tx.execute("DELETE FROM chunks WHERE path = ?1", [path])
@@ -248,13 +332,14 @@ pub async fn upsert_note(
     )
     .await?;
 
-    for (i, (content, embedding)) in chunks.iter().enumerate() {
+    for (i, (chunk, embedding)) in chunks.iter().enumerate() {
+        let chunk: PreparedChunk = chunk.clone().into();
         let embedding_json = serde_json::to_string(embedding)?;
         let chunk_index = i64::try_from(i).context("chunk index exceeds i64 range")?;
 
         tx.execute(
-            "INSERT INTO chunks (path, chunk_index, content, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
-            libsql::params![path, chunk_index, content.as_str(), embedding_json],
+            "INSERT INTO chunks (path, chunk_index, content, locator, embedding) VALUES (?1, ?2, ?3, ?4, vector32(?5))",
+            libsql::params![path, chunk_index, chunk.content.as_str(), chunk.locator.as_deref(), embedding_json],
         )
         .await?;
     }
@@ -264,20 +349,63 @@ pub async fn upsert_note(
 }
 
 pub async fn delete_note(conn: &Connection, path: &str) -> anyhow::Result<()> {
+    apply_directory_changes(conn, &[path.to_owned()], &[]).await
+}
+
+pub async fn apply_directory_changes(
+    conn: &Connection,
+    deleted_paths: &[String],
+    upserts: &[NoteUpsert],
+) -> anyhow::Result<()> {
     let tx = conn.transaction().await?;
-    tx.execute("DELETE FROM chunks WHERE path = ?1", [path])
+
+    for path in deleted_paths {
+        tx.execute("DELETE FROM chunks WHERE path = ?1", [path.as_str()])
+            .await?;
+        tx.execute("DELETE FROM notes WHERE path = ?1", [path.as_str()])
+            .await?;
+    }
+
+    for (path, hash, chunks) in upserts {
+        tx.execute("DELETE FROM chunks WHERE path = ?1", [path.as_str()])
+            .await?;
+        tx.execute(
+            "INSERT OR REPLACE INTO notes (path, content_hash, updated_at) VALUES (?1, ?2, unixepoch())",
+            [path.as_str(), hash.as_str()],
+        )
         .await?;
-    tx.execute("DELETE FROM notes WHERE path = ?1", [path])
-        .await?;
+
+        for (i, (chunk, embedding)) in chunks.iter().enumerate() {
+            let embedding_json = serde_json::to_string(embedding)?;
+            let chunk_index = i64::try_from(i).context("chunk index exceeds i64 range")?;
+            tx.execute(
+                "INSERT INTO chunks (path, chunk_index, content, locator, embedding) VALUES (?1, ?2, ?3, ?4, vector32(?5))",
+                libsql::params![path.as_str(), chunk_index, chunk.content.as_str(), chunk.locator.as_deref(), embedding_json],
+            )
+            .await?;
+        }
+    }
+
     tx.commit().await?;
     Ok(())
 }
 
-pub async fn all_chunks(conn: &Connection) -> anyhow::Result<Vec<(String, String)>> {
-    let mut rows = conn.query("SELECT path, content FROM chunks", ()).await?;
+pub async fn all_chunks(conn: &Connection) -> anyhow::Result<Vec<(String, PreparedChunk)>> {
+    let mut rows = conn
+        .query(
+            "SELECT path, content, locator FROM chunks ORDER BY path, chunk_index",
+            (),
+        )
+        .await?;
     let mut results = Vec::new();
     while let Some(row) = rows.next().await? {
-        results.push((row.get(0)?, row.get(1)?));
+        results.push((
+            row.get(0)?,
+            PreparedChunk {
+                content: row.get(1)?,
+                locator: row.get(2)?,
+            },
+        ));
     }
     Ok(results)
 }
@@ -291,7 +419,7 @@ pub async fn search_semantic(
 
     let mut rows = conn
         .query(
-            "SELECT c.path, c.content, vector_distance_cos(c.embedding, vector32(?1)) AS distance
+            "SELECT c.path, c.content, c.locator, vector_distance_cos(c.embedding, vector32(?1)) AS distance
              FROM vector_top_k('chunks_idx', vector32(?1), ?2) AS v
              JOIN chunks c ON c.rowid = v.id
              ORDER BY distance ASC",
@@ -308,6 +436,7 @@ pub async fn search_semantic(
     while let Some(row) = rows.next().await? {
         let path: String = row.get(0)?;
         let content: String = row.get(1)?;
+        let locator: Option<String> = row.get(2)?;
 
         if seen.contains(&path) {
             continue;
@@ -316,6 +445,7 @@ pub async fn search_semantic(
         results.push(SearchResult {
             path,
             snippet: content,
+            locator,
         });
         if results.len() >= limit {
             break;
@@ -446,6 +576,7 @@ impl SemanticSource for DbSemanticSource {
                 .map(|r| Candidate {
                     path: r.path,
                     snippet: r.snippet,
+                    locator: r.locator,
                 })
                 .collect())
         })
@@ -564,6 +695,129 @@ mod tests {
 
     fn dummy_embedding() -> Vec<f32> {
         vec![0.0; TEST_DIM]
+    }
+
+    fn test_profile() -> IndexProfile {
+        IndexProfile {
+            embedder: crate::types::EmbedderProfile {
+                provider: "openai".to_owned(),
+                endpoint: Some("https://example.test/v1".to_owned()),
+                model: "model-a".to_owned(),
+                dimension: TEST_DIM,
+            },
+            preparer: "markdown-v1".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_open_persists_and_requires_an_exact_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let profile = test_profile();
+        let (_db, conn) = connect_with_profile(&path, &profile).await.expect("create");
+        let mut rows = conn
+            .query("SELECT value FROM metadata WHERE key = 'index_profile'", ())
+            .await
+            .expect("query");
+        let row = rows.next().await.expect("row").expect("profile row");
+        let stored: String = row.get(0).expect("value");
+        assert_eq!(stored, serde_json::to_string(&profile).expect("serialize"));
+        drop(conn);
+        connect_with_profile(&path, &profile)
+            .await
+            .expect("matching profile");
+    }
+
+    #[tokio::test]
+    async fn profile_open_rejects_pre_locator_chunks_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let profile = test_profile();
+        let (_db, conn) = connect_with_profile(&path, &profile).await.expect("create");
+        conn.execute_batch(
+            "DROP TABLE chunks;
+             CREATE TABLE chunks (
+                 id INTEGER PRIMARY KEY,
+                 path TEXT NOT NULL,
+                 chunk_index INTEGER NOT NULL,
+                 content TEXT NOT NULL,
+                 embedding F32_BLOB(1024)
+             );",
+        )
+        .await
+        .expect("replace chunks schema");
+        drop(conn);
+
+        let err = connect_with_profile(&path, &profile)
+            .await
+            .expect_err("pre-locator schema rejected");
+        assert!(matches!(
+            err.downcast_ref::<NeedleError>(),
+            Some(NeedleError::IndexProfileMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn profile_open_rejects_legacy_and_all_identity_mismatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let profile = test_profile();
+        let (_db, _conn) = connect(&path, Some(TEST_DIM)).await.expect("legacy index");
+        let err = connect_with_profile(&path, &profile)
+            .await
+            .expect_err("legacy rejected");
+        assert!(matches!(
+            err.downcast_ref::<NeedleError>(),
+            Some(NeedleError::IndexProfileMismatch { .. })
+        ));
+
+        std::fs::remove_file(&path).expect("remove legacy");
+        let (_db, _conn) = connect_with_profile(&path, &profile).await.expect("create");
+        for changed in [
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    provider: "voyage".to_owned(),
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    model: "model-b".to_owned(),
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    endpoint: Some("https://other.test/v1".to_owned()),
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    dimension: 384,
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: profile.embedder.clone(),
+                preparer: "other-v1".to_owned(),
+            },
+        ] {
+            let err = connect_with_profile(&path, &changed)
+                .await
+                .expect_err("mismatch rejected");
+            assert!(matches!(
+                err.downcast_ref::<NeedleError>(),
+                Some(
+                    NeedleError::IndexProfileMismatch { .. }
+                        | NeedleError::DimensionMismatch { .. }
+                )
+            ));
+        }
     }
 
     fn make_chunks(texts: &[&str]) -> Vec<(String, Vec<f32>)> {
@@ -795,7 +1049,7 @@ mod tests {
 
         let chunks = all_chunks(&conn).await.expect("query failed");
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].1, "version two");
+        assert_eq!(chunks[0].1.content, "version two");
     }
 
     #[tokio::test]
@@ -876,6 +1130,23 @@ mod tests {
         let blob = vec![0u8; 12]; // 3 floats
         let decoded = decode_embedding(&blob).expect("decode failed");
         assert_eq!(decoded.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn search_semantic_returns_stored_locator() {
+        let (_dir, _db, conn) = test_db().await;
+        let chunk = PreparedChunk {
+            content: "test content".to_owned(),
+            locator: Some("Heading > Details".to_owned()),
+        };
+        upsert_note(&conn, "note.md", "abc", &[(chunk, vec![1.0; TEST_DIM])])
+            .await
+            .expect("upsert failed");
+
+        let results = search_semantic(&conn, &vec![1.0; TEST_DIM], 10)
+            .await
+            .expect("search failed");
+        assert_eq!(results[0].locator.as_deref(), Some("Heading > Details"));
     }
 
     #[tokio::test]

@@ -23,6 +23,9 @@ pub enum NeedleError {
     )]
     DimensionMismatch { db: usize, provider: usize },
 
+    #[error("index profile is missing or incompatible ({reason}; reindex required)")]
+    IndexProfileMismatch { reason: String },
+
     #[error(
         "no embedding provider available: set VOYAGE_API_KEY, OPENAI_API_KEY, or compile with --features local"
     )]

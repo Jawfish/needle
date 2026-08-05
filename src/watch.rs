@@ -1,13 +1,18 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use crate::{db, embed::Embedder, fts::FtsIndex, index};
+#[cfg(test)]
+use crate::document::DefaultPreparer;
+#[cfg(test)]
+use crate::document::PreparedChunk;
+use crate::{db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, index};
 
 const DEBOUNCE_MS: u64 = 500;
 
@@ -25,7 +30,11 @@ pub struct OpenStore {
 ///
 /// Callers are responsible for opening each store (DB connection, FTS index,
 /// initial indexing pass, lock acquisition) before calling this function.
-pub async fn run_watcher(stores: Vec<OpenStore>, embedder: &Embedder) -> anyhow::Result<()> {
+pub async fn run_watcher(
+    stores: Vec<OpenStore>,
+    embedder: &Embedder,
+    preparer: Arc<dyn DocumentPreparer>,
+) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
 
     // Collect notes_dirs for the watcher closure. Config resolution guarantees
@@ -34,14 +43,17 @@ pub async fn run_watcher(stores: Vec<OpenStore>, embedder: &Embedder) -> anyhow:
 
     let mut watcher = {
         let notes_dirs_clone = notes_dirs.clone();
+        let preparer = Arc::clone(&preparer);
         notify::recommended_watcher(move |event: Result<notify::Event, _>| {
             if let Ok(event) = event {
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                         for path in event.paths {
-                            if path.extension().is_some_and(|e| e == "md")
-                                && should_index_path(&path, notes_dirs_clone.iter())
-                            {
+                            if should_index_path_with_preparer(
+                                &path,
+                                notes_dirs_clone.iter(),
+                                preparer.as_ref(),
+                            ) {
                                 let _ = tx.send(path);
                             }
                         }
@@ -78,7 +90,14 @@ pub async fn run_watcher(stores: Vec<OpenStore>, embedder: &Embedder) -> anyhow:
         }
 
         if !changed.is_empty() {
-            dispatch_changes(&stores, &notes_dirs, embedder, &changed).await;
+            dispatch_changes_with_preparer(
+                &stores,
+                &notes_dirs,
+                embedder,
+                &changed,
+                preparer.as_ref(),
+            )
+            .await;
         }
     }
 
@@ -88,11 +107,29 @@ pub async fn run_watcher(stores: Vec<OpenStore>, embedder: &Embedder) -> anyhow:
 /// Route each changed path to its owning store and process it.
 ///
 /// Extracted so tests can drive dispatch directly without a real FS watcher.
+#[cfg(test)]
 pub async fn dispatch_changes(
     stores: &[OpenStore],
     notes_dirs: &[PathBuf],
     embedder: &Embedder,
     changed: &HashSet<PathBuf>,
+) {
+    dispatch_changes_with_preparer(
+        stores,
+        notes_dirs,
+        embedder,
+        changed,
+        &DefaultPreparer::default(),
+    )
+    .await;
+}
+
+pub async fn dispatch_changes_with_preparer(
+    stores: &[OpenStore],
+    notes_dirs: &[PathBuf],
+    embedder: &Embedder,
+    changed: &HashSet<PathBuf>,
+    preparer: &dyn DocumentPreparer,
 ) {
     for path in changed {
         // Non-overlapping roots (enforced at config time) guarantee at
@@ -103,19 +140,37 @@ pub async fn dispatch_changes(
 
         if let Some(idx) = store_idx {
             let store = &stores[idx];
-            process_single_file(&store.conn, &store.fts, embedder, &store.notes_dir, path).await;
+            process_single_file(
+                &store.conn,
+                &store.fts,
+                embedder,
+                &store.notes_dir,
+                path,
+                preparer,
+            )
+            .await;
         }
     }
 }
 
+#[cfg(test)]
 pub fn should_index_path<'a>(
     path: &std::path::Path,
     roots: impl Iterator<Item = &'a PathBuf>,
 ) -> bool {
+    should_index_path_with_preparer(path, roots, &DefaultPreparer::default())
+}
+
+pub fn should_index_path_with_preparer<'a>(
+    path: &std::path::Path,
+    roots: impl Iterator<Item = &'a PathBuf>,
+    preparer: &dyn DocumentPreparer,
+) -> bool {
     let owning_root = roots
         .into_iter()
         .find(|dir| path.starts_with(dir.as_path()));
-    owning_root.is_some_and(|root| !index::is_in_hidden_dir(path, root))
+    owning_root
+        .is_some_and(|root| !index::is_in_hidden_dir(path, root) && preparer.supports_path(path))
 }
 
 async fn process_single_file(
@@ -124,9 +179,12 @@ async fn process_single_file(
     embedder: &Embedder,
     notes_dir: &Path,
     path: &Path,
+    preparer: &dyn DocumentPreparer,
 ) {
     if path.exists() {
-        match index::index_single_file(conn, fts, embedder, notes_dir, path).await {
+        match index::index_single_file_with_preparer(conn, fts, embedder, notes_dir, path, preparer)
+            .await
+        {
             Ok(index::FtsStatus::Current) => {}
             Ok(index::FtsStatus::Stale) => reconcile_fts(conn, fts).await,
             Err(e) => tracing::error!(path = %path.display(), error = %e, "failed to index"),
@@ -169,16 +227,79 @@ async fn process_batch(
     changed: &HashSet<PathBuf>,
 ) {
     for path in changed {
-        process_single_file(conn, fts, embedder, notes_dir, path).await;
+        process_single_file(
+            conn,
+            fts,
+            embedder,
+            notes_dir,
+            path,
+            &DefaultPreparer::default(),
+        )
+        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::*;
     use crate::{db, embed, fts::FtsIndex};
+
+    struct CountingMarkdownPreparer(Arc<AtomicUsize>);
+
+    impl DocumentPreparer for CountingMarkdownPreparer {
+        fn supports_path(&self, source_path: &Path) -> bool {
+            source_path
+                .extension()
+                .is_some_and(|extension| extension == "md")
+        }
+
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
+        }
+
+        fn profile(&self) -> &'static str {
+            "counting-markdown-v1"
+        }
+    }
+
+    struct NotePreparer;
+
+    impl DocumentPreparer for NotePreparer {
+        fn supports_path(&self, source_path: &Path) -> bool {
+            source_path
+                .extension()
+                .is_some_and(|extension| extension == "note")
+        }
+
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
+        }
+
+        fn profile(&self) -> &'static str {
+            "note-v1"
+        }
+    }
 
     fn create_file(dir: &Path, relative: &str, content: &str) {
         let path = dir.join(relative);
@@ -205,6 +326,148 @@ mod tests {
     }
 
     // ---------- routing tests -------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_uses_preparer_for_supported_single_file_updates() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "entry.note", "prepared content");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let notes_dirs = vec![notes_dir.path().to_path_buf()];
+        let mut changed = HashSet::new();
+        changed.insert(notes_dir.path().join("entry.note"));
+
+        dispatch_changes_with_preparer(
+            std::slice::from_ref(&store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+            &NotePreparer,
+        )
+        .await;
+
+        assert!(
+            db::all_note_hashes(&store.conn)
+                .await
+                .expect("hashes")
+                .contains_key("entry.note")
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn dispatch_indexes_plain_text_with_default_preparer() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "watch.txt", "watch plain text");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let notes_dirs = vec![notes_dir.path().to_path_buf()];
+        let mut changed = HashSet::new();
+        changed.insert(notes_dir.path().join("watch.txt"));
+
+        dispatch_changes(
+            std::slice::from_ref(&store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        assert!(
+            db::all_note_hashes(&store.conn)
+                .await
+                .expect("hashes")
+                .contains_key("watch.txt")
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn default_watcher_indexes_document_fixtures_and_removes_deleted_pdf() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let fixtures = [
+            (
+                "fixture.pdf",
+                include_bytes!("../tests/fixtures/documents/fixture.pdf").as_slice(),
+                "PDFFIXTURENEEDLE",
+            ),
+            (
+                "fixture.epub",
+                include_bytes!("../tests/fixtures/documents/fixture.epub").as_slice(),
+                "EPUBFIXTURENEEDLE",
+            ),
+            (
+                "fixture.html",
+                include_bytes!("../tests/fixtures/documents/fixture.html").as_slice(),
+                "HTMLFIXTURENEEDLE",
+            ),
+            (
+                "fixture.docx",
+                include_bytes!("../tests/fixtures/documents/fixture.docx").as_slice(),
+                "DOCXFIXTURENEEDLE",
+            ),
+        ];
+        for (path, bytes, _) in fixtures {
+            std::fs::write(notes_dir.path().join(path), bytes).expect("write fixture");
+        }
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let notes_dirs = vec![notes_dir.path().to_path_buf()];
+        let changed: HashSet<PathBuf> = fixtures
+            .iter()
+            .map(|(path, _, _)| notes_dir.path().join(path))
+            .collect();
+
+        dispatch_changes(
+            std::slice::from_ref(&store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        let semantic_paths: Vec<String> = db::search_semantic(&store.conn, &[0.0; 1024], 10)
+            .await
+            .expect("semantic search")
+            .into_iter()
+            .map(|result| result.path)
+            .collect();
+        for (path, _, marker) in fixtures {
+            assert!(semantic_paths.contains(&path.to_owned()), "{path}");
+            assert_eq!(
+                store
+                    .fts
+                    .search(marker, 10)
+                    .await
+                    .expect("full-text search")[0]
+                    .path,
+                path
+            );
+        }
+
+        std::fs::remove_file(notes_dir.path().join("fixture.pdf")).expect("remove fixture");
+        let changed = HashSet::from([notes_dir.path().join("fixture.pdf")]);
+        dispatch_changes(
+            std::slice::from_ref(&store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        assert!(
+            !db::search_semantic(&store.conn, &[0.0; 1024], 10)
+                .await
+                .expect("semantic search")
+                .into_iter()
+                .any(|result| result.path == "fixture.pdf")
+        );
+        assert!(
+            store
+                .fts
+                .search("PDFFIXTURENEEDLE", 10)
+                .await
+                .expect("full-text search")
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn dispatch_routes_file_to_correct_store() {
@@ -465,6 +728,25 @@ mod tests {
             .expect("hash")
             .expect("should exist");
         assert_eq!(hash_before, hash_after);
+    }
+
+    #[tokio::test]
+    async fn watcher_unchanged_file_does_not_prepare_or_embed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "same");
+        let (_db_dir, _db, conn, _fts_dir, fts, _) = test_setup(notes_dir.path()).await;
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let preparer = CountingMarkdownPreparer(Arc::clone(&prepare_calls));
+        let initial = embed::Embedder::create_null(1024);
+        let path = notes_dir.path().join("note.md");
+
+        process_single_file(&conn, &fts, &initial, notes_dir.path(), &path, &preparer).await;
+        prepare_calls.store(0, Ordering::SeqCst);
+        let (embedder, embed_calls) = embed::Embedder::create_counting(1024, false);
+        process_single_file(&conn, &fts, &embedder, notes_dir.path(), &path, &preparer).await;
+
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

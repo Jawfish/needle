@@ -1,8 +1,12 @@
 use sha2::{Digest, Sha256};
 
 pub fn content_hash(content: &str) -> String {
+    content_hash_bytes(content.as_bytes())
+}
+
+pub fn content_hash_bytes(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(content);
     let result = hasher.finalize();
     hex_encode(&result)
 }
