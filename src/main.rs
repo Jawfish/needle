@@ -63,7 +63,7 @@ async fn run_reindex(
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
 ) -> anyhow::Result<index::IndexStats> {
-    let preparer = document::MarkdownPreparer;
+    let preparer = document::DefaultPreparer::default();
     let profile = index_profile(embedder, &preparer);
 
     match db::connect_with_profile(db_path, &profile).await {
@@ -335,7 +335,7 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
 
 async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-    let preparer = std::sync::Arc::new(document::MarkdownPreparer);
+    let preparer = std::sync::Arc::new(document::DefaultPreparer::default());
     let profile = index_profile(&embedder, preparer.as_ref());
 
     let mut open_stores: Vec<watch::OpenStore> = Vec::with_capacity(config.docs_dirs.len());
@@ -423,7 +423,7 @@ async fn run_search(
         &mut std::io::stdin().lock(),
         std::io::stdin().is_terminal(),
     )?;
-    let preparer = document::MarkdownPreparer;
+    let preparer = document::DefaultPreparer::default();
     let profile = embedder.map(|embedder| index_profile(embedder, &preparer));
     let adapters = open_search_adapters(&config.docs_dirs, profile.as_ref()).await?;
     let store_ports: Vec<query::SearchStorePorts<'_>> = config
@@ -624,6 +624,41 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn xberg_profile_requires_reindex_from_builtin_index() {
+        let notes_dir = tempfile::tempdir().expect("notes tempdir");
+        std::fs::write(notes_dir.path().join("note.md"), "# Note\n\nXberg content")
+            .expect("write note");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let fts_dir = tempfile::tempdir().expect("fts tempdir");
+        let db_path = db_dir.path().join("needle.db");
+        let embedder = embed::Embedder::create_null(1024);
+        let xberg_profile = index_profile(&embedder, &document::DefaultPreparer::default());
+        let builtin_profile = types::IndexProfile {
+            embedder: xberg_profile.embedder.clone(),
+            preparer: "markdown-v1".to_owned(),
+        };
+
+        {
+            let (_db, _conn) = db::connect_with_profile(&db_path, &builtin_profile)
+                .await
+                .expect("create builtin index");
+        }
+        let error = db::connect_with_profile(&db_path, &xberg_profile)
+            .await
+            .expect_err("Xberg profile must reject builtin index");
+        assert!(requires_reindex(&error));
+
+        let stats = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path())
+            .await
+            .expect("reindex");
+        assert_eq!(stats.added, 1);
+        db::connect_with_profile(&db_path, &xberg_profile)
+            .await
+            .expect("Xberg profile after reindex");
+    }
+
     #[test]
     fn resolve_query_returns_explicit_argument() {
         let mut reader = Cursor::new(b"");
@@ -818,6 +853,7 @@ mod tests {
     ///   3. Call `run_reindex` with dimension 1024 (triggers mismatch path).
     ///   4. Assert the original DB file still exists and still contains the old
     ///      data (the prior index is preserved, not destroyed).
+    #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_original_db_on_dimension_mismatch() {
         use std::io::Write;
@@ -876,6 +912,7 @@ mod tests {
     /// on the live index before propagating the error, wiping it. After the fix
     /// the live FTS must still answer queries for content indexed before the
     /// failed reindex.
+    #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_fts_index_on_dimension_mismatch() {
         use std::io::Write;
@@ -1070,6 +1107,7 @@ mod tests {
     /// the live FTS.  When the next reindex attempt starts, it must restore the
     /// backup before cleaning temp artifacts; otherwise deleting the backup
     /// permanently destroys FTS availability even if the new build also fails.
+    #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn interrupted_reindex_restores_fts_backup_on_next_attempt() {
         use std::io::Write;

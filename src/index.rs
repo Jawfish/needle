@@ -239,7 +239,7 @@ pub async fn index_directory(
         fts,
         embedder,
         notes_dir,
-        &crate::document::MarkdownPreparer,
+        &crate::document::DefaultPreparer::default(),
     )
     .await
 }
@@ -397,7 +397,7 @@ fn collect_supported_files(
 
 #[cfg(test)]
 fn collect_markdown_files(dir: &Path) -> anyhow::Result<HashMap<String, std::path::PathBuf>> {
-    collect_supported_files(dir, &crate::document::MarkdownPreparer)
+    collect_supported_files(dir, &crate::document::DefaultPreparer::default())
 }
 
 fn collect_recursive(
@@ -660,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_markdown_files() {
+    fn collects_markdown_and_text_but_ignores_unsupported_files() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         create_file(dir.path(), "note.md", "");
         create_file(dir.path(), "readme.txt", "");
@@ -668,8 +668,78 @@ mod tests {
         create_file(dir.path(), "data.json", "");
 
         let files = collect_markdown_files(dir.path()).expect("collect failed");
-        assert_eq!(files.len(), 1);
         assert!(files.contains_key("note.md"));
+        #[cfg(feature = "documents")]
+        {
+            assert_eq!(files.len(), 2);
+            assert!(files.contains_key("readme.txt"));
+        }
+        #[cfg(not(feature = "documents"))]
+        assert_eq!(files.len(), 1);
+    }
+
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn default_preparer_indexes_plain_text_and_empty_documents() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "guide.txt", "needle text search phrase");
+        create_file(notes_dir.path(), "empty.txt", "");
+
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let stats = index_directory(&conn, &fts, &Embedder::create_null(1024), notes_dir.path())
+            .await
+            .expect("index");
+
+        assert_eq!(stats.added, 2);
+        assert!(
+            db::all_chunks(&conn)
+                .await
+                .expect("chunks")
+                .iter()
+                .any(|(path, content)| path == "guide.txt" && content.contains("search phrase"))
+        );
+        assert!(
+            db::all_note_hashes(&conn)
+                .await
+                .expect("hashes")
+                .contains_key("empty.txt")
+        );
+        assert!(
+            !db::all_chunks(&conn)
+                .await
+                .expect("chunks")
+                .iter()
+                .any(|(path, _)| path == "empty.txt")
+        );
+
+        let semantic = db::DbSemanticSource::new(conn.clone());
+        let fts_source = crate::fts::FtsFtsSource::new(fts);
+        let paths = db::DbPathSource::new(conn);
+        let results = crate::rank::search(
+            &semantic,
+            &fts_source,
+            &paths,
+            None,
+            "empty",
+            10,
+            &crate::rank::RrfWeights {
+                semantic: 0.0,
+                fts: 0.0,
+                filename: 1.0,
+            },
+        )
+        .await
+        .expect("search");
+        assert_eq!(
+            results.first().map(|result| result.path.as_str()),
+            Some("empty.txt")
+        );
     }
 
     #[test]

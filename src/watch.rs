@@ -9,7 +9,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 #[cfg(test)]
-use crate::document::MarkdownPreparer;
+use crate::document::DefaultPreparer;
 use crate::{db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, index};
 
 const DEBOUNCE_MS: u64 = 500;
@@ -112,7 +112,14 @@ pub async fn dispatch_changes(
     embedder: &Embedder,
     changed: &HashSet<PathBuf>,
 ) {
-    dispatch_changes_with_preparer(stores, notes_dirs, embedder, changed, &MarkdownPreparer).await;
+    dispatch_changes_with_preparer(
+        stores,
+        notes_dirs,
+        embedder,
+        changed,
+        &DefaultPreparer::default(),
+    )
+    .await;
 }
 
 pub async fn dispatch_changes_with_preparer(
@@ -149,7 +156,7 @@ pub fn should_index_path<'a>(
     path: &std::path::Path,
     roots: impl Iterator<Item = &'a PathBuf>,
 ) -> bool {
-    should_index_path_with_preparer(path, roots, &MarkdownPreparer)
+    should_index_path_with_preparer(path, roots, &DefaultPreparer::default())
 }
 
 pub fn should_index_path_with_preparer<'a>(
@@ -218,7 +225,15 @@ async fn process_batch(
     changed: &HashSet<PathBuf>,
 ) {
     for path in changed {
-        process_single_file(conn, fts, embedder, notes_dir, path, &MarkdownPreparer).await;
+        process_single_file(
+            conn,
+            fts,
+            embedder,
+            notes_dir,
+            path,
+            &DefaultPreparer::default(),
+        )
+        .await;
     }
 }
 
@@ -321,6 +336,32 @@ mod tests {
                 .await
                 .expect("hashes")
                 .contains_key("entry.note")
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn dispatch_indexes_plain_text_with_default_preparer() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "watch.txt", "watch plain text");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let notes_dirs = vec![notes_dir.path().to_path_buf()];
+        let mut changed = HashSet::new();
+        changed.insert(notes_dir.path().join("watch.txt"));
+
+        dispatch_changes(
+            std::slice::from_ref(&store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        assert!(
+            db::all_note_hashes(&store.conn)
+                .await
+                .expect("hashes")
+                .contains_key("watch.txt")
         );
     }
 
