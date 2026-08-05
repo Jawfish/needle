@@ -12,6 +12,7 @@ mod output;
 mod query;
 mod rank;
 mod search_merge;
+mod server;
 mod similar;
 mod types;
 mod watch;
@@ -308,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
 fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool {
     match command {
         Command::Watch | Command::Reindex => true,
-        Command::Search { .. } => weights.semantic > 0.0,
+        Command::Search { .. } | Command::Serve { .. } => weights.semantic > 0.0,
         _ => false,
     }
 }
@@ -393,7 +394,7 @@ async fn run_reindex_command(
 async fn open_search_adapters(
     stores: &[config::DirectoryStore],
     profile: Option<&types::IndexProfile>,
-) -> anyhow::Result<Vec<(db::DbSemanticSource, fts::FtsFtsSource, db::DbPathSource)>> {
+) -> anyhow::Result<Vec<server::SearchAdapter>> {
     let mut out = Vec::with_capacity(stores.len());
     for store in stores {
         let (_db, conn) = match profile {
@@ -401,11 +402,11 @@ async fn open_search_adapters(
             None => db::connect(&store.db_path, None).await?,
         };
         let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
-        out.push((
-            db::DbSemanticSource::new(conn.clone()),
-            fts::FtsFtsSource::new(fts_index),
-            db::DbPathSource::new(conn),
-        ));
+        out.push(server::SearchAdapter {
+            semantic: db::DbSemanticSource::new(conn.clone()),
+            fts: fts::FtsFtsSource::new(fts_index),
+            paths: db::DbPathSource::new(conn),
+        });
     }
     Ok(out)
 }
@@ -430,11 +431,11 @@ async fn run_search(
         .docs_dirs
         .iter()
         .zip(adapters.iter())
-        .map(|(store, (semantic, fts, paths))| query::SearchStorePorts {
+        .map(|(store, adapter)| query::SearchStorePorts {
             notes_dir: &store.notes_dir,
-            semantic,
-            fts,
-            paths,
+            semantic: &adapter.semantic,
+            fts: &adapter.fts,
+            paths: &adapter.paths,
         })
         .collect();
     let per_store =
@@ -552,6 +553,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 limit,
                 mode,
                 &mut std::io::stdout(),
+            )
+            .await
+        }
+        Command::Serve { host, port } => {
+            let preparer = document::DefaultPreparer::default();
+            let profile = embedder
+                .as_ref()
+                .map(|value| index_profile(value, &preparer));
+            let adapters = open_search_adapters(&config.docs_dirs, profile.as_ref()).await?;
+            server::run(
+                host,
+                port,
+                &config.docs_dirs,
+                adapters,
+                embedder,
+                config.weights,
             )
             .await
         }

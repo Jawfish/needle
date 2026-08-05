@@ -368,7 +368,11 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper 0.1.2",
+ "tokio",
  "tower 0.4.13",
  "tower-layer",
  "tower-service",
@@ -3329,6 +3333,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "maud"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df518b75016b4289cdddffa1b01f2122f4a49802c93191f3133f6dc2472ebcaa"
+dependencies = [
+ "itoa",
+ "maud_macros",
+]
+
+[[package]]
+name = "maud_macros"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa453238ec218da0af6b11fc5978d3b5c3a45ed97b722391a2a11f3306274e18"
+dependencies = [
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3491,10 +3517,13 @@ name = "needle"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "fastembed",
  "fs2",
+ "hyper 0.14.32",
  "libsql",
+ "maud",
  "notify",
  "nucleo",
  "reqwest 0.13.4",
@@ -3506,6 +3535,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
  "xberg",
@@ -4186,6 +4216,29 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "proc-macro-error"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c"
+dependencies = [
+ "proc-macro-error-attr",
+ "proc-macro2",
+ "quote",
+ "version_check",
+]
+
+[[package]]
+name = "proc-macro-error-attr"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1be40180e52ecc98ad80b184934baf3d0d29f979574e439af5a55274b35f869"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "version_check",
 ]
 
 [[package]]
@@ -5068,6 +5121,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

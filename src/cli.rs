@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 #[derive(clap::Parser)]
 #[command(
@@ -43,6 +43,13 @@ pub enum Command {
         #[arg(long, env = "NEEDLE_W_FILENAME")]
         w_filename: Option<f64>,
     },
+    /// Serve indexed documents in a browser
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
     /// Find similar document pairs based on embeddings
     Similar {
         #[arg(long, default_value = "0.85")]
@@ -64,4 +71,38 @@ pub enum Command {
     },
     /// Reindex all supported documents
     Reindex,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn serve_uses_default_host_and_port() {
+        let cli = Cli::try_parse_from(["needle", "serve"]).expect("parse");
+        let parsed = match cli.command {
+            Command::Serve { host, port } => Some((host, port)),
+            _ => None,
+        };
+        assert_eq!(
+            parsed,
+            Some(("127.0.0.1".parse::<IpAddr>().expect("IP"), 8080))
+        );
+    }
+
+    #[test]
+    fn serve_accepts_host_and_port_overrides() {
+        let cli = Cli::try_parse_from(["needle", "serve", "--host", "0.0.0.0", "--port", "9090"])
+            .expect("parse");
+        let parsed = match cli.command {
+            Command::Serve { host, port } => Some((host, port)),
+            _ => None,
+        };
+        assert_eq!(
+            parsed,
+            Some(("0.0.0.0".parse::<IpAddr>().expect("IP"), 9090))
+        );
+    }
 }
