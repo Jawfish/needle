@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -47,13 +50,22 @@ impl DirectoryStore {
 }
 
 #[derive(Debug)]
+pub struct Namespace {
+    pub name: String,
+    pub description: Option<String>,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
 pub struct Config {
+    pub namespaces: Vec<Namespace>,
     pub docs_dirs: Vec<DirectoryStore>,
     pub embed: EmbedConfig,
     pub weights: RrfWeights,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     provider: Option<String>,
     model: Option<String>,
@@ -62,10 +74,18 @@ struct FileConfig {
     voyage_api_key: Option<String>,
     openai_api_key: Option<String>,
     needle_api_key: Option<String>,
-    notes_dirs: Option<Vec<PathBuf>>,
+    namespaces: Option<Vec<FileNamespace>>,
     w_semantic: Option<f64>,
     w_fts: Option<f64>,
     w_filename: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileNamespace {
+    name: Option<String>,
+    description: Option<String>,
+    paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Clone, Copy)]
@@ -76,93 +96,149 @@ pub struct CliWeights {
 }
 
 impl Config {
-    pub fn resolve(
-        cli_docs_dirs: Vec<PathBuf>,
-        cli_weights: CliWeights,
-        cli_embed: CliEmbedArgs,
-    ) -> anyhow::Result<Self> {
-        Self::resolve_with(cli_docs_dirs, cli_weights, cli_embed, load_file_config()?)
+    pub fn resolve(cli_weights: CliWeights, cli_embed: CliEmbedArgs) -> anyhow::Result<Self> {
+        let file_config = load_file_config()?;
+        Self::resolve_with(cli_weights, cli_embed, &file_config)
     }
 
     fn resolve_with(
-        cli_docs_dirs: Vec<PathBuf>,
         cli_weights: CliWeights,
         cli_embed: CliEmbedArgs,
-        file_config: FileConfig,
+        file_config: &FileConfig,
     ) -> anyhow::Result<Self> {
-        let weights = resolve_weights(cli_weights, &file_config);
-        let embed = resolve_embed_config(cli_embed, &file_config);
-
-        let raw_paths: Vec<PathBuf> = if !cli_docs_dirs.is_empty() {
-            cli_docs_dirs
-        } else if let Some(dirs) = file_config.notes_dirs.filter(|v| !v.is_empty()) {
-            dirs
-        } else {
-            return Err(NeedleError::MissingDirectories(
-                "no docs directories configured; set notes_dirs in config.toml or pass --docs-dir <PATH>".to_owned(),
-            )
-            .into());
-        };
-
-        let mut canonical_paths: Vec<PathBuf> = Vec::with_capacity(raw_paths.len());
-        for path in raw_paths {
-            let canonical = path
-                .canonicalize()
-                .with_context(|| format!("canonicalizing path {}", path.display()))?;
-            if !canonical_paths.contains(&canonical) {
-                canonical_paths.push(canonical);
-            }
-        }
-
-        let mut overlap_pairs: Vec<String> = Vec::new();
-        for i in 0..canonical_paths.len() {
-            for j in (i + 1)..canonical_paths.len() {
-                let a = &canonical_paths[i];
-                let b = &canonical_paths[j];
-                if a.starts_with(b.as_path()) || b.starts_with(a.as_path()) {
-                    overlap_pairs.push(format!("  {} and {}", a.display(), b.display()));
-                }
-            }
-        }
-        if !overlap_pairs.is_empty() {
-            return Err(NeedleError::OverlappingDirectories(overlap_pairs.join("\n")).into());
-        }
-
-        let missing: Vec<String> = canonical_paths
-            .iter()
-            .filter(|p| !p.is_dir())
-            .map(|p| p.display().to_string())
-            .collect();
-
-        if !missing.is_empty() {
-            return Err(NeedleError::MissingDirectories(missing.join("\n")).into());
-        }
-
-        let mut docs_dirs: Vec<DirectoryStore> = Vec::with_capacity(canonical_paths.len());
-        for notes_dir in canonical_paths {
-            let data_dir = data_dir_for(&notes_dir)?;
-            std::fs::create_dir_all(&data_dir)?;
-            let db_path = data_dir.join("needle.db");
-            let tantivy_dir = data_dir.join("tantivy");
-            std::fs::create_dir_all(&tantivy_dir)?;
-            docs_dirs.push(DirectoryStore {
-                notes_dir,
-                db_path,
-                tantivy_dir,
-            });
-        }
+        let weights = resolve_weights(cli_weights, file_config);
+        let embed = resolve_embed_config(cli_embed, file_config);
+        let (namespaces, canonical_paths) = resolve_namespaces(file_config)?;
+        let docs_dirs = build_directory_stores(canonical_paths)?;
 
         tracing::debug!(
-            dirs = ?docs_dirs.iter().map(|s| s.notes_dir.display().to_string()).collect::<Vec<_>>(),
+            dirs = ?docs_dirs.iter().map(|store| store.notes_dir.display().to_string()).collect::<Vec<_>>(),
             "resolved docs dirs"
         );
 
         Ok(Self {
+            namespaces,
             docs_dirs,
             embed,
             weights,
         })
     }
+}
+
+fn resolve_namespaces(file_config: &FileConfig) -> anyhow::Result<(Vec<Namespace>, Vec<PathBuf>)> {
+    let definitions = file_config
+        .namespaces
+        .as_deref()
+        .filter(|definitions| !definitions.is_empty())
+        .ok_or(NeedleError::NoNamespaces)?;
+
+    let mut names = HashSet::with_capacity(definitions.len());
+    for (index, definition) in definitions.iter().enumerate() {
+        let name = namespace_name(definition, index)?;
+        if !names.insert(name) {
+            return Err(NeedleError::InvalidNamespace(format!(
+                "namespace '{name}' is configured more than once"
+            ))
+            .into());
+        }
+        namespace_paths(definition, name)?;
+    }
+
+    let mut namespaces = Vec::with_capacity(definitions.len());
+    let mut canonical_paths = Vec::new();
+    for (index, definition) in definitions.iter().enumerate() {
+        let name = namespace_name(definition, index)?;
+        let mut paths = Vec::new();
+        for path in namespace_paths(definition, name)? {
+            let canonical = path.canonicalize().with_context(|| {
+                format!(
+                    "canonicalizing path {} in namespace '{name}'",
+                    path.display()
+                )
+            })?;
+            if !canonical.is_dir() {
+                return Err(NeedleError::MissingDirectories(format!(
+                    "{} (namespace '{name}')",
+                    canonical.display()
+                ))
+                .into());
+            }
+            if !paths.contains(&canonical) {
+                paths.push(canonical.clone());
+            }
+            if !canonical_paths.contains(&canonical) {
+                canonical_paths.push(canonical);
+            }
+        }
+        namespaces.push(Namespace {
+            name: name.to_owned(),
+            description: definition.description.clone(),
+            paths,
+        });
+    }
+
+    reject_overlapping_directories(&canonical_paths)?;
+    Ok((namespaces, canonical_paths))
+}
+
+fn namespace_name(definition: &FileNamespace, index: usize) -> anyhow::Result<&str> {
+    let name = definition.name.as_deref().ok_or_else(|| {
+        NeedleError::InvalidNamespace(format!("namespace entry {} is missing a name", index + 1))
+    })?;
+    if name.trim().is_empty() {
+        return Err(NeedleError::InvalidNamespace(format!(
+            "namespace entry {} has an empty name",
+            index + 1
+        ))
+        .into());
+    }
+    Ok(name)
+}
+
+fn namespace_paths<'a>(definition: &'a FileNamespace, name: &str) -> anyhow::Result<&'a [PathBuf]> {
+    definition
+        .paths
+        .as_deref()
+        .filter(|paths| !paths.is_empty())
+        .ok_or_else(|| {
+            NeedleError::InvalidNamespace(format!(
+                "namespace '{name}' must define one or more paths"
+            ))
+            .into()
+        })
+}
+
+fn reject_overlapping_directories(paths: &[PathBuf]) -> anyhow::Result<()> {
+    let mut overlap_pairs = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        for other in &paths[index + 1..] {
+            if path.starts_with(other) || other.starts_with(path) {
+                overlap_pairs.push(format!("  {} and {}", path.display(), other.display()));
+            }
+        }
+    }
+    if overlap_pairs.is_empty() {
+        Ok(())
+    } else {
+        Err(NeedleError::OverlappingDirectories(overlap_pairs.join("\n")).into())
+    }
+}
+
+fn build_directory_stores(paths: Vec<PathBuf>) -> anyhow::Result<Vec<DirectoryStore>> {
+    let mut docs_dirs = Vec::with_capacity(paths.len());
+    for notes_dir in paths {
+        let data_dir = data_dir_for(&notes_dir)?;
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("needle.db");
+        let tantivy_dir = data_dir.join("tantivy");
+        std::fs::create_dir_all(&tantivy_dir)?;
+        docs_dirs.push(DirectoryStore {
+            notes_dir,
+            db_path,
+            tantivy_dir,
+        });
+    }
+    Ok(docs_dirs)
 }
 
 fn resolve_embed_config(cli: CliEmbedArgs, file: &FileConfig) -> EmbedConfig {
@@ -181,7 +257,9 @@ fn resolve_embed_config(cli: CliEmbedArgs, file: &FileConfig) -> EmbedConfig {
             .api_base
             .or_else(|| env("NEEDLE_API_BASE"))
             .or_else(|| file.api_base.clone()),
-        dim: env("NEEDLE_DIM").and_then(|s| s.parse().ok()).or(file.dim),
+        dim: env("NEEDLE_DIM")
+            .and_then(|value| value.parse().ok())
+            .or(file.dim),
         voyage_api_key: env("VOYAGE_API_KEY").or_else(|| file.voyage_api_key.clone()),
         openai_api_key: env("OPENAI_API_KEY").or_else(|| file.openai_api_key.clone()),
         needle_api_key: env("NEEDLE_API_KEY").or_else(|| file.needle_api_key.clone()),
@@ -240,10 +318,12 @@ fn load_file_config() -> anyhow::Result<FileConfig> {
 
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
-        Err(e) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileConfig::default());
+        }
+        Err(error) => {
             return Err(
-                anyhow::Error::from(e).context(format!("reading config: {}", path.display()))
+                anyhow::Error::from(error).context(format!("reading config: {}", path.display()))
             );
         }
     };
@@ -255,6 +335,38 @@ fn load_file_config() -> anyhow::Result<FileConfig> {
 mod tests {
     use super::*;
 
+    fn weights() -> CliWeights {
+        CliWeights {
+            semantic: None,
+            fts: None,
+            filename: None,
+        }
+    }
+
+    fn embed() -> CliEmbedArgs {
+        CliEmbedArgs {
+            provider: None,
+            model: None,
+            api_base: None,
+        }
+    }
+
+    fn namespace(name: Option<&str>, paths: Option<Vec<PathBuf>>) -> FileNamespace {
+        FileNamespace {
+            name: name.map(str::to_owned),
+            description: None,
+            paths,
+        }
+    }
+
+    fn resolve(namespaces: Vec<FileNamespace>) -> anyhow::Result<Config> {
+        let file_config = FileConfig {
+            namespaces: Some(namespaces),
+            ..Default::default()
+        };
+        Config::resolve_with(weights(), embed(), &file_config)
+    }
+
     #[test]
     fn cli_weights_override_file_config() {
         let file_config = FileConfig {
@@ -263,7 +375,6 @@ mod tests {
             w_filename: Some(4.0),
             ..Default::default()
         };
-
         let cli_weights = CliWeights {
             semantic: Some(10.0),
             fts: None,
@@ -277,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn file_config_overrides_defaults() {
+    fn file_config_overrides_weight_defaults() {
         let file_config = FileConfig {
             w_semantic: Some(9.0),
             w_fts: Some(8.0),
@@ -285,298 +396,189 @@ mod tests {
             ..Default::default()
         };
 
-        let cli_weights = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-
-        let weights = resolve_weights(cli_weights, &file_config);
-        assert!((weights.semantic - 9.0).abs() < f64::EPSILON);
-        assert!((weights.fts - 8.0).abs() < f64::EPSILON);
-        assert!((weights.filename - 7.0).abs() < f64::EPSILON);
+        let resolved = resolve_weights(weights(), &file_config);
+        assert!((resolved.semantic - 9.0).abs() < f64::EPSILON);
+        assert!((resolved.fts - 8.0).abs() < f64::EPSILON);
+        assert!((resolved.filename - 7.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn defaults_used_when_no_overrides() {
-        let cli_weights = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-
-        let weights = resolve_weights(cli_weights, &FileConfig::default());
-        let defaults = RrfWeights::default();
-        assert!((weights.semantic - defaults.semantic).abs() < f64::EPSILON);
-        assert!((weights.fts - defaults.fts).abs() < f64::EPSILON);
-        assert!((weights.filename - defaults.filename).abs() < f64::EPSILON);
+    fn no_namespaces_configured_is_an_error() {
+        let file_config = FileConfig::default();
+        let result = Config::resolve_with(weights(), embed(), &file_config);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("no documentation namespaces configured"));
     }
 
     #[test]
-    fn nonexistent_notes_dir_is_an_error() {
-        let bad_dir = PathBuf::from("/nonexistent/path/that/should/not/exist");
-        let cli_weights = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-
-        let cli_embed = CliEmbedArgs {
-            provider: None,
-            model: None,
-            api_base: None,
-        };
-
-        let result =
-            Config::resolve_with(vec![bad_dir], cli_weights, cli_embed, FileConfig::default());
-        assert!(result.is_err());
+    fn namespace_requires_a_name() {
+        let result = resolve(vec![namespace(None, Some(vec![PathBuf::from("/tmp")]))]);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("missing a name"));
     }
 
     #[test]
-    fn no_directories_configured_is_an_error() {
-        let cli_weights = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-        let cli_embed = CliEmbedArgs {
-            provider: None,
-            model: None,
-            api_base: None,
-        };
-
-        let result = Config::resolve_with(vec![], cli_weights, cli_embed, FileConfig::default());
-        assert!(result.is_err());
-        let msg = result.expect_err("should fail").to_string();
-        assert!(msg.contains("no docs directories configured"), "got: {msg}");
+    fn namespace_name_cannot_be_blank() {
+        let result = resolve(vec![namespace(
+            Some("  "),
+            Some(vec![PathBuf::from("/tmp")]),
+        )]);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("empty name"));
     }
 
     #[test]
-    fn cli_dirs_override_file_config_dirs() {
-        let cli_widgets = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-        let cli_embed = CliEmbedArgs {
-            provider: None,
-            model: None,
-            api_base: None,
-        };
-        let file_config = FileConfig {
-            notes_dirs: Some(vec![PathBuf::from(
-                "/nonexistent/file/config/dir/that/does/not/exist",
-            )]),
-            ..Default::default()
-        };
+    fn namespace_names_must_be_unique() {
+        let result = resolve(vec![
+            namespace(Some("work"), Some(vec![PathBuf::from("/tmp")])),
+            namespace(Some("work"), Some(vec![PathBuf::from("/var/tmp")])),
+        ]);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("configured more than once"));
+    }
 
-        // When CLI dirs are given, the nonexistent file-config dir is not consulted.
-        // But CLI dir also doesn't exist, so we still get an error - just for the CLI path.
-        let cli_dir = PathBuf::from("/nonexistent/cli/dir/that/does/not/exist");
-        let result = Config::resolve_with(vec![cli_dir], cli_widgets, cli_embed, file_config);
-        assert!(result.is_err());
-        let msg = result.expect_err("should fail").to_string();
-        // Should mention the CLI path, not the file-config path
-        assert!(
-            msg.contains("nonexistent/cli/dir") || msg.contains("canonicalizing"),
-            "got: {msg}"
+    #[test]
+    fn namespace_names_are_case_sensitive() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let first = base.path().join("first");
+        let second = base.path().join("second");
+        std::fs::create_dir(&first).expect("create first");
+        std::fs::create_dir(&second).expect("create second");
+
+        let config = resolve(vec![
+            namespace(Some("work"), Some(vec![first])),
+            namespace(Some("Work"), Some(vec![second])),
+        ])
+        .expect("must resolve");
+        assert_eq!(config.namespaces.len(), 2);
+    }
+
+    #[test]
+    fn namespace_requires_one_or_more_paths() {
+        let result = resolve(vec![namespace(Some("work"), Some(Vec::new()))]);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("one or more paths"));
+    }
+
+    #[test]
+    fn shared_path_uses_one_store_and_preserves_membership() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let expected_path = directory.path().canonicalize().expect("canonicalize");
+        let mut first = namespace(
+            Some("project-a"),
+            Some(vec![directory.path().to_path_buf()]),
         );
-    }
+        first.description = Some("Project A documentation".to_owned());
+        let second = namespace(Some("shared"), Some(vec![expected_path.clone()]));
 
-    #[test]
-    fn duplicate_cli_dirs_are_deduplicated() {
-        // Two references to the same real directory (use /tmp which always exists)
-        let real_dir = PathBuf::from("/tmp");
-        let cli_widgets = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-        let cli_embed = CliEmbedArgs {
-            provider: None,
-            model: None,
-            api_base: None,
-        };
-        let result = Config::resolve_with(
-            vec![real_dir.clone(), real_dir],
-            cli_widgets,
-            cli_embed,
-            FileConfig::default(),
-        );
-        // /tmp exists so this should succeed
-        assert!(result.is_ok(), "resolve should succeed for /tmp");
-        let config = result.expect("succeed");
+        let config = resolve(vec![first, second]).expect("must resolve");
+        assert_eq!(config.docs_dirs.len(), 1);
+        assert_eq!(config.docs_dirs[0].notes_dir, expected_path);
         assert_eq!(
-            config.docs_dirs.len(),
-            1,
-            "duplicate entry must be deduplicated"
+            config.namespaces[0].description.as_deref(),
+            Some("Project A documentation")
         );
+        assert_eq!(config.namespaces[0].paths, config.namespaces[1].paths);
     }
 
     #[test]
-    fn missing_directories_error_names_all_bad_paths() {
-        let bad1 = PathBuf::from("/nonexistent/path/aaa");
-        let bad2 = PathBuf::from("/nonexistent/path/bbb");
-        let cli_weights = CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        };
-        let cli_embed = CliEmbedArgs {
-            provider: None,
-            model: None,
-            api_base: None,
-        };
-        let result = Config::resolve_with(
-            vec![bad1, bad2],
-            cli_weights,
-            cli_embed,
-            FileConfig::default(),
-        );
-        assert!(result.is_err());
-        // canonicalize will fail on completely nonexistent paths before is_dir check
-        // The error should mention one of the paths
-        assert!(result.is_err());
-    }
+    fn duplicate_paths_within_a_namespace_use_one_store() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = resolve(vec![namespace(
+            Some("project-a"),
+            Some(vec![
+                directory.path().to_path_buf(),
+                directory.path().to_path_buf(),
+            ]),
+        )])
+        .expect("must resolve");
 
-    fn overlap_weights() -> CliWeights {
-        CliWeights {
-            semantic: None,
-            fts: None,
-            filename: None,
-        }
-    }
-
-    fn overlap_embed() -> CliEmbedArgs {
-        CliEmbedArgs {
-            provider: None,
-            model: None,
-            api_base: None,
-        }
+        assert_eq!(config.docs_dirs.len(), 1);
+        assert_eq!(config.namespaces[0].paths.len(), 1);
     }
 
     #[test]
-    fn parent_child_overlap_is_rejected() {
-        let parent = tempfile::tempdir().expect("parent tempdir");
+    fn distinct_overlapping_paths_are_rejected() {
+        let parent = tempfile::tempdir().expect("tempdir");
         let child = parent.path().join("child");
         std::fs::create_dir(&child).expect("create child");
 
-        let result = Config::resolve_with(
-            vec![parent.path().to_path_buf(), child],
-            overlap_weights(),
-            overlap_embed(),
-            FileConfig::default(),
-        );
-        assert!(result.is_err());
-        let msg = result.expect_err("should fail").to_string();
-        assert!(msg.contains("overlap"), "got: {msg}");
+        let result = resolve(vec![
+            namespace(Some("parent"), Some(vec![parent.path().to_path_buf()])),
+            namespace(Some("child"), Some(vec![child])),
+        ]);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("overlap"));
+        assert!(message.contains(parent.path().to_string_lossy().as_ref()));
     }
 
     #[test]
-    fn child_parent_order_is_also_rejected() {
-        let parent = tempfile::tempdir().expect("parent tempdir");
-        let child = parent.path().join("child");
-        std::fs::create_dir(&child).expect("create child");
-
-        let result = Config::resolve_with(
-            vec![child, parent.path().to_path_buf()],
-            overlap_weights(),
-            overlap_embed(),
-            FileConfig::default(),
-        );
-        assert!(result.is_err());
-        let msg = result.expect_err("should fail").to_string();
-        assert!(msg.contains("overlap"), "got: {msg}");
-    }
-
-    #[test]
-    fn non_overlapping_siblings_are_accepted() {
-        let base = tempfile::tempdir().expect("base tempdir");
-        let sib_a = base.path().join("a");
-        let sib_b = base.path().join("b");
-        std::fs::create_dir(&sib_a).expect("create sib_a");
-        std::fs::create_dir(&sib_b).expect("create sib_b");
-
-        let result = Config::resolve_with(
-            vec![sib_a, sib_b],
-            overlap_weights(),
-            overlap_embed(),
-            FileConfig::default(),
-        );
-        assert!(
-            result.is_ok(),
-            "non-overlapping siblings must be accepted: {:?}",
-            result.err()
-        );
-        assert_eq!(result.expect("ok").docs_dirs.len(), 2);
-    }
-
-    #[test]
-    fn three_non_overlapping_paths_are_all_accepted() {
+    fn non_overlapping_paths_are_accepted() {
         let base = tempfile::tempdir().expect("tempdir");
-        for name in ["x", "y", "z"] {
-            std::fs::create_dir(base.path().join(name)).expect("create dir");
-        }
+        let first = base.path().join("first");
+        let second = base.path().join("second");
+        std::fs::create_dir(&first).expect("create first");
+        std::fs::create_dir(&second).expect("create second");
 
-        let dirs = ["x", "y", "z"]
-            .iter()
-            .map(|n| base.path().join(n))
-            .collect();
-
-        let result = Config::resolve_with(
-            dirs,
-            overlap_weights(),
-            overlap_embed(),
-            FileConfig::default(),
-        );
-        assert!(
-            result.is_ok(),
-            "three non-overlapping paths must be accepted: {:?}",
-            result.err()
-        );
-        assert_eq!(result.expect("ok").docs_dirs.len(), 3);
+        let config = resolve(vec![
+            namespace(Some("one"), Some(vec![first])),
+            namespace(Some("two"), Some(vec![second])),
+        ])
+        .expect("must resolve");
+        assert_eq!(config.docs_dirs.len(), 2);
     }
 
     #[test]
-    fn string_prefix_but_not_path_prefix_is_accepted() {
-        // /docs and /docs-extra share a string prefix but are distinct path components.
-        // Path::starts_with does component-level matching so they must not be flagged.
-        let base = tempfile::tempdir().expect("tempdir");
-        let docs = base.path().join("docs");
-        let docs_extra = base.path().join("docs-extra");
-        std::fs::create_dir(&docs).expect("create docs");
-        std::fs::create_dir(&docs_extra).expect("create docs-extra");
-
-        let result = Config::resolve_with(
-            vec![docs, docs_extra],
-            overlap_weights(),
-            overlap_embed(),
-            FileConfig::default(),
-        );
-        assert!(
-            result.is_ok(),
-            "string-prefix-only siblings must not be flagged as overlapping: {:?}",
-            result.err()
-        );
+    fn nonexistent_namespace_path_is_actionable() {
+        let path = PathBuf::from("/nonexistent/needle-namespace-test");
+        let result = resolve(vec![namespace(Some("work"), Some(vec![path.clone()]))]);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("canonicalizing path"));
+        assert!(message.contains(path.to_string_lossy().as_ref()));
+        assert!(message.contains("namespace 'work'"));
     }
 
     #[test]
-    fn overlap_error_names_both_paths() {
-        let parent = tempfile::tempdir().expect("parent tempdir");
-        let child = parent.path().join("sub");
-        std::fs::create_dir(&child).expect("create child");
+    fn file_namespace_path_is_rejected() {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let result = resolve(vec![namespace(
+            Some("work"),
+            Some(vec![file.path().to_path_buf()]),
+        )]);
+        let message = result.expect_err("must fail").to_string();
+        assert!(message.contains("docs directories not found"));
+        assert!(message.contains("namespace 'work'"));
+    }
 
-        let result = Config::resolve_with(
-            vec![parent.path().to_path_buf(), child],
-            overlap_weights(),
-            overlap_embed(),
-            FileConfig::default(),
+    #[test]
+    fn notes_dirs_is_not_accepted_in_configuration() {
+        let result = toml::from_str::<FileConfig>("notes_dirs = [\"/tmp\"]");
+        assert!(result.is_err());
+        let error = result.err().expect("must fail");
+        assert!(error.to_string().contains("notes_dirs"));
+    }
+
+    #[test]
+    fn namespace_toml_parses() {
+        let config = toml::from_str::<FileConfig>(
+            r#"
+[[namespaces]]
+name = "project-a"
+description = "Project A documentation"
+paths = ["/tmp"]
+"#,
+        )
+        .expect("must parse");
+        let definitions = config.namespaces.expect("namespaces");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name.as_deref(), Some("project-a"));
+        assert_eq!(
+            definitions[0].description.as_deref(),
+            Some("Project A documentation")
         );
-        let msg = result.expect_err("should fail").to_string();
-        // Both paths should appear in the error so the user knows which pair to fix.
-        assert!(
-            msg.contains(parent.path().to_string_lossy().as_ref()),
-            "error must name the parent path, got: {msg}"
+        assert_eq!(
+            definitions[0].paths.as_deref(),
+            Some([PathBuf::from("/tmp")].as_slice())
         );
     }
 
@@ -587,7 +589,6 @@ mod tests {
             model: Some("voyage-4".to_owned()),
             ..Default::default()
         };
-
         let cli_embed = CliEmbedArgs {
             provider: Some("openai".to_owned()),
             model: None,
@@ -601,13 +602,7 @@ mod tests {
 
     #[test]
     fn embed_config_defaults_to_none() {
-        let cli_embed = CliEmbedArgs {
-            provider: None,
-            model: None,
-            api_base: None,
-        };
-
-        let embed = resolve_embed_config(cli_embed, &FileConfig::default());
+        let embed = resolve_embed_config(embed(), &FileConfig::default());
         assert!(embed.provider.is_none());
         assert!(embed.model.is_none());
         assert!(embed.api_base.is_none());
@@ -627,13 +622,15 @@ mod tests {
     fn to_relative_strips_absolute_prefix() {
         let store = make_store("/home/user/notes");
         assert_eq!(
-            store.to_relative("/home/user/notes/topic.md").expect("ok"),
+            store
+                .to_relative("/home/user/notes/topic.md")
+                .expect("must convert"),
             "topic.md"
         );
         assert_eq!(
             store
                 .to_relative("/home/user/notes/sub/topic.md")
-                .expect("ok"),
+                .expect("must convert"),
             "sub/topic.md"
         );
     }
@@ -641,9 +638,12 @@ mod tests {
     #[test]
     fn to_relative_passes_through_relative_path() {
         let store = make_store("/home/user/notes");
-        assert_eq!(store.to_relative("topic.md").expect("ok"), "topic.md");
         assert_eq!(
-            store.to_relative("sub/topic.md").expect("ok"),
+            store.to_relative("topic.md").expect("must convert"),
+            "topic.md"
+        );
+        assert_eq!(
+            store.to_relative("sub/topic.md").expect("must convert"),
             "sub/topic.md"
         );
     }

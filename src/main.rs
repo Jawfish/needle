@@ -494,7 +494,7 @@ async fn run_related(
         } else {
             anyhow::anyhow!(
                 "relative path '{path}' is ambiguous with multiple docs dirs configured; \
-                 pass an absolute path or use --docs-dir to specify a single directory"
+                 pass an absolute path"
             )
         }
     })?;
@@ -525,7 +525,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         model: cli.model,
         api_base: cli.api_base,
     };
-    let config = Config::resolve(cli.docs_dirs, cli_weights, cli_embed)?;
+    let config = Config::resolve(cli_weights, cli_embed)?;
+    tracing::debug!(
+        namespaces = ?config.namespaces.iter().map(|namespace| (
+            &namespace.name,
+            &namespace.description,
+            &namespace.paths,
+        )).collect::<Vec<_>>(),
+        "resolved documentation namespaces"
+    );
 
     let embedder = if search_needs_embedder(&cli.command, &config.weights) {
         Some(Embedder::from_config(&config.embed)?)

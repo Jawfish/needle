@@ -1,4 +1,4 @@
-use std::{net::IpAddr, path::PathBuf};
+use std::net::IpAddr;
 
 #[derive(clap::Parser)]
 #[command(
@@ -6,9 +6,6 @@ use std::{net::IpAddr, path::PathBuf};
     about = "Semantic search for Markdown, text, PDF, EPUB, HTML, and Word documents"
 )]
 pub struct Cli {
-    #[arg(long = "docs-dir", action = clap::ArgAction::Append)]
-    pub docs_dirs: Vec<PathBuf>,
-
     #[arg(long, env = "NEEDLE_PROVIDER")]
     pub provider: Option<String>,
 
@@ -78,6 +75,11 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn docs_dir_is_not_a_supported_option() {
+        assert!(Cli::try_parse_from(["needle", "--docs-dir", "/tmp", "search", "query"]).is_err());
+    }
 
     #[test]
     fn serve_uses_default_host_and_port() {
