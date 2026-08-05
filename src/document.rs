@@ -41,14 +41,7 @@ pub struct XbergPreparer;
 #[cfg(feature = "documents")]
 impl DocumentPreparer for XbergPreparer {
     fn supports_path(&self, source_path: &Path) -> bool {
-        source_path
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|extension| {
-                ["md", "markdown", "txt"]
-                    .iter()
-                    .any(|supported| extension.eq_ignore_ascii_case(supported))
-            })
+        mime_type(source_path).is_some()
     }
 
     fn prepare(&self, source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
@@ -91,7 +84,7 @@ impl DocumentPreparer for XbergPreparer {
     }
 
     fn profile(&self) -> &'static str {
-        "xberg-1.0.14-render-markdown-chunker-markdown-max-1000-overlap-200-trim-sizing-characters-heading-context-page-extraction-cache-off"
+        "xberg-1.0.14-pdf-office-html-render-markdown-chunker-markdown-max-1000-overlap-200-trim-sizing-characters-heading-context-page-extraction-ocr-off-cache-off"
     }
 }
 
@@ -101,6 +94,13 @@ fn mime_type(source_path: &Path) -> Option<&'static str> {
         Some(extension) if extension.eq_ignore_ascii_case("md") => Some("text/markdown"),
         Some(extension) if extension.eq_ignore_ascii_case("markdown") => Some("text/markdown"),
         Some(extension) if extension.eq_ignore_ascii_case("txt") => Some("text/plain"),
+        Some(extension) if extension.eq_ignore_ascii_case("pdf") => Some("application/pdf"),
+        Some(extension) if extension.eq_ignore_ascii_case("epub") => Some("application/epub+zip"),
+        Some(extension) if extension.eq_ignore_ascii_case("html") => Some("text/html"),
+        Some(extension) if extension.eq_ignore_ascii_case("htm") => Some("text/html"),
+        Some(extension) if extension.eq_ignore_ascii_case("docx") => {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        }
         _ => None,
     }
 }
@@ -109,6 +109,7 @@ fn mime_type(source_path: &Path) -> Option<&'static str> {
 fn extract_with_xberg(input: xberg::ExtractInput) -> xberg::Result<xberg::ExtractionResult> {
     let config = xberg::ExtractionConfig {
         use_cache: false,
+        disable_ocr: true,
         output_format: xberg::OutputFormat::Markdown,
         chunking: Some(xberg::ChunkingConfig {
             chunker_type: xberg::ChunkerType::Markdown,
@@ -241,11 +242,35 @@ mod tests {
 
     #[cfg(feature = "documents")]
     #[test]
-    fn xberg_preparer_supports_markdown_and_text_case_insensitively() {
-        for path in ["note.md", "note.MARKDOWN", "note.Txt"] {
+    fn xberg_preparer_supports_document_paths_case_insensitively() {
+        for path in [
+            "note.md",
+            "note.MARKDOWN",
+            "note.Txt",
+            "guide.PDF",
+            "book.Epub",
+            "page.HTML",
+            "page.Htm",
+            "report.DocX",
+        ] {
             assert!(XbergPreparer.supports_path(Path::new(path)), "{path}");
         }
-        assert!(!XbergPreparer.supports_path(Path::new("note.html")));
+        assert!(!XbergPreparer.supports_path(Path::new("image.png")));
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn xberg_preparer_rejects_password_protected_pdfs_with_the_source_path() {
+        let path = Path::new("password-protected.pdf");
+        let error = XbergPreparer
+            .prepare(
+                path,
+                include_bytes!("../tests/fixtures/documents/password-protected.pdf"),
+            )
+            .expect_err("password-protected PDF must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("password-protected.pdf"));
+        assert!(message.contains("password") || message.contains("encrypted"));
     }
 
     #[cfg(feature = "documents")]

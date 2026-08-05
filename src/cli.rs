@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 #[derive(clap::Parser)]
-#[command(name = "needle", about = "Semantic search for markdown notes")]
+#[command(
+    name = "needle",
+    about = "Semantic search for Markdown, text, PDF, EPUB, HTML, and Word documents"
+)]
 pub struct Cli {
     #[arg(long = "docs-dir", action = clap::ArgAction::Append)]
     pub docs_dirs: Vec<PathBuf>,
@@ -59,6 +62,6 @@ pub enum Command {
         #[arg(short, long)]
         paths_only: bool,
     },
-    /// Reindex all notes
+    /// Reindex all supported documents
     Reindex,
 }

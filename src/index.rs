@@ -679,6 +679,30 @@ mod tests {
     }
 
     #[cfg(feature = "documents")]
+    const DOCUMENT_FIXTURES: [(&str, &[u8], &str); 4] = [
+        (
+            "fixture.pdf",
+            include_bytes!("../tests/fixtures/documents/fixture.pdf"),
+            "PDFFIXTURENEEDLE",
+        ),
+        (
+            "fixture.epub",
+            include_bytes!("../tests/fixtures/documents/fixture.epub"),
+            "EPUBFIXTURENEEDLE",
+        ),
+        (
+            "fixture.html",
+            include_bytes!("../tests/fixtures/documents/fixture.html"),
+            "HTMLFIXTURENEEDLE",
+        ),
+        (
+            "fixture.docx",
+            include_bytes!("../tests/fixtures/documents/fixture.docx"),
+            "DOCXFIXTURENEEDLE",
+        ),
+    ];
+
+    #[cfg(feature = "documents")]
     #[tokio::test]
     async fn default_preparer_indexes_plain_text_and_empty_documents() {
         let notes_dir = tempfile::tempdir().expect("tempdir");
@@ -740,6 +764,41 @@ mod tests {
             results.first().map(|result| result.path.as_str()),
             Some("empty.txt")
         );
+    }
+
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn default_reindex_indexes_document_fixtures_for_semantic_and_full_text_search() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        for (path, bytes, _) in DOCUMENT_FIXTURES {
+            std::fs::write(notes_dir.path().join(path), bytes).expect("write fixture");
+        }
+
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let stats = index_directory(&conn, &fts, &Embedder::create_null(1024), notes_dir.path())
+            .await
+            .expect("index");
+        assert_eq!(stats.added, DOCUMENT_FIXTURES.len());
+
+        let semantic_paths: Vec<String> = db::search_semantic(&conn, &[0.0; 1024], 10)
+            .await
+            .expect("semantic search")
+            .into_iter()
+            .map(|result| result.path)
+            .collect();
+        for (path, _, marker) in DOCUMENT_FIXTURES {
+            assert!(semantic_paths.contains(&path.to_owned()), "{path}");
+            assert_eq!(
+                fts.search(marker, 10).await.expect("full-text search")[0].path,
+                path
+            );
+        }
     }
 
     #[test]

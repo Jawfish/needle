@@ -365,6 +365,96 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn default_watcher_indexes_document_fixtures_and_removes_deleted_pdf() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let fixtures = [
+            (
+                "fixture.pdf",
+                include_bytes!("../tests/fixtures/documents/fixture.pdf").as_slice(),
+                "PDFFIXTURENEEDLE",
+            ),
+            (
+                "fixture.epub",
+                include_bytes!("../tests/fixtures/documents/fixture.epub").as_slice(),
+                "EPUBFIXTURENEEDLE",
+            ),
+            (
+                "fixture.html",
+                include_bytes!("../tests/fixtures/documents/fixture.html").as_slice(),
+                "HTMLFIXTURENEEDLE",
+            ),
+            (
+                "fixture.docx",
+                include_bytes!("../tests/fixtures/documents/fixture.docx").as_slice(),
+                "DOCXFIXTURENEEDLE",
+            ),
+        ];
+        for (path, bytes, _) in fixtures {
+            std::fs::write(notes_dir.path().join(path), bytes).expect("write fixture");
+        }
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let notes_dirs = vec![notes_dir.path().to_path_buf()];
+        let changed: HashSet<PathBuf> = fixtures
+            .iter()
+            .map(|(path, _, _)| notes_dir.path().join(path))
+            .collect();
+
+        dispatch_changes(
+            std::slice::from_ref(&store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        let semantic_paths: Vec<String> = db::search_semantic(&store.conn, &[0.0; 1024], 10)
+            .await
+            .expect("semantic search")
+            .into_iter()
+            .map(|result| result.path)
+            .collect();
+        for (path, _, marker) in fixtures {
+            assert!(semantic_paths.contains(&path.to_owned()), "{path}");
+            assert_eq!(
+                store
+                    .fts
+                    .search(marker, 10)
+                    .await
+                    .expect("full-text search")[0]
+                    .path,
+                path
+            );
+        }
+
+        std::fs::remove_file(notes_dir.path().join("fixture.pdf")).expect("remove fixture");
+        let changed = HashSet::from([notes_dir.path().join("fixture.pdf")]);
+        dispatch_changes(
+            std::slice::from_ref(&store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        assert!(
+            !db::search_semantic(&store.conn, &[0.0; 1024], 10)
+                .await
+                .expect("semantic search")
+                .into_iter()
+                .any(|result| result.path == "fixture.pdf")
+        );
+        assert!(
+            store
+                .fts
+                .search("PDFFIXTURENEEDLE", 10)
+                .await
+                .expect("full-text search")
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_routes_file_to_correct_store() {
         let dir1 = tempfile::tempdir().expect("tempdir");
