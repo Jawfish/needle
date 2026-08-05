@@ -619,26 +619,7 @@ async fn run_related(
     Ok(())
 }
 
-async fn run_related_command(
-    config: &Config,
-    embedder: Option<&Embedder>,
-    path: String,
-    limit: usize,
-    mode: OutputMode,
-    writer: &mut impl Write,
-) -> anyhow::Result<()> {
-    run_related(
-        config,
-        embedder.map(Embedder::dim),
-        path,
-        limit,
-        mode,
-        writer,
-    )
-    .await
-}
-
-async fn run_serve_command(
+async fn run_serve(
     config: &Config,
     embedder: Option<Embedder>,
     host: std::net::IpAddr,
@@ -656,11 +637,7 @@ async fn run_serve_command(
         &config.namespaces,
         adapters,
         embedder,
-        rank::RrfWeights {
-            semantic: config.weights.semantic,
-            fts: config.weights.fts,
-            filename: config.weights.filename,
-        },
+        config.weights,
     )
     .await
 }
@@ -724,7 +701,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Serve { host, port } => run_serve_command(&config, embedder, host, port).await,
+        Command::Serve { host, port } => run_serve(&config, embedder, host, port).await,
         Command::Similar {
             namespaces,
             threshold,
@@ -748,9 +725,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             limit,
             paths_only,
         } => {
-            run_related_command(
+            let dim = embedder.as_ref().map(Embedder::dim);
+            run_related(
                 &config,
-                embedder.as_ref(),
+                dim,
                 path,
                 limit,
                 output_mode(cli.json, paths_only),
