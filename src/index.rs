@@ -3,12 +3,7 @@ use std::{collections::HashMap, path::Path};
 use anyhow::Context;
 use libsql::Connection;
 
-use crate::{
-    db,
-    embed::{self, Embedder},
-    fts::FtsIndex,
-    hash,
-};
+use crate::{db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, hash};
 
 #[derive(Debug)]
 pub struct IndexStats {
@@ -109,16 +104,17 @@ pub fn plan_directory_index(
 pub fn plan_single_file(
     rel_path: String,
     stored_hash: Option<&str>,
-    content: &str,
+    content_hash: String,
+    chunks: Vec<String>,
 ) -> SingleFilePlan {
-    let file_hash = hash::content_hash(content);
+    let file_hash = content_hash;
     if stored_hash.is_some_and(|h| h == file_hash) {
         return SingleFilePlan::Unchanged;
     }
     SingleFilePlan::NeedsIndex {
         rel_path,
         content_hash: file_hash,
-        chunks: embed::chunk_text(content),
+        chunks,
     }
 }
 
@@ -195,39 +191,69 @@ pub async fn index_directory(
     embedder: &Embedder,
     notes_dir: &Path,
 ) -> anyhow::Result<IndexStats> {
+    index_directory_with_preparer(
+        conn,
+        fts,
+        embedder,
+        notes_dir,
+        &crate::document::MarkdownPreparer,
+    )
+    .await
+}
+
+pub async fn index_directory_with_preparer(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    notes_dir: &Path,
+    preparer: &dyn DocumentPreparer,
+) -> anyhow::Result<IndexStats> {
     let existing_hashes = db::all_note_hashes(conn).await?;
-    let disk_files = read_disk_hashes(notes_dir).await?;
+    let disk_files = read_disk_hashes(notes_dir, preparer).await?;
     let plan = plan_directory_index(&existing_hashes, &disk_files);
     execute_directory_plan(conn, fts, embedder, plan).await
 }
 
-pub async fn index_single_file(
+pub async fn index_single_file_with_preparer(
     conn: &Connection,
     fts: &FtsIndex,
     embedder: &Embedder,
     notes_dir: &Path,
     abs_path: &Path,
+    preparer: &dyn DocumentPreparer,
 ) -> anyhow::Result<FtsStatus> {
+    if !preparer.supports_path(abs_path) {
+        return Ok(FtsStatus::Current);
+    }
+
     let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
         |_| abs_path.to_string_lossy().to_string(),
         |p| p.to_string_lossy().to_string(),
     );
-    let content = tokio::fs::read_to_string(abs_path).await?;
+    let source = tokio::fs::read(abs_path).await?;
     let stored_hash = db::note_hash(conn, &rel_path).await?;
-    let plan = plan_single_file(rel_path, stored_hash.as_deref(), &content);
+    let plan = plan_single_file(
+        rel_path,
+        stored_hash.as_deref(),
+        hash::content_hash_bytes(&source),
+        preparer.prepare(abs_path, &source)?,
+    );
     execute_single_file_plan(conn, fts, embedder, plan).await
 }
 
-async fn read_disk_hashes(dir: &Path) -> anyhow::Result<HashMap<String, DiskFile>> {
-    let files = collect_markdown_files(dir)?;
+async fn read_disk_hashes(
+    dir: &Path,
+    preparer: &dyn DocumentPreparer,
+) -> anyhow::Result<HashMap<String, DiskFile>> {
+    let files = collect_supported_files(dir, preparer)?;
     let mut out = HashMap::with_capacity(files.len());
     for (rel_path, abs_path) in files {
-        let content = tokio::fs::read_to_string(&abs_path).await?;
+        let source = tokio::fs::read(&abs_path).await?;
         out.insert(
             rel_path,
             DiskFile {
-                content_hash: hash::content_hash(&content),
-                chunks: embed::chunk_text(&content),
+                content_hash: hash::content_hash_bytes(&source),
+                chunks: preparer.prepare(&abs_path, &source)?,
             },
         );
     }
@@ -289,15 +315,24 @@ pub fn is_in_hidden_dir(path: &Path, root: &Path) -> bool {
         .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
 }
 
-fn collect_markdown_files(dir: &Path) -> anyhow::Result<HashMap<String, std::path::PathBuf>> {
+fn collect_supported_files(
+    dir: &Path,
+    preparer: &dyn DocumentPreparer,
+) -> anyhow::Result<HashMap<String, std::path::PathBuf>> {
     let mut files = HashMap::new();
-    collect_recursive(dir, dir, &mut files)?;
+    collect_recursive(dir, dir, preparer, &mut files)?;
     Ok(files)
+}
+
+#[cfg(test)]
+fn collect_markdown_files(dir: &Path) -> anyhow::Result<HashMap<String, std::path::PathBuf>> {
+    collect_supported_files(dir, &crate::document::MarkdownPreparer)
 }
 
 fn collect_recursive(
     root: &Path,
     dir: &Path,
+    preparer: &dyn DocumentPreparer,
     files: &mut HashMap<String, std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -311,8 +346,8 @@ fn collect_recursive(
             {
                 continue;
             }
-            collect_recursive(root, &path, files)?;
-        } else if path.extension().is_some_and(|e| e == "md") {
+            collect_recursive(root, &path, preparer, files)?;
+        } else if preparer.supports_path(&path) {
             let rel = path.strip_prefix(root).map_or_else(
                 |_| path.to_string_lossy().to_string(),
                 |p| p.to_string_lossy().to_string(),
@@ -326,6 +361,7 @@ fn collect_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed;
 
     fn create_file(dir: &Path, relative: &str, content: &str) {
         let path = dir.join(relative);
@@ -353,6 +389,24 @@ mod tests {
     fn assert_file_to_index(f: &FileToIndex, rel_path: &str, is_new: bool) {
         assert_eq!(f.rel_path, rel_path);
         assert_eq!(f.is_new, is_new);
+    }
+
+    struct NotePreparer;
+
+    impl DocumentPreparer for NotePreparer {
+        fn supports_path(&self, source_path: &Path) -> bool {
+            source_path
+                .extension()
+                .is_some_and(|extension| extension == "note")
+        }
+
+        fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
+            Ok(vec![std::str::from_utf8(source)?.to_owned()])
+        }
+
+        fn profile(&self) -> &'static str {
+            "note-v1"
+        }
     }
 
     #[test]
@@ -422,14 +476,24 @@ mod tests {
     fn single_file_plan_is_unchanged_when_hash_matches() {
         let content = "hello world";
         let stored = hash::content_hash(content);
-        let plan = plan_single_file("note.md".to_string(), Some(&stored), content);
+        let plan = plan_single_file(
+            "note.md".to_string(),
+            Some(&stored),
+            hash::content_hash(content),
+            vec![content.to_string()],
+        );
         assert!(matches!(plan, SingleFilePlan::Unchanged));
     }
 
     #[test]
     fn single_file_plan_needs_index_when_no_stored_hash() {
         let content = "hello world";
-        let plan = plan_single_file("note.md".to_string(), None, content);
+        let plan = plan_single_file(
+            "note.md".to_string(),
+            None,
+            hash::content_hash(content),
+            vec![content.to_string()],
+        );
         match plan {
             SingleFilePlan::NeedsIndex {
                 rel_path,
@@ -447,7 +511,12 @@ mod tests {
     #[test]
     fn single_file_plan_needs_index_when_hash_differs() {
         let content = "updated content";
-        let plan = plan_single_file("note.md".to_string(), Some("oldhash"), content);
+        let plan = plan_single_file(
+            "note.md".to_string(),
+            Some("oldhash"),
+            hash::content_hash(content),
+            vec![content.to_string()],
+        );
         match plan {
             SingleFilePlan::NeedsIndex { content_hash, .. } => {
                 assert_eq!(content_hash, hash::content_hash(content));
@@ -522,6 +591,35 @@ mod tests {
                 "relative path should not start with /: {key}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn directory_index_uses_preparer_for_discovery_and_chunks() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "entry.note", "prepared content");
+
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        let stats = index_directory_with_preparer(
+            &conn,
+            &fts,
+            &Embedder::create_null(1024),
+            notes_dir.path(),
+            &NotePreparer,
+        )
+        .await
+        .expect("index");
+
+        assert_eq!(stats.added, 1);
+        assert_eq!(
+            db::all_chunks(&conn).await.expect("chunks"),
+            vec![("entry.note".to_string(), "prepared content".to_string(),)]
+        );
     }
 
     #[tokio::test]

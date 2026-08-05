@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod db;
+mod document;
 mod embed;
 mod error;
 mod fts;
@@ -308,6 +309,7 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
 async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
     let dim = Some(embedder.dim());
+    let preparer = std::sync::Arc::new(document::MarkdownPreparer);
 
     let mut open_stores: Vec<watch::OpenStore> = Vec::with_capacity(config.docs_dirs.len());
     // Locks are held for the watcher's lifetime and released on drop when
@@ -321,7 +323,14 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         let fts = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
 
         tracing::info!(dir = %store.notes_dir.display(), "initial indexing");
-        let stats = index::index_directory(&conn, &fts, &embedder, &store.notes_dir).await?;
+        let stats = index::index_directory_with_preparer(
+            &conn,
+            &fts,
+            &embedder,
+            &store.notes_dir,
+            preparer.as_ref(),
+        )
+        .await?;
         tracing::info!(%stats, dir = %store.notes_dir.display(), "initial index complete");
 
         held_locks.push(lock);
@@ -332,7 +341,7 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         });
     }
 
-    watch::run_watcher(open_stores, &embedder).await
+    watch::run_watcher(open_stores, &embedder, preparer).await
 }
 
 async fn run_reindex_command(
