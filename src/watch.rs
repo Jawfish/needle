@@ -277,6 +277,31 @@ mod tests {
         }
     }
 
+    struct FailingContentPreparer;
+
+    impl DocumentPreparer for FailingContentPreparer {
+        fn supports_path(&self, source_path: &Path) -> bool {
+            source_path
+                .extension()
+                .is_some_and(|extension| extension == "md")
+        }
+
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
+            anyhow::ensure!(source != b"broken", "test preparation failure");
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
+        }
+
+        fn profile(&self) -> &'static str {
+            "failing-content-v1"
+        }
+    }
+
     struct NotePreparer;
 
     impl DocumentPreparer for NotePreparer {
@@ -747,6 +772,54 @@ mod tests {
 
         assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
         assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn watcher_records_preparation_failure_and_clears_it_after_success() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "broken.md", "broken");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let embedder = embed::Embedder::create_null(1024);
+        let path = notes_dir.path().join("broken.md");
+
+        process_single_file(
+            &store.conn,
+            &store.fts,
+            &embedder,
+            notes_dir.path(),
+            &path,
+            &FailingContentPreparer,
+        )
+        .await;
+        assert!(
+            db::failed_file_hash(&store.conn, "broken.md")
+                .await
+                .expect("failure hash")
+                .is_some()
+        );
+
+        create_file(notes_dir.path(), "broken.md", "fixed");
+        process_single_file(
+            &store.conn,
+            &store.fts,
+            &embedder,
+            notes_dir.path(),
+            &path,
+            &FailingContentPreparer,
+        )
+        .await;
+        assert!(
+            db::failed_file_hash(&store.conn, "broken.md")
+                .await
+                .expect("failure hash")
+                .is_none()
+        );
+        assert!(
+            db::note_hash(&store.conn, "broken.md")
+                .await
+                .expect("note hash")
+                .is_some()
+        );
     }
 
     #[test]
