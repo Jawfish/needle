@@ -405,7 +405,8 @@ async fn open_search_adapters(
         out.push(server::SearchAdapter {
             semantic: db::DbSemanticSource::new(conn.clone()),
             fts: fts::FtsFtsSource::new(fts_index),
-            paths: db::DbPathSource::new(conn),
+            paths: db::DbPathSource::new(conn.clone()),
+            documents: db::DbDocumentChunksSource::new(conn),
         });
     }
     Ok(out)

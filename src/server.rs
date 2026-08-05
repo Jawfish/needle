@@ -1,17 +1,24 @@
-use std::{net::IpAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::IpAddr,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Context as _;
 use axum::{
     Router,
-    extract::{Query, State},
-    response::Html,
+    extract::{Query, RawQuery, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
 
 use crate::{
-    db::{DbPathSource, DbSemanticSource},
+    db::{DbDocumentChunksSource, DbPathSource, DbSemanticSource, DocumentChunksSource},
+    document::PreparedChunk,
     embed::Embedder,
     fts::FtsFtsSource,
     query::{self, SearchStorePorts},
@@ -20,12 +27,13 @@ use crate::{
 };
 
 const RESULT_LIMIT: usize = 20;
-const CSS: &str = "body{max-width:52rem;margin:2rem auto;padding:0 1rem;font-family:system-ui,sans-serif;color:#17202a;background:#fafafa}form{display:flex;gap:.5rem}input{flex:1;padding:.6rem;font:inherit}button{padding:.6rem 1rem;font:inherit}article{background:white;border:1px solid #d5d8dc;border-radius:.4rem;margin:1rem 0;padding:1rem}h1{margin-top:0}.path{font-family:monospace;overflow-wrap:anywhere}.locator{color:#52616b}.snippet{white-space:pre-wrap}.state{padding:1rem;background:#eef3f5;border-radius:.4rem}";
+const CSS: &str = "body{max-width:52rem;margin:2rem auto;padding:0 1rem;font-family:system-ui,sans-serif;color:#17202a;background:#fafafa}form{display:flex;gap:.5rem}input{flex:1;padding:.6rem;font:inherit}button{padding:.6rem 1rem;font:inherit}article{background:white;border:1px solid #d5d8dc;border-radius:.4rem;margin:1rem 0;padding:1rem}h1{margin-top:0}.path{font-family:monospace;overflow-wrap:anywhere}.locator{color:#52616b}.snippet{white-space:pre-wrap}.state{padding:1rem;background:#eef3f5;border-radius:.4rem}mark{background:#ffe082}";
 
 pub struct SearchAdapter {
     pub semantic: DbSemanticSource,
     pub fts: FtsFtsSource,
     pub paths: DbPathSource,
+    pub documents: DbDocumentChunksSource,
 }
 
 struct SearchStore {
@@ -33,6 +41,7 @@ struct SearchStore {
     semantic: Arc<dyn SemanticSource>,
     fts: Arc<dyn FtsSource>,
     paths: Arc<dyn PathSource>,
+    documents: Arc<dyn DocumentChunksSource>,
 }
 
 struct AppState {
@@ -65,10 +74,9 @@ pub async fn run(
         tracing::warn!("WARNING: unauthenticated indexed content is exposed at http://{address}");
     }
     tracing::info!("serving indexed documents at http://{address}");
-
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
-    let server = axum::Server::from_tcp(
+    axum::Server::from_tcp(
         listener
             .into_std()
             .context("preparing HTTP server listener")?,
@@ -78,8 +86,9 @@ pub async fn run(
         if shutdown.await.is_ok() {
             tracing::info!("shutting down");
         }
-    });
-    server.await.context("running HTTP server")
+    })
+    .await
+    .context("running HTTP server")
 }
 
 impl AppState {
@@ -97,6 +106,7 @@ impl AppState {
                 semantic: Arc::new(adapter.semantic),
                 fts: Arc::new(adapter.fts),
                 paths: Arc::new(adapter.paths),
+                documents: Arc::new(adapter.documents),
             })
             .collect();
         Self {
@@ -108,7 +118,10 @@ impl AppState {
 }
 
 fn router(state: Arc<AppState>) -> Router {
-    Router::new().route("/", get(home)).with_state(state)
+    Router::new()
+        .route("/", get(home))
+        .route("/document", get(document))
+        .with_state(state)
 }
 
 #[allow(clippy::option_if_let_else)]
@@ -118,10 +131,11 @@ async fn home(
 ) -> Html<String> {
     let query = params.q.unwrap_or_default();
     if query.trim().is_empty() {
-        let content = html! { p class="state" { "Search your indexed documents." } };
-        return Html(page(&query, &content));
+        return Html(page(
+            &query,
+            &html! { p class="state" { "Search your indexed documents." } },
+        ));
     }
-
     let ports: Vec<SearchStorePorts<'_>> = state
         .stores
         .iter()
@@ -146,19 +160,14 @@ async fn home(
             if results.is_empty() {
                 html! { p class="state" { "No indexed documents matched your search." } }
             } else {
-                html! {
-                    p { "Showing up to " (RESULT_LIMIT) " ranked results." }
-                    @for result in results {
-                        article {
-                            div class="path" { (result.path) }
-                            (result.locator.as_ref().map_or_else(
-                                || html! {},
-                                |locator| html! { div class="locator" { (locator) } },
-                            ))
+                html! { p { "Showing up to " (RESULT_LIMIT) " ranked results." } @for result in results {
+                    @if let Some((store, path)) = result_store(&state.stores, &result.path) {
+                        article { div class="path" { a href=(document_url(store, path, &query, result.locator.as_deref())) { (result.path) } }
+                            (result.locator.as_ref().map_or_else(|| html! {}, |locator| html! { div class="locator" { (locator) } }))
                             p class="snippet" { (result.snippet) }
                         }
                     }
-                }
+                }}
             }
         }
         Err(_) => {
@@ -168,40 +177,201 @@ async fn home(
     Html(page(&query, &content))
 }
 
-fn page(query: &str, content: &Markup) -> String {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Needle search" }
-                style { (PreEscaped(CSS)) }
-            }
-            body {
-                h1 { "Needle" }
-                form method="get" action="/" {
-                    label for="q" { "Search indexed documents" }
-                    input id="q" name="q" type="search" value=(query) autofocus;
-                    button type="submit" { "Search" }
-                }
-                (content)
-            }
+async fn document(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> Response {
+    let Ok(params) = parse_document_query(raw.as_deref()) else {
+        return error_page(StatusCode::BAD_REQUEST, "Invalid document request.", "");
+    };
+    let Some(store) = state.stores.get(params.store) else {
+        return error_page(StatusCode::NOT_FOUND, "Document not found.", &params.query);
+    };
+    match store.documents.document_chunks(&params.path).await {
+        Ok(Some(chunks)) => Html(document_page(
+            &params.path,
+            &params.query,
+            params.locator.as_deref(),
+            &chunks,
+        ))
+        .into_response(),
+        Ok(None) => error_page(StatusCode::NOT_FOUND, "Document not found.", &params.query),
+        Err(error) => {
+            tracing::error!(%error, "reading indexed document failed");
+            error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Document is temporarily unavailable.",
+                &params.query,
+            )
         }
     }
-    .into_string()
+}
+
+struct DocumentParams {
+    store: usize,
+    path: String,
+    query: String,
+    locator: Option<String>,
+}
+
+fn parse_document_query(raw: Option<&str>) -> Result<DocumentParams, ()> {
+    let mut store = None;
+    let mut path = None;
+    let mut query = None;
+    let mut locator = None;
+    for pair in raw.unwrap_or_default().split('&') {
+        let (key, value) = pair.split_once('=').ok_or(())?;
+        let key = decode_query(key)?;
+        let value = decode_query(value)?;
+        match key.as_str() {
+            "store" if store.is_none() => store = Some(value.parse().map_err(|_| ())?),
+            "path" if path.is_none() => path = Some(value),
+            "q" if query.is_none() => query = Some(value),
+            "locator" if locator.is_none() => locator = Some(value),
+            _ => return Err(()),
+        }
+    }
+    let path = path.ok_or(())?;
+    if !is_clean_relative_path(&path) {
+        return Err(());
+    }
+    Ok(DocumentParams {
+        store: store.ok_or(())?,
+        path,
+        query: query.unwrap_or_default(),
+        locator,
+    })
+}
+
+fn decode_query(value: &str) -> Result<String, ()> {
+    if value.as_bytes().windows(1).enumerate().any(|(i, byte)| {
+        byte == b"%"
+            && (i + 2 >= value.len()
+                || !value.as_bytes()[i + 1].is_ascii_hexdigit()
+                || !value.as_bytes()[i + 2].is_ascii_hexdigit())
+    }) {
+        return Err(());
+    }
+    percent_decode_str(&value.replace('+', " "))
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| ())
+}
+
+fn is_clean_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\0')
+        && Path::new(path)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+
+fn result_store<'a>(stores: &[SearchStore], path: &'a str) -> Option<(usize, &'a str)> {
+    if stores.len() == 1 {
+        return Some((0, path));
+    }
+    stores.iter().enumerate().find_map(|(id, store)| {
+        Path::new(path)
+            .strip_prefix(&store.notes_dir)
+            .ok()
+            .and_then(|relative| relative.to_str())
+            .map(|relative| (id, relative))
+    })
+}
+
+fn document_url(store: usize, path: &str, query: &str, locator: Option<&str>) -> String {
+    let mut url = format!(
+        "/document?store={store}&path={}&q={}",
+        encode(path),
+        encode(query)
+    );
+    if let Some(locator) = locator {
+        url.push_str("&locator=");
+        url.push_str(&encode(locator));
+    }
+    url.push_str("#match");
+    url
+}
+
+fn encode(value: &str) -> String {
+    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+}
+
+fn document_page(
+    path: &str,
+    query: &str,
+    locator: Option<&str>,
+    chunks: &[PreparedChunk],
+) -> String {
+    let matched = locator
+        .and_then(|needle| {
+            chunks
+                .iter()
+                .position(|chunk| chunk.locator.as_deref() == Some(needle))
+        })
+        .or_else(|| {
+            chunks
+                .iter()
+                .position(|chunk| contains_term(&chunk.content, query))
+        });
+    let content = html! { p { a href=(format!("/?q={}", encode(query))) { "Back to results" } } h2 class="path" { (path) }
+        @if chunks.is_empty() { p class="state" { "This indexed document has no chunks." } }
+        @for (index, chunk) in chunks.iter().enumerate() { article id=[if Some(index) == matched { Some("match") } else { None }] {
+            (chunk.locator.as_ref().map_or_else(|| html! {}, |locator| html! { div class="locator" { (locator) } }))
+            p class="snippet" { (highlight(&chunk.content, query)) }
+        }}
+    };
+    page(query, &content)
+}
+
+fn terms(query: &str) -> Vec<&str> {
+    let mut terms: Vec<&str> = query.split_whitespace().collect();
+    terms.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    terms.dedup();
+    terms
+}
+
+fn contains_term(content: &str, query: &str) -> bool {
+    terms(query).iter().any(|term| content.contains(term))
+}
+
+fn highlight(content: &str, query: &str) -> Markup {
+    let terms = terms(query);
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    while offset < content.len() {
+        if let Some(term) = terms
+            .iter()
+            .find(|term| content[offset..].starts_with(**term))
+        {
+            parts.push((true, &content[offset..offset + term.len()]));
+            offset += term.len();
+        } else {
+            let width = content[offset..].chars().next().map_or(0, char::len_utf8);
+            parts.push((false, &content[offset..offset + width]));
+            offset += width;
+        }
+    }
+    html! { @for (is_match, part) in parts { @if is_match { mark { (part) } } @else { (part) } } }
+}
+
+fn error_page(status: StatusCode, message: &str, query: &str) -> Response {
+    (
+        status,
+        Html(page(query, &html! { p class="state" { (message) } })),
+    )
+        .into_response()
+}
+
+fn page(query: &str, content: &Markup) -> String {
+    html! { (DOCTYPE) html lang="en" { head { meta charset="utf-8"; meta name="viewport" content="width=device-width, initial-scale=1"; title { "Needle search" } style { (PreEscaped(CSS)) } } body { h1 { "Needle" } form method="get" action="/" { label for="q" { "Search indexed documents" } input id="q" name="q" type="search" value=(query) autofocus; button type="submit" { "Search" } } (content) } } }.into_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use axum::{body::Body, http::Request};
-    use hyper::body::to_bytes;
-    use tower::ServiceExt;
-
     use super::*;
     use crate::rank::{Candidate, SearchFuture};
+    use axum::{body::Body, http::Request};
+    use hyper::body::to_bytes;
+    use std::{collections::HashMap, path::PathBuf};
+    use tower::ServiceExt;
 
     struct FakeSemantic;
     impl SemanticSource for FakeSemantic {
@@ -213,7 +383,6 @@ mod tests {
             Box::pin(async { Ok(vec![]) })
         }
     }
-
     struct FakeFts {
         results: Vec<Candidate>,
         fails: bool,
@@ -235,7 +404,6 @@ mod tests {
             })
         }
     }
-
     struct FakePaths(Vec<String>);
     impl PathSource for FakePaths {
         fn all_paths(&self) -> SearchFuture<'_, Vec<String>> {
@@ -243,7 +411,25 @@ mod tests {
             Box::pin(async move { Ok(paths) })
         }
     }
-
+    struct FakeDocuments {
+        documents: HashMap<String, Vec<PreparedChunk>>,
+        fails: bool,
+    }
+    impl DocumentChunksSource for FakeDocuments {
+        fn document_chunks<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> SearchFuture<'a, Option<Vec<PreparedChunk>>> {
+            let result = self.documents.get(path).cloned();
+            let fails = self.fails;
+            Box::pin(async move {
+                if fails {
+                    anyhow::bail!("secret /database/path");
+                }
+                Ok(result)
+            })
+        }
+    }
     fn copy_candidate(candidate: &Candidate) -> Candidate {
         Candidate {
             path: candidate.path.clone(),
@@ -251,7 +437,6 @@ mod tests {
             locator: candidate.locator.clone(),
         }
     }
-
     fn candidate(path: &str) -> Candidate {
         Candidate {
             path: path.to_owned(),
@@ -259,15 +444,22 @@ mod tests {
             locator: Some(format!("locator {path}")),
         }
     }
+    type FakeStore = (
+        PathBuf,
+        Vec<Candidate>,
+        HashMap<String, Vec<PreparedChunk>>,
+        bool,
+    );
 
-    fn app(stores: Vec<(PathBuf, Vec<Candidate>, bool)>) -> Router {
+    fn app(stores: Vec<FakeStore>) -> Router {
         let stores = stores
             .into_iter()
-            .map(|(notes_dir, results, fails)| SearchStore {
+            .map(|(notes_dir, results, documents, fails)| SearchStore {
                 paths: Arc::new(FakePaths(results.iter().map(|r| r.path.clone()).collect())),
                 notes_dir,
                 semantic: Arc::new(FakeSemantic),
                 fts: Arc::new(FakeFts { results, fails }),
+                documents: Arc::new(FakeDocuments { documents, fails }),
             })
             .collect();
         router(Arc::new(AppState {
@@ -280,97 +472,165 @@ mod tests {
             },
         }))
     }
-
-    async fn get(app: Router, uri: &str) -> String {
+    async fn response(app: Router, uri: &str) -> (StatusCode, String) {
         let response = app
             .oneshot(Request::get(uri).body(Body::empty()).expect("request"))
             .await
             .expect("response");
-        String::from_utf8(to_bytes(response.into_body()).await.expect("body").to_vec())
-            .expect("utf8")
+        let status = response.status();
+        let body = String::from_utf8(to_bytes(response.into_body()).await.expect("body").to_vec())
+            .expect("utf8");
+        (status, body)
     }
-
-    #[tokio::test]
-    async fn empty_query_renders_home_state() {
-        let body = get(app(vec![]), "/?q=%20%20").await;
-        assert!(body.contains("Search your indexed documents."));
-    }
-
-    #[tokio::test]
-    async fn results_show_path_snippet_and_locator() {
-        let body = get(
-            app(vec![(
-                PathBuf::from("/notes"),
-                vec![candidate("note.md")],
-                false,
-            )]),
-            "/?q=note",
+    fn store(
+        path: &str,
+        results: Vec<Candidate>,
+        documents: &[(&str, Vec<PreparedChunk>)],
+    ) -> (
+        PathBuf,
+        Vec<Candidate>,
+        HashMap<String, Vec<PreparedChunk>>,
+        bool,
+    ) {
+        (
+            PathBuf::from(path),
+            results,
+            documents
+                .iter()
+                .map(|(path, chunks)| ((*path).to_owned(), chunks.clone()))
+                .collect(),
+            false,
         )
-        .await;
+    }
+
+    #[tokio::test]
+    async fn results_link_to_encoded_store_relative_documents() {
+        let body = response(
+            app(vec![store(
+                "/notes",
+                vec![candidate("nested/a & b.md")],
+                &[],
+            )]),
+            "/?q=a%20b",
+        )
+        .await
+        .1;
+        assert!(body.contains("href=\"/document?store=0&amp;path=nested%2Fa%20%26%20b%2Emd&amp;q=a%20b&amp;locator=locator%20nested%2Fa%20%26%20b%2Emd#match\""));
+    }
+    #[tokio::test]
+    async fn duplicate_relative_paths_have_isolated_document_views() {
+        let chunks_a = vec![PreparedChunk {
+            content: "alpha".to_owned(),
+            locator: Some("A".to_owned()),
+        }];
+        let chunks_b = vec![PreparedChunk {
+            content: "beta".to_owned(),
+            locator: Some("B".to_owned()),
+        }];
+        let application = app(vec![
+            store("/one", vec![candidate("note.md")], &[("note.md", chunks_a)]),
+            store("/two", vec![candidate("note.md")], &[("note.md", chunks_b)]),
+        ]);
+        let body = response(application.clone(), "/?q=note").await.1;
+        assert!(body.contains("store=0") && body.contains("store=1"));
         assert!(
-            body.contains("note.md")
-                && body.contains("snippet note.md")
-                && body.contains("locator note.md")
+            response(
+                application.clone(),
+                "/document?store=0&path=note.md&q=alpha"
+            )
+            .await
+            .1
+            .contains("alpha")
+        );
+        assert!(
+            response(application, "/document?store=1&path=note.md&q=beta")
+                .await
+                .1
+                .contains("beta")
         );
     }
-
     #[tokio::test]
-    async fn multiple_stores_keep_same_relative_paths_distinct() {
-        let body = get(
-            app(vec![
-                (PathBuf::from("/one"), vec![candidate("note.md")], false),
-                (PathBuf::from("/two"), vec![candidate("note.md")], false),
-            ]),
-            "/?q=note",
+    async fn document_escapes_and_highlights_literal_terms_at_locator() {
+        let chunks = vec![
+            PreparedChunk {
+                content: "<tag> a+b a+b".to_owned(),
+                locator: Some("<loc>".to_owned()),
+            },
+            PreparedChunk {
+                content: "later".to_owned(),
+                locator: None,
+            },
+        ];
+        let body = response(
+            app(vec![store("/notes", vec![], &[("note.md", chunks)])]),
+            "/document?store=0&path=note.md&q=a%2Bb&locator=%3Cloc%3E",
         )
-        .await;
-        assert!(body.contains("/one/note.md") && body.contains("/two/note.md"));
+        .await
+        .1;
+        assert!(
+            body.contains("id=\"match\"")
+                && body.contains("&lt;tag&gt; <mark>a+b</mark> <mark>a+b</mark>")
+                && body.contains("&lt;loc&gt;")
+        );
+        assert!(!body.contains("<tag>"));
     }
-
     #[tokio::test]
-    async fn results_are_limited_to_twenty() {
-        let results = (0..25)
-            .map(|i| candidate(&format!("note-{i}.md")))
-            .collect();
-        let body = get(
-            app(vec![(PathBuf::from("/notes"), results, false)]),
-            "/?q=note",
+    async fn document_uses_query_match_when_locator_is_absent() {
+        let chunks = vec![
+            PreparedChunk {
+                content: "first".to_owned(),
+                locator: None,
+            },
+            PreparedChunk {
+                content: "needle [x]".to_owned(),
+                locator: None,
+            },
+        ];
+        let body = response(
+            app(vec![store("/notes", vec![], &[("note.md", chunks)])]),
+            "/document?store=0&path=note.md&q=needle%20%5Bx%5D",
         )
-        .await;
-        assert_eq!(body.matches("class=\"path\"").count(), RESULT_LIMIT);
+        .await
+        .1;
+        assert_eq!(body.matches("id=\"match\"").count(), 1);
+        assert!(body.contains("<mark>needle</mark> <mark>[x]</mark>"));
     }
-
     #[tokio::test]
-    async fn no_match_and_failure_are_distinct_and_sanitized() {
-        let none = get(
-            app(vec![(PathBuf::from("/notes"), vec![], false)]),
-            "/?q=none",
-        )
-        .await;
-        let failed = get(
-            app(vec![(PathBuf::from("/notes"), vec![], true)]),
-            "/?q=fail",
-        )
-        .await;
-        assert!(none.contains("No indexed documents matched"));
-        assert!(failed.contains("Search is temporarily unavailable"));
-        assert!(!failed.contains("secret") && !failed.contains("/private/index"));
+    async fn malformed_and_missing_documents_are_safe_4xx() {
+        let application = app(vec![store("/notes", vec![], &[])]);
+        for uri in [
+            "/document?store=x&path=note.md",
+            "/document?store=0&path=../note.md",
+            "/document?store=0&path=%2Fetc%2Fpasswd",
+            "/document?store=3&path=note.md",
+            "/document?store=0&path=stale.md",
+        ] {
+            let (status, body) = response(application.clone(), uri).await;
+            assert!(status.is_client_error());
+            assert!(!body.contains("/database/path"));
+        }
     }
-
     #[tokio::test]
-    async fn dynamic_values_are_escaped() {
-        let unsafe_value = "<script>alert(1)</script>\"";
-        let result = Candidate {
-            path: unsafe_value.to_owned(),
-            snippet: unsafe_value.to_owned(),
-            locator: Some(unsafe_value.to_owned()),
-        };
-        let body = get(
-            app(vec![(PathBuf::from("/notes"), vec![result], false)]),
-            "/?q=%3Cscript%3Ealert%281%29%3C%2Fscript%3E%22",
-        )
-        .await;
-        assert!(!body.contains(unsafe_value));
-        assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;&quot;"));
+    async fn document_read_errors_are_sanitized() {
+        let application = app(vec![(
+            PathBuf::from("/notes"),
+            vec![],
+            HashMap::new(),
+            true,
+        )]);
+        let (status, body) = response(application, "/document?store=0&path=note.md").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("secret") && !body.contains("/database/path"));
+    }
+    #[tokio::test]
+    async fn search_failure_is_sanitized() {
+        let application = app(vec![(
+            PathBuf::from("/notes"),
+            vec![],
+            HashMap::new(),
+            true,
+        )]);
+        let body = response(application, "/?q=fail").await.1;
+        assert!(body.contains("Search is temporarily unavailable") && !body.contains("secret"));
     }
 }
