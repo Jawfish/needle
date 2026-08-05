@@ -29,9 +29,23 @@ use crate::{
     output::OutputMode,
 };
 
-fn is_dimension_mismatch(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<NeedleError>()
-        .is_some_and(|e| matches!(e, NeedleError::DimensionMismatch { .. }))
+fn requires_reindex(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NeedleError>().is_some_and(|e| {
+        matches!(
+            e,
+            NeedleError::DimensionMismatch { .. } | NeedleError::IndexProfileMismatch { .. }
+        )
+    })
+}
+
+fn index_profile(
+    embedder: &Embedder,
+    preparer: &dyn document::DocumentPreparer,
+) -> types::IndexProfile {
+    types::IndexProfile {
+        embedder: embedder.identity(),
+        preparer: preparer.profile().to_owned(),
+    }
 }
 
 /// Run a full reindex, recovering atomically when there is a dimension mismatch.
@@ -49,17 +63,20 @@ async fn run_reindex(
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
 ) -> anyhow::Result<index::IndexStats> {
-    let dim = embedder.dim();
+    let preparer = document::MarkdownPreparer;
+    let profile = index_profile(embedder, &preparer);
 
-    match db::connect(db_path, Some(dim)).await {
+    match db::connect_with_profile(db_path, &profile).await {
         Ok((_db, conn)) => {
             let fts = fts::FtsIndex::open_or_create(fts_dir)?;
-            let stats = index::index_directory(&conn, &fts, embedder, notes_dir).await?;
+            let stats =
+                index::index_directory_with_preparer(&conn, &fts, embedder, notes_dir, &preparer)
+                    .await?;
             Ok(stats)
         }
-        Err(ref e) if is_dimension_mismatch(e) => {
-            tracing::warn!("dimension mismatch detected; rebuilding index atomically");
-            reindex_via_temp(db_path, fts_dir, embedder, notes_dir, dim).await
+        Err(ref e) if requires_reindex(e) => {
+            tracing::warn!("index profile mismatch detected; rebuilding index atomically");
+            reindex_via_temp(db_path, fts_dir, embedder, notes_dir, &profile, &preparer).await
         }
         Err(e) => Err(e),
     }
@@ -70,7 +87,8 @@ async fn reindex_via_temp(
     fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
-    dim: usize,
+    profile: &types::IndexProfile,
+    preparer: &dyn document::DocumentPreparer,
 ) -> anyhow::Result<index::IndexStats> {
     let tmp_db_path = db_path.with_extension("reindex-tmp");
     let tmp_fts_dir = sibling_fts_dir(fts_dir, "reindex-tmp");
@@ -83,7 +101,15 @@ async fn reindex_via_temp(
 
     clean_temp_artifacts(&tmp_db_path, &tmp_fts_dir);
 
-    let result = build_index_in_temp(&tmp_db_path, &tmp_fts_dir, embedder, notes_dir, dim).await;
+    let result = build_index_in_temp(
+        &tmp_db_path,
+        &tmp_fts_dir,
+        embedder,
+        notes_dir,
+        profile,
+        preparer,
+    )
+    .await;
 
     match result {
         Ok(stats) => {
@@ -261,13 +287,14 @@ async fn build_index_in_temp(
     tmp_fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
-    dim: usize,
+    profile: &types::IndexProfile,
+    preparer: &dyn document::DocumentPreparer,
 ) -> anyhow::Result<index::IndexStats> {
     std::fs::create_dir_all(tmp_fts_dir)
         .with_context(|| format!("creating temp FTS dir {}", tmp_fts_dir.display()))?;
-    let (_tmp_db, tmp_conn) = db::connect(tmp_db_path, Some(dim)).await?;
+    let (_tmp_db, tmp_conn) = db::connect_with_profile(tmp_db_path, profile).await?;
     let tmp_fts = fts::FtsIndex::open_or_create(tmp_fts_dir)?;
-    index::index_directory(&tmp_conn, &tmp_fts, embedder, notes_dir).await
+    index::index_directory_with_preparer(&tmp_conn, &tmp_fts, embedder, notes_dir, preparer).await
 }
 
 #[tokio::main]
@@ -308,8 +335,8 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
 
 async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-    let dim = Some(embedder.dim());
     let preparer = std::sync::Arc::new(document::MarkdownPreparer);
+    let profile = index_profile(&embedder, preparer.as_ref());
 
     let mut open_stores: Vec<watch::OpenStore> = Vec::with_capacity(config.docs_dirs.len());
     // Locks are held for the watcher's lifetime and released on drop when
@@ -319,7 +346,7 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
 
     for store in &config.docs_dirs {
         let lock = lock::IndexLock::try_acquire(&store.db_path)?;
-        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        let (_db, conn) = db::connect_with_profile(&store.db_path, &profile).await?;
         let fts = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
 
         tracing::info!(dir = %store.notes_dir.display(), "initial indexing");
@@ -365,11 +392,14 @@ async fn run_reindex_command(
 
 async fn open_search_adapters(
     stores: &[config::DirectoryStore],
-    dim: Option<usize>,
+    profile: Option<&types::IndexProfile>,
 ) -> anyhow::Result<Vec<(db::DbSemanticSource, fts::FtsFtsSource, db::DbPathSource)>> {
     let mut out = Vec::with_capacity(stores.len());
     for store in stores {
-        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        let (_db, conn) = match profile {
+            Some(profile) => db::connect_with_profile(&store.db_path, profile).await?,
+            None => db::connect(&store.db_path, None).await?,
+        };
         let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
         out.push((
             db::DbSemanticSource::new(conn.clone()),
@@ -393,8 +423,9 @@ async fn run_search(
         &mut std::io::stdin().lock(),
         std::io::stdin().is_terminal(),
     )?;
-    let dim = embedder.map(Embedder::dim);
-    let adapters = open_search_adapters(&config.docs_dirs, dim).await?;
+    let preparer = document::MarkdownPreparer;
+    let profile = embedder.map(|embedder| index_profile(embedder, &preparer));
+    let adapters = open_search_adapters(&config.docs_dirs, profile.as_ref()).await?;
     let store_ports: Vec<query::SearchStorePorts<'_>> = config
         .docs_dirs
         .iter()
@@ -741,7 +772,7 @@ mod tests {
         let result = db::connect(&path, Some(1024)).await;
         assert!(result.is_err());
         assert!(
-            is_dimension_mismatch(&result.expect_err("should fail")),
+            requires_reindex(&result.expect_err("should fail")),
             "error must be DimensionMismatch"
         );
     }

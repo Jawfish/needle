@@ -8,7 +8,10 @@ use std::{sync::Arc, time::Duration};
 
 use serde::Deserialize;
 
-use crate::{error::NeedleError, types::EmbedConfig};
+use crate::{
+    error::NeedleError,
+    types::{EmbedConfig, EmbedderProfile},
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;
@@ -101,8 +104,10 @@ impl Embedder {
             }
             #[cfg(feature = "local")]
             ProviderKind::Local => {
-                let (model, dim) = local::init_model(config.model.as_deref())?;
-                Ok(Self::Local(local::LocalProvider::new(model, dim)))
+                let (model, model_name, dim) = local::init_model(config.model.as_deref())?;
+                Ok(Self::Local(local::LocalProvider::new(
+                    model, model_name, dim,
+                )))
             }
             #[cfg(not(feature = "local"))]
             ProviderKind::Local => Err(NeedleError::NoEmbeddingProvider.into()),
@@ -123,6 +128,41 @@ impl Embedder {
             #[cfg(test)]
             Self::Null { dim } => *dim,
         }
+    }
+
+    pub fn profile(&self) -> EmbedderProfile {
+        match self {
+            Self::Voyage(p) => EmbedderProfile {
+                provider: "voyage".to_owned(),
+                endpoint: None,
+                model: p.model().to_owned(),
+                dimension: p.dim(),
+            },
+            Self::OpenAi(p) => EmbedderProfile {
+                provider: "openai".to_owned(),
+                endpoint: Some(p.api_base().to_owned()),
+                model: p.model().to_owned(),
+                dimension: p.dim(),
+            },
+            #[cfg(feature = "local")]
+            Self::Local(p) => EmbedderProfile {
+                provider: "local".to_owned(),
+                endpoint: None,
+                model: p.model().to_owned(),
+                dimension: p.dim(),
+            },
+            #[cfg(test)]
+            Self::Null { dim } => EmbedderProfile {
+                provider: "test-null".to_owned(),
+                endpoint: None,
+                model: "test-null".to_owned(),
+                dimension: *dim,
+            },
+        }
+    }
+
+    pub fn identity(&self) -> EmbedderProfile {
+        self.profile()
     }
 
     pub async fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -294,6 +334,24 @@ mod tests {
     #[test]
     fn parse_provider_name_rejects_unknown() {
         assert!(parse_provider_name("gemini").is_err());
+    }
+
+    #[test]
+    fn openai_profile_resolves_defaults_and_normalizes_endpoint() {
+        let config = EmbedConfig {
+            provider: Some("openai".to_owned()),
+            model: None,
+            api_base: Some("https://example.test/v1///".to_owned()),
+            dim: Some(768),
+            voyage_api_key: None,
+            openai_api_key: None,
+            needle_api_key: None,
+        };
+        let profile = Embedder::from_config(&config).expect("embedder").profile();
+        assert_eq!(profile.provider, "openai");
+        assert_eq!(profile.endpoint.as_deref(), Some("https://example.test/v1"));
+        assert_eq!(profile.model, "text-embedding-3-small");
+        assert_eq!(profile.dimension, 768);
     }
 
     #[test]

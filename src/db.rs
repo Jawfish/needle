@@ -7,8 +7,10 @@ use anyhow::{Context, bail};
 use libsql::Connection;
 
 use crate::{
+    error::NeedleError,
     rank::{Candidate, PathSource, SemanticSource},
     similar::{AllChunkEmbeddingsSource, NoteEmbeddingsSource, RelatedResult, RelatedSearchSource},
+    types::IndexProfile,
 };
 
 const BYTES_PER_F32: usize = 4;
@@ -40,13 +42,32 @@ pub async fn connect(
     db_path: &Path,
     expected_dim: Option<usize>,
 ) -> anyhow::Result<(libsql::Database, Connection)> {
+    connect_inner(db_path, expected_dim, None).await
+}
+
+pub async fn connect_with_profile(
+    db_path: &Path,
+    profile: &IndexProfile,
+) -> anyhow::Result<(libsql::Database, Connection)> {
+    connect_inner(db_path, Some(profile.embedder.dimension), Some(profile)).await
+}
+
+async fn connect_inner(
+    db_path: &Path,
+    expected_dim: Option<usize>,
+    profile: Option<&IndexProfile>,
+) -> anyhow::Result<(libsql::Database, Connection)> {
     let db = libsql::Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
-    init_schema(&conn, expected_dim).await?;
+    init_schema(&conn, expected_dim, profile).await?;
     Ok((db, conn))
 }
 
-async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::Result<()> {
+async fn init_schema(
+    conn: &Connection,
+    expected_dim: Option<usize>,
+    profile: Option<&IndexProfile>,
+) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
@@ -60,6 +81,10 @@ async fn init_schema(conn: &Connection, expected_dim: Option<usize>) -> anyhow::
         );",
     )
     .await?;
+
+    if let Some(profile) = profile {
+        resolve_profile(conn, profile).await?;
+    }
 
     // When neither the caller nor stored metadata can supply a dimension (fresh DB
     // opened by a read-only command like `similar`) skip chunks infrastructure
@@ -140,6 +165,40 @@ async fn resolve_schema_dim(
         (None, Some(stored)) => Ok(Some(stored)),
         (None, None) => Ok(None),
     }
+}
+
+async fn resolve_profile(conn: &Connection, expected: &IndexProfile) -> anyhow::Result<()> {
+    let mut rows = conn
+        .query("SELECT value FROM metadata WHERE key = 'index_profile'", ())
+        .await?;
+    let Some(row) = rows.next().await? else {
+        if chunks_table_exists(conn).await? {
+            return Err(NeedleError::IndexProfileMismatch {
+                reason: "legacy index has no profile metadata".to_owned(),
+            }
+            .into());
+        }
+        let value = serde_json::to_string(expected)?;
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('index_profile', ?1)",
+            [value],
+        )
+        .await?;
+        return Ok(());
+    };
+    let value: String = row.get(0)?;
+    let stored: IndexProfile =
+        serde_json::from_str(&value).map_err(|e| NeedleError::IndexProfileMismatch {
+            reason: format!("stored profile metadata is invalid: {e}"),
+        })?;
+    if stored != *expected {
+        return Err(NeedleError::IndexProfileMismatch {
+            reason: "stored profile differs from the configured embedder or document preparer"
+                .to_owned(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 async fn stored_dim(conn: &Connection) -> anyhow::Result<Option<usize>> {
@@ -564,6 +623,98 @@ mod tests {
 
     fn dummy_embedding() -> Vec<f32> {
         vec![0.0; TEST_DIM]
+    }
+
+    fn test_profile() -> IndexProfile {
+        IndexProfile {
+            embedder: crate::types::EmbedderProfile {
+                provider: "openai".to_owned(),
+                endpoint: Some("https://example.test/v1".to_owned()),
+                model: "model-a".to_owned(),
+                dimension: TEST_DIM,
+            },
+            preparer: "markdown-v1".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_open_persists_and_requires_an_exact_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let profile = test_profile();
+        let (_db, conn) = connect_with_profile(&path, &profile).await.expect("create");
+        let mut rows = conn
+            .query("SELECT value FROM metadata WHERE key = 'index_profile'", ())
+            .await
+            .expect("query");
+        let row = rows.next().await.expect("row").expect("profile row");
+        let stored: String = row.get(0).expect("value");
+        assert_eq!(stored, serde_json::to_string(&profile).expect("serialize"));
+        drop(conn);
+        connect_with_profile(&path, &profile)
+            .await
+            .expect("matching profile");
+    }
+
+    #[tokio::test]
+    async fn profile_open_rejects_legacy_and_all_identity_mismatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let profile = test_profile();
+        let (_db, _conn) = connect(&path, Some(TEST_DIM)).await.expect("legacy index");
+        let err = connect_with_profile(&path, &profile)
+            .await
+            .expect_err("legacy rejected");
+        assert!(matches!(
+            err.downcast_ref::<NeedleError>(),
+            Some(NeedleError::IndexProfileMismatch { .. })
+        ));
+
+        std::fs::remove_file(&path).expect("remove legacy");
+        let (_db, _conn) = connect_with_profile(&path, &profile).await.expect("create");
+        for changed in [
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    provider: "voyage".to_owned(),
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    model: "model-b".to_owned(),
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    endpoint: Some("https://other.test/v1".to_owned()),
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: crate::types::EmbedderProfile {
+                    dimension: 384,
+                    ..profile.embedder.clone()
+                },
+                preparer: profile.preparer.clone(),
+            },
+            IndexProfile {
+                embedder: profile.embedder.clone(),
+                preparer: "other-v1".to_owned(),
+            },
+        ] {
+            let err = connect_with_profile(&path, &changed)
+                .await
+                .expect_err("mismatch rejected");
+            assert!(matches!(
+                err.downcast_ref::<NeedleError>(),
+                Some(NeedleError::IndexProfileMismatch { .. })
+                    | Some(NeedleError::DimensionMismatch { .. })
+            ));
+        }
     }
 
     fn make_chunks(texts: &[&str]) -> Vec<(String, Vec<f32>)> {

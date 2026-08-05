@@ -69,6 +69,14 @@ impl OpenAiProvider {
         self.dim
     }
 
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub async fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let mut all = Vec::with_capacity(texts.len());
         for batch in texts.chunks(MAX_BATCH_SIZE) {
