@@ -6,6 +6,9 @@ mod local;
 
 use std::{sync::Arc, time::Duration};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde::Deserialize;
 
 use crate::{
@@ -68,6 +71,12 @@ pub enum Embedder {
     Null {
         dim: usize,
     },
+    #[cfg(test)]
+    Test {
+        dim: usize,
+        calls: Arc<AtomicUsize>,
+        fails: bool,
+    },
 }
 
 impl Embedder {
@@ -119,6 +128,19 @@ impl Embedder {
         Self::Null { dim }
     }
 
+    #[cfg(test)]
+    pub fn create_counting(dim: usize, fails: bool) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self::Test {
+                dim,
+                calls: Arc::clone(&calls),
+                fails,
+            },
+            calls,
+        )
+    }
+
     pub const fn dim(&self) -> usize {
         match self {
             Self::Voyage(p) => p.dim(),
@@ -126,7 +148,7 @@ impl Embedder {
             #[cfg(feature = "local")]
             Self::Local(p) => p.dim(),
             #[cfg(test)]
-            Self::Null { dim } => *dim,
+            Self::Null { dim } | Self::Test { dim, .. } => *dim,
         }
     }
 
@@ -152,7 +174,7 @@ impl Embedder {
                 dimension: p.dim(),
             },
             #[cfg(test)]
-            Self::Null { dim } => EmbedderProfile {
+            Self::Null { dim } | Self::Test { dim, .. } => EmbedderProfile {
                 provider: "test-null".to_owned(),
                 endpoint: None,
                 model: "test-null".to_owned(),
@@ -173,6 +195,12 @@ impl Embedder {
             Self::Local(p) => p.embed_documents(texts).await,
             #[cfg(test)]
             Self::Null { dim } => Ok(texts.iter().map(|_| vec![0.0; *dim]).collect()),
+            #[cfg(test)]
+            Self::Test { dim, calls, fails } => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::ensure!(!fails, "test embedding failure");
+                Ok(texts.iter().map(|_| vec![0.0; *dim]).collect())
+            }
         }
     }
 
@@ -184,6 +212,12 @@ impl Embedder {
             Self::Local(p) => p.embed_query(query).await,
             #[cfg(test)]
             Self::Null { dim } => Ok(vec![0.0; *dim]),
+            #[cfg(test)]
+            Self::Test { dim, calls, fails } => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::ensure!(!fails, "test embedding failure");
+                Ok(vec![0.0; *dim])
+            }
         }
     }
 }

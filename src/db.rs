@@ -323,11 +323,43 @@ pub async fn upsert_note(
 }
 
 pub async fn delete_note(conn: &Connection, path: &str) -> anyhow::Result<()> {
+    apply_directory_changes(conn, &[path.to_owned()], &[]).await
+}
+
+pub async fn apply_directory_changes(
+    conn: &Connection,
+    deleted_paths: &[String],
+    upserts: &[(String, String, Vec<(String, Vec<f32>)>)],
+) -> anyhow::Result<()> {
     let tx = conn.transaction().await?;
-    tx.execute("DELETE FROM chunks WHERE path = ?1", [path])
+
+    for path in deleted_paths {
+        tx.execute("DELETE FROM chunks WHERE path = ?1", [path.as_str()])
+            .await?;
+        tx.execute("DELETE FROM notes WHERE path = ?1", [path.as_str()])
+            .await?;
+    }
+
+    for (path, hash, chunks) in upserts {
+        tx.execute("DELETE FROM chunks WHERE path = ?1", [path.as_str()])
+            .await?;
+        tx.execute(
+            "INSERT OR REPLACE INTO notes (path, content_hash, updated_at) VALUES (?1, ?2, unixepoch())",
+            [path.as_str(), hash.as_str()],
+        )
         .await?;
-    tx.execute("DELETE FROM notes WHERE path = ?1", [path])
-        .await?;
+
+        for (i, (content, embedding)) in chunks.iter().enumerate() {
+            let embedding_json = serde_json::to_string(embedding)?;
+            let chunk_index = i64::try_from(i).context("chunk index exceeds i64 range")?;
+            tx.execute(
+                "INSERT INTO chunks (path, chunk_index, content, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
+                libsql::params![path.as_str(), chunk_index, content.as_str(), embedding_json],
+            )
+            .await?;
+        }
+    }
+
     tx.commit().await?;
     Ok(())
 }

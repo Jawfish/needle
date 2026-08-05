@@ -226,10 +226,35 @@ async fn process_batch(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::*;
     use crate::{db, embed, fts::FtsIndex};
+
+    struct CountingMarkdownPreparer(Arc<AtomicUsize>);
+
+    impl DocumentPreparer for CountingMarkdownPreparer {
+        fn supports_path(&self, source_path: &Path) -> bool {
+            source_path
+                .extension()
+                .is_some_and(|extension| extension == "md")
+        }
+
+        fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![std::str::from_utf8(source)?.to_owned()])
+        }
+
+        fn profile(&self) -> &'static str {
+            "counting-markdown-v1"
+        }
+    }
 
     struct NotePreparer;
 
@@ -560,6 +585,25 @@ mod tests {
             .expect("hash")
             .expect("should exist");
         assert_eq!(hash_before, hash_after);
+    }
+
+    #[tokio::test]
+    async fn watcher_unchanged_file_does_not_prepare_or_embed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "same");
+        let (_db_dir, _db, conn, _fts_dir, fts, _) = test_setup(notes_dir.path()).await;
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let preparer = CountingMarkdownPreparer(Arc::clone(&prepare_calls));
+        let initial = embed::Embedder::create_null(1024);
+        let path = notes_dir.path().join("note.md");
+
+        process_single_file(&conn, &fts, &initial, notes_dir.path(), &path, &preparer).await;
+        prepare_calls.store(0, Ordering::SeqCst);
+        let (embedder, embed_calls) = embed::Embedder::create_counting(1024, false);
+        process_single_file(&conn, &fts, &embedder, notes_dir.path(), &path, &preparer).await;
+
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -50,6 +50,12 @@ pub struct DirectoryIndexPlan {
     pub unchanged_count: usize,
 }
 
+struct SourceFile {
+    abs_path: std::path::PathBuf,
+    content_hash: String,
+    source: Vec<u8>,
+}
+
 pub enum SingleFilePlan {
     Unchanged,
     NeedsIndex {
@@ -126,24 +132,21 @@ pub async fn execute_directory_plan(
 ) -> anyhow::Result<IndexStats> {
     let added_count = plan.to_add.len();
     let updated_count = plan.to_update.len();
+    let to_embed: Vec<&FileToIndex> = plan.to_add.iter().chain(plan.to_update.iter()).collect();
+    let upserts = embed_files(embedder, &to_embed).await?;
+
+    db::apply_directory_changes(conn, &plan.to_delete, &upserts).await?;
 
     for path in &plan.to_delete {
-        db::delete_note(conn, path).await?;
         tracing::info!(path, "deleted from index");
     }
-
-    let to_embed: Vec<&FileToIndex> = plan.to_add.iter().chain(plan.to_update.iter()).collect();
-
-    let embed_result = if to_embed.is_empty() {
-        Ok(())
-    } else {
-        embed_and_upsert(conn, embedder, &to_embed).await
-    };
+    for file in &to_embed {
+        let action = if file.is_new { "indexed" } else { "updated" };
+        tracing::info!(path = file.rel_path, action);
+    }
 
     let all_chunks = db::all_chunks(conn).await?;
     fts.rebuild(all_chunks).await?;
-
-    embed_result?;
 
     Ok(IndexStats {
         added: added_count,
@@ -168,6 +171,12 @@ pub async fn execute_single_file_plan(
         } => {
             let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
             let embeddings = embedder.embed_documents(&chunk_refs).await?;
+            anyhow::ensure!(
+                embeddings.len() == chunks.len(),
+                "embedder returned {} embeddings for {} chunks",
+                embeddings.len(),
+                chunks.len()
+            );
             let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
             db::upsert_note(conn, &rel_path, &content_hash, &paired).await?;
 
@@ -209,7 +218,27 @@ pub async fn index_directory_with_preparer(
     preparer: &dyn DocumentPreparer,
 ) -> anyhow::Result<IndexStats> {
     let existing_hashes = db::all_note_hashes(conn).await?;
-    let disk_files = read_disk_hashes(notes_dir, preparer).await?;
+    let source_files = read_disk_sources(notes_dir, preparer).await?;
+    let mut disk_files = HashMap::with_capacity(source_files.len());
+    for (rel_path, source_file) in source_files {
+        if existing_hashes.get(&rel_path) == Some(&source_file.content_hash) {
+            disk_files.insert(
+                rel_path,
+                DiskFile {
+                    content_hash: source_file.content_hash,
+                    chunks: Vec::new(),
+                },
+            );
+            continue;
+        }
+        disk_files.insert(
+            rel_path,
+            DiskFile {
+                content_hash: source_file.content_hash,
+                chunks: preparer.prepare(&source_file.abs_path, &source_file.source)?,
+            },
+        );
+    }
     let plan = plan_directory_index(&existing_hashes, &disk_files);
     execute_directory_plan(conn, fts, embedder, plan).await
 }
@@ -232,42 +261,47 @@ pub async fn index_single_file_with_preparer(
     );
     let source = tokio::fs::read(abs_path).await?;
     let stored_hash = db::note_hash(conn, &rel_path).await?;
+    let content_hash = hash::content_hash_bytes(&source);
+    if stored_hash.as_deref() == Some(content_hash.as_str()) {
+        return execute_single_file_plan(conn, fts, embedder, SingleFilePlan::Unchanged).await;
+    }
     let plan = plan_single_file(
         rel_path,
         stored_hash.as_deref(),
-        hash::content_hash_bytes(&source),
+        content_hash,
         preparer.prepare(abs_path, &source)?,
     );
     execute_single_file_plan(conn, fts, embedder, plan).await
 }
 
-async fn read_disk_hashes(
+async fn read_disk_sources(
     dir: &Path,
     preparer: &dyn DocumentPreparer,
-) -> anyhow::Result<HashMap<String, DiskFile>> {
+) -> anyhow::Result<HashMap<String, SourceFile>> {
     let files = collect_supported_files(dir, preparer)?;
     let mut out = HashMap::with_capacity(files.len());
     for (rel_path, abs_path) in files {
         let source = tokio::fs::read(&abs_path).await?;
         out.insert(
             rel_path,
-            DiskFile {
+            SourceFile {
+                abs_path,
                 content_hash: hash::content_hash_bytes(&source),
-                chunks: preparer.prepare(&abs_path, &source)?,
+                source,
             },
         );
     }
     Ok(out)
 }
 
-async fn embed_and_upsert(
-    conn: &Connection,
+async fn embed_files(
     embedder: &Embedder,
     files: &[&FileToIndex],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, String, Vec<(String, Vec<f32>)>)>> {
     let total_chunks: usize = files.iter().map(|f| f.chunks.len()).sum();
     tracing::info!(files = files.len(), chunks = total_chunks, "embedding");
 
+    let mut upserts = Vec::with_capacity(files.len());
     for batch in files.chunks(FILE_BATCH_SIZE) {
         let batch_texts: Vec<&str> = batch
             .iter()
@@ -275,6 +309,12 @@ async fn embed_and_upsert(
             .collect();
 
         let batch_embeddings = embedder.embed_documents(&batch_texts).await?;
+        anyhow::ensure!(
+            batch_embeddings.len() == batch_texts.len(),
+            "embedder returned {} embeddings for {} chunks",
+            batch_embeddings.len(),
+            batch_texts.len()
+        );
 
         let mut offset = 0;
         for file in batch {
@@ -293,14 +333,11 @@ async fn embed_and_upsert(
 
             offset += file.chunks.len();
 
-            db::upsert_note(conn, &file.rel_path, &file.content_hash, &paired).await?;
-
-            let action = if file.is_new { "indexed" } else { "updated" };
-            tracing::info!(path = file.rel_path, action);
+            upserts.push((file.rel_path.clone(), file.content_hash.clone(), paired));
         }
     }
 
-    Ok(())
+    Ok(upserts)
 }
 
 pub fn is_in_hidden_dir(path: &Path, root: &Path) -> bool {
@@ -360,6 +397,11 @@ fn collect_recursive(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use crate::embed;
 
@@ -369,6 +411,19 @@ mod tests {
             std::fs::create_dir_all(parent).expect("failed to create parent dirs");
         }
         std::fs::write(&path, content).expect("failed to write file");
+    }
+
+    async fn assert_old_note_content(conn: &Connection) {
+        assert_eq!(
+            db::all_chunks(conn)
+                .await
+                .expect("chunks")
+                .into_iter()
+                .find(|(path, _)| path == "note.md")
+                .expect("note chunk")
+                .1,
+            "before"
+        );
     }
 
     fn disk_files_from(entries: &[(&str, &str)]) -> HashMap<String, DiskFile> {
@@ -389,6 +444,29 @@ mod tests {
     fn assert_file_to_index(f: &FileToIndex, rel_path: &str, is_new: bool) {
         assert_eq!(f.rel_path, rel_path);
         assert_eq!(f.is_new, is_new);
+    }
+
+    struct CountingPreparer {
+        calls: Arc<AtomicUsize>,
+        fails: bool,
+    }
+
+    impl DocumentPreparer for CountingPreparer {
+        fn supports_path(&self, source_path: &Path) -> bool {
+            source_path
+                .extension()
+                .is_some_and(|extension| extension == "md")
+        }
+
+        fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!self.fails, "test preparation failure");
+            Ok(vec![std::str::from_utf8(source)?.to_owned()])
+        }
+
+        fn profile(&self) -> &'static str {
+            "counting-v1"
+        }
     }
 
     struct NotePreparer;
@@ -721,6 +799,139 @@ mod tests {
         assert!(!is_in_hidden_dir(Path::new("/notes/.dotfile.md"), root));
         assert!(is_in_hidden_dir(Path::new("/notes/.hidden/note.md"), root));
         assert!(is_in_hidden_dir(Path::new("/notes/sub/.git/note.md"), root));
+    }
+
+    #[tokio::test]
+    async fn directory_reindex_prepares_and_embeds_only_changed_files() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "keep.md", "keep");
+        create_file(notes_dir.path(), "change.md", "before");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let preparer = CountingPreparer {
+            calls: Arc::clone(&prepare_calls),
+            fails: false,
+        };
+        let (embedder, embed_calls) = Embedder::create_counting(1024, false);
+
+        index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &preparer)
+            .await
+            .expect("first index");
+        index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &preparer)
+            .await
+            .expect("unchanged index");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 1);
+
+        create_file(notes_dir.path(), "change.md", "after");
+        index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &preparer)
+            .await
+            .expect("changed index");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 2);
+
+        std::fs::remove_file(notes_dir.path().join("change.md")).expect("remove");
+        index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &preparer)
+            .await
+            .expect("delete index");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            !db::all_note_hashes(&conn)
+                .await
+                .expect("hashes")
+                .contains_key("change.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_or_embedding_preserves_existing_note() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "before");
+        create_file(notes_dir.path(), "gone.md", "gone");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let initial = CountingPreparer {
+            calls: initial_calls,
+            fails: false,
+        };
+        index_directory_with_preparer(
+            &conn,
+            &fts,
+            &Embedder::create_null(1024),
+            notes_dir.path(),
+            &initial,
+        )
+        .await
+        .expect("initial index");
+        let old_hash = db::note_hash(&conn, "note.md").await.expect("hash");
+
+        create_file(notes_dir.path(), "note.md", "after");
+        std::fs::remove_file(notes_dir.path().join("gone.md")).expect("remove");
+        let failed_preparer = CountingPreparer {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fails: true,
+        };
+        assert!(
+            index_directory_with_preparer(
+                &conn,
+                &fts,
+                &Embedder::create_null(1024),
+                notes_dir.path(),
+                &failed_preparer,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db::note_hash(&conn, "note.md").await.expect("hash"),
+            old_hash
+        );
+        assert_old_note_content(&conn).await;
+        assert!(
+            db::note_hash(&conn, "gone.md")
+                .await
+                .expect("hash")
+                .is_some()
+        );
+
+        let working_preparer = CountingPreparer {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fails: false,
+        };
+        let (failing_embedder, _) = Embedder::create_counting(1024, true);
+        assert!(
+            index_directory_with_preparer(
+                &conn,
+                &fts,
+                &failing_embedder,
+                notes_dir.path(),
+                &working_preparer,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db::note_hash(&conn, "note.md").await.expect("hash"),
+            old_hash
+        );
+        assert_old_note_content(&conn).await;
+        assert!(
+            db::note_hash(&conn, "gone.md")
+                .await
+                .expect("hash")
+                .is_some()
+        );
     }
 
     #[test]
