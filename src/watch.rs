@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 
 #[cfg(test)]
 use crate::document::DefaultPreparer;
+#[cfg(test)]
+use crate::document::PreparedChunk;
 use crate::{db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, index};
 
 const DEBOUNCE_MS: u64 = 500;
@@ -259,9 +261,15 @@ mod tests {
                 .is_some_and(|extension| extension == "md")
         }
 
-        fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![std::str::from_utf8(source)?.to_owned()])
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
         }
 
         fn profile(&self) -> &'static str {
@@ -278,8 +286,14 @@ mod tests {
                 .is_some_and(|extension| extension == "note")
         }
 
-        fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
-            Ok(vec![std::str::from_utf8(source)?.to_owned()])
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
         }
 
         fn profile(&self) -> &'static str {

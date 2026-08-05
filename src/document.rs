@@ -6,9 +6,24 @@ use anyhow::Context;
 #[cfg(not(feature = "documents"))]
 const CHUNK_TARGET_CHARS: usize = 4000;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedChunk {
+    pub content: String,
+    pub locator: Option<String>,
+}
+
+impl From<String> for PreparedChunk {
+    fn from(content: String) -> Self {
+        Self {
+            content,
+            locator: None,
+        }
+    }
+}
+
 pub trait DocumentPreparer: Send + Sync {
     fn supports_path(&self, source_path: &Path) -> bool;
-    fn prepare(&self, source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>>;
+    fn prepare(&self, source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<PreparedChunk>>;
     fn profile(&self) -> &'static str;
 }
 
@@ -24,9 +39,15 @@ impl DocumentPreparer for MarkdownPreparer {
             .is_some_and(|extension| extension == "md")
     }
 
-    fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
+    fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<PreparedChunk>> {
         let content = std::str::from_utf8(source)?;
-        Ok(chunk_text(content))
+        Ok(chunk_text(content)
+            .into_iter()
+            .map(|content| PreparedChunk {
+                content,
+                locator: None,
+            })
+            .collect())
     }
 
     fn profile(&self) -> &'static str {
@@ -44,7 +65,7 @@ impl DocumentPreparer for XbergPreparer {
         mime_type(source_path).is_some()
     }
 
-    fn prepare(&self, source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
+    fn prepare(&self, source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<PreparedChunk>> {
         let mime_type = mime_type(source_path).expect("supported paths have a MIME type");
         let input = xberg::ExtractInput::from_bytes(
             source.to_vec(),
@@ -78,13 +99,49 @@ impl DocumentPreparer for XbergPreparer {
                     .chunks
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|chunk| chunk.content)
+                    .map(|chunk| PreparedChunk {
+                        locator: chunk_locator(&chunk),
+                        content: chunk.content,
+                    })
             })
             .collect())
     }
 
     fn profile(&self) -> &'static str {
-        "xberg-1.0.14-pdf-office-html-render-markdown-chunker-markdown-max-1000-overlap-200-trim-sizing-characters-heading-context-page-extraction-ocr-off-cache-off"
+        "xberg-1.0.14-pdf-office-html-render-markdown-chunker-markdown-max-1000-overlap-200-trim-sizing-characters-heading-context-page-extraction-locators-v1-ocr-off-cache-off"
+    }
+}
+
+#[cfg(feature = "documents")]
+fn chunk_locator(chunk: &xberg::types::Chunk) -> Option<String> {
+    let headings: Vec<&str> = if chunk.metadata.heading_path.is_empty() {
+        chunk
+            .metadata
+            .heading_context
+            .as_ref()
+            .map(|context| {
+                context
+                    .headings
+                    .iter()
+                    .map(|heading| heading.text.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        chunk
+            .metadata
+            .heading_path
+            .iter()
+            .map(String::as_str)
+            .collect()
+    };
+    if !headings.is_empty() {
+        return Some(headings.join(" > "));
+    }
+    match (chunk.metadata.first_page, chunk.metadata.last_page) {
+        (Some(first), Some(last)) if first == last => Some(format!("p. {first}")),
+        (Some(first), Some(last)) => Some(format!("p. {first}-{last}")),
+        _ => None,
     }
 }
 
@@ -230,7 +287,13 @@ mod tests {
         let chunks = MarkdownPreparer
             .prepare(Path::new("note.md"), source)
             .expect("prepare");
-        assert_eq!(chunks, vec!["# Heading\n\nBody text"]);
+        assert_eq!(
+            chunks,
+            vec![PreparedChunk {
+                content: "# Heading\n\nBody text".to_owned(),
+                locator: None,
+            }]
+        );
     }
 
     #[cfg(not(feature = "documents"))]
@@ -293,11 +356,84 @@ mod tests {
     #[test]
     fn xberg_preparer_extracts_markdown_with_heading_context() {
         let chunks = XbergPreparer
-            .prepare(Path::new("note.md"), b"# Heading\n\nBody text")
+            .prepare(
+                Path::new("note.md"),
+                b"# Heading\n\n## Details\n\nBody text",
+            )
             .expect("prepare");
         assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].contains("Heading"));
-        assert!(chunks[0].contains("Body text"));
+        assert!(chunks[0].content.contains("Heading"));
+        assert!(chunks[0].content.contains("Body text"));
+        assert_eq!(chunks[0].locator.as_deref(), Some("Heading"));
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn xberg_preparer_preserves_locators_for_structured_document_fixtures() {
+        for (path, source) in [
+            (
+                "fixture.epub",
+                include_bytes!("../tests/fixtures/documents/fixture.epub").as_slice(),
+            ),
+            (
+                "fixture.html",
+                include_bytes!("../tests/fixtures/documents/fixture.html").as_slice(),
+            ),
+            (
+                "fixture.docx",
+                include_bytes!("../tests/fixtures/documents/fixture.docx").as_slice(),
+            ),
+        ] {
+            let chunks = XbergPreparer.prepare(Path::new(path), source).expect(path);
+            assert!(
+                chunks.iter().any(|chunk| chunk.locator.is_some()),
+                "{path}: {chunks:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn xberg_preparer_uses_heading_locators_for_html() {
+        let chunks = XbergPreparer
+            .prepare(
+                Path::new("note.html"),
+                b"<h1>Introduction</h1><h2>Methods</h2><p>Body text</p>",
+            )
+            .expect("prepare");
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.locator.as_deref() == Some("Introduction")),
+            "{chunks:?}"
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn xberg_preparer_uses_page_locators_for_pdf_chunks() {
+        let chunks = XbergPreparer
+            .prepare(
+                Path::new("fixture.pdf"),
+                include_bytes!("../tests/fixtures/documents/fixture.pdf"),
+            )
+            .expect("prepare");
+        assert!(
+            chunks.iter().any(|chunk| chunk
+                .locator
+                .as_deref()
+                .is_some_and(|locator| locator.starts_with("p. "))),
+            "{chunks:?}"
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn xberg_preparer_uses_no_locator_for_plain_text() {
+        let chunks = XbergPreparer
+            .prepare(Path::new("note.txt"), b"Plain text without headings")
+            .expect("prepare");
+        assert!(chunks.iter().all(|chunk| chunk.locator.is_none()));
     }
 
     #[cfg(not(feature = "documents"))]

@@ -13,11 +13,14 @@ use tantivy::{
 };
 use tokio::sync::Mutex;
 
+use crate::document::PreparedChunk;
+
 const WRITER_HEAP_SIZE: usize = 50_000_000;
 
 pub struct FtsResult {
     pub path: String,
     pub snippet: String,
+    pub locator: Option<String>,
 }
 
 pub struct FtsIndex {
@@ -26,6 +29,7 @@ pub struct FtsIndex {
     writer: Arc<Mutex<Option<IndexWriter>>>,
     path_field: Field,
     content_field: Field,
+    locator_field: Field,
     #[cfg(test)]
     mutations: Arc<MutationState>,
 }
@@ -79,6 +83,7 @@ impl FtsIndex {
         let mut schema_builder = Schema::builder();
         let path_field = schema_builder.add_text_field("path", STRING | STORED);
         let content_field = schema_builder.add_text_field("content", content_options);
+        let locator_field = schema_builder.add_text_field("locator", STORED);
         let schema = schema_builder.build();
 
         let index = if index_dir.join("meta.json").exists() {
@@ -111,6 +116,7 @@ impl FtsIndex {
             writer: Arc::new(Mutex::new(None)),
             path_field,
             content_field,
+            locator_field,
             #[cfg(test)]
             mutations: Arc::new(MutationState {
                 count: AtomicUsize::new(0),
@@ -156,13 +162,17 @@ impl FtsIndex {
         Ok(())
     }
 
-    pub async fn upsert(&self, path: &str, chunks: &[String]) -> anyhow::Result<()> {
+    pub async fn upsert<T>(&self, path: &str, chunks: &[T]) -> anyhow::Result<()>
+    where
+        T: Clone + Into<PreparedChunk> + Sync,
+    {
         #[cfg(test)]
         self.before_mutation()?;
         let path_field = self.path_field;
         let content_field = self.content_field;
+        let locator_field = self.locator_field;
         let path_owned = path.to_owned();
-        let chunks_owned: Vec<String> = chunks.to_vec();
+        let chunks_owned: Vec<PreparedChunk> = chunks.iter().cloned().map(Into::into).collect();
         let writer = Arc::clone(&self.writer);
         let index = self.index.clone();
 
@@ -176,7 +186,10 @@ impl FtsIndex {
                 for chunk in &chunks_owned {
                     let mut doc = TantivyDocument::new();
                     doc.add_text(path_field, &path_owned);
-                    doc.add_text(content_field, chunk);
+                    doc.add_text(content_field, &chunk.content);
+                    if let Some(locator) = &chunk.locator {
+                        doc.add_text(locator_field, locator);
+                    }
                     w.add_document(doc)?;
                 }
 
@@ -218,6 +231,7 @@ impl FtsIndex {
         let reader = self.reader.clone();
         let content_field = self.content_field;
         let path_field = self.path_field;
+        let locator_field = self.locator_field;
         let query_owned = query.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -252,6 +266,11 @@ impl FtsIndex {
                     continue;
                 }
 
+                let locator = doc
+                    .get_first(locator_field)
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned);
+
                 let content = doc
                     .get_first(content_field)
                     .and_then(|v| v.as_str())
@@ -270,6 +289,7 @@ impl FtsIndex {
                 results.push(FtsResult {
                     path,
                     snippet: snippet_text,
+                    locator,
                 });
 
                 if results.len() >= limit {
@@ -282,12 +302,20 @@ impl FtsIndex {
         .await?
     }
 
-    pub async fn rebuild(&self, chunks: Vec<(String, String)>) -> anyhow::Result<()> {
+    pub async fn rebuild<T>(&self, chunks: Vec<(String, T)>) -> anyhow::Result<()>
+    where
+        T: Into<PreparedChunk>,
+    {
         #[cfg(test)]
         self.before_mutation()?;
 
         let path_field = self.path_field;
         let content_field = self.content_field;
+        let locator_field = self.locator_field;
+        let chunks: Vec<(String, PreparedChunk)> = chunks
+            .into_iter()
+            .map(|(path, chunk)| (path, chunk.into()))
+            .collect();
         let writer = Arc::clone(&self.writer);
         let index = self.index.clone();
 
@@ -297,10 +325,13 @@ impl FtsIndex {
             with_writer(&mut guard, &index, |w| {
                 w.delete_all_documents()?;
 
-                for (path, content) in &chunks {
+                for (path, chunk) in &chunks {
                     let mut doc = TantivyDocument::new();
                     doc.add_text(path_field, path);
-                    doc.add_text(content_field, content);
+                    doc.add_text(content_field, &chunk.content);
+                    if let Some(locator) = &chunk.locator {
+                        doc.add_text(locator_field, locator);
+                    }
                     w.add_document(doc)?;
                 }
 
@@ -338,6 +369,7 @@ impl crate::rank::FtsSource for FtsFtsSource {
                 .map(|r| crate::rank::Candidate {
                     path: r.path,
                     snippet: r.snippet,
+                    locator: r.locator,
                 })
                 .collect())
         })
@@ -368,6 +400,23 @@ mod tests {
             .await
             .expect("upsert failed");
         assert!(!index.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_returns_stored_locator() {
+        let (_dir, index) = temp_index();
+        index
+            .upsert(
+                "note.md",
+                &[PreparedChunk {
+                    content: "searchable content".to_owned(),
+                    locator: Some("p. 12-14".to_owned()),
+                }],
+            )
+            .await
+            .expect("upsert failed");
+        let results = index.search("searchable", 10).await.expect("search failed");
+        assert_eq!(results[0].locator.as_deref(), Some("p. 12-14"));
     }
 
     #[tokio::test]

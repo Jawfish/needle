@@ -158,6 +158,7 @@ mod tests {
             path: path.to_owned(),
             score,
             snippet: snippet.to_owned(),
+            locator: None,
         }
     }
 

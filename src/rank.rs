@@ -17,6 +17,7 @@ pub type SearchFuture<'a, T> =
 pub struct Candidate {
     pub path: String,
     pub snippet: String,
+    pub locator: Option<String>,
 }
 
 /// Port: produces semantic nearest-neighbour candidates for a query embedding.
@@ -43,6 +44,8 @@ pub struct FusedResult {
     pub path: String,
     pub score: f64,
     pub snippet: String,
+    #[serde(skip)]
+    pub locator: Option<String>,
 }
 
 pub async fn search(
@@ -80,7 +83,7 @@ pub async fn search(
         Vec::new()
     };
 
-    let mut scores: HashMap<String, (f64, String)> = HashMap::new();
+    let mut scores: HashMap<String, (f64, String, Option<String>)> = HashMap::new();
 
     accumulate_rrf(&mut scores, &semantic_candidates, weights.semantic);
     accumulate_rrf(&mut scores, &fts_candidates, weights.fts);
@@ -88,10 +91,11 @@ pub async fn search(
 
     let mut results: Vec<FusedResult> = scores
         .into_iter()
-        .map(|(path, (score, snippet))| FusedResult {
+        .map(|(path, (score, snippet, locator))| FusedResult {
             path,
             score,
             snippet,
+            locator,
         })
         .collect();
 
@@ -106,7 +110,7 @@ pub async fn search(
 }
 
 fn accumulate_rrf(
-    scores: &mut HashMap<String, (f64, String)>,
+    scores: &mut HashMap<String, (f64, String, Option<String>)>,
     candidates: &[Candidate],
     weight: f64,
 ) {
@@ -115,7 +119,7 @@ fn accumulate_rrf(
         let rrf_score = weight / (RRF_K + (rank as f64) + 1.0);
         let entry = scores
             .entry(item.path.clone())
-            .or_insert_with(|| (0.0, item.snippet.clone()));
+            .or_insert_with(|| (0.0, item.snippet.clone(), item.locator.clone()));
         entry.0 += rrf_score;
     }
 }
@@ -146,6 +150,7 @@ fn rank_by_filename(query: &str, paths: &[String]) -> Vec<Candidate> {
         .map(|(_, path)| Candidate {
             path: path.clone(),
             snippet: path.clone(),
+            locator: None,
         })
         .collect()
 }
@@ -160,6 +165,7 @@ mod tests {
             .map(|(p, s)| Candidate {
                 path: (*p).to_owned(),
                 snippet: (*s).to_owned(),
+                locator: None,
             })
             .collect()
     }

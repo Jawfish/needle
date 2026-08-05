@@ -12,7 +12,12 @@ pub fn merge_fused_results(per_store: Vec<Vec<FusedResult>>, limit: usize) -> Ve
         for result in results {
             accumulator
                 .entry(result.path.clone())
-                .and_modify(|existing| existing.score += result.score)
+                .and_modify(|existing| {
+                    existing.score += result.score;
+                    if existing.locator.is_none() {
+                        existing.locator.clone_from(&result.locator);
+                    }
+                })
                 .or_insert(result);
         }
     }
@@ -79,6 +84,7 @@ mod tests {
             path: path.to_owned(),
             score,
             snippet: String::new(),
+            locator: None,
         }
     }
 

@@ -138,6 +138,7 @@ mod tests {
                 .map(|c| Candidate {
                     path: c.path.clone(),
                     snippet: c.snippet.clone(),
+                    locator: c.locator.clone(),
                 })
                 .collect();
             Box::pin(async move { Ok(items) })
@@ -157,6 +158,7 @@ mod tests {
                 .map(|c| Candidate {
                     path: c.path.clone(),
                     snippet: c.snippet.clone(),
+                    locator: c.locator.clone(),
                 })
                 .collect();
             Box::pin(async move { Ok(items) })
@@ -175,6 +177,7 @@ mod tests {
         Candidate {
             path: path.to_owned(),
             snippet: path.to_owned(),
+            locator: None,
         }
     }
 

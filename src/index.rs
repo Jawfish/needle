@@ -3,7 +3,13 @@ use std::{collections::HashMap, path::Path};
 use anyhow::Context;
 use libsql::Connection;
 
-use crate::{db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, hash};
+use crate::{
+    db,
+    document::{DocumentPreparer, PreparedChunk},
+    embed::Embedder,
+    fts::FtsIndex,
+    hash,
+};
 
 #[derive(Debug)]
 pub struct IndexStats {
@@ -31,14 +37,14 @@ pub enum FtsStatus {
 #[derive(Debug, PartialEq, Eq)]
 pub struct DiskFile {
     pub content_hash: String,
-    pub chunks: Vec<String>,
+    pub chunks: Vec<PreparedChunk>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct FileToIndex {
     pub rel_path: String,
     pub content_hash: String,
-    pub chunks: Vec<String>,
+    pub chunks: Vec<PreparedChunk>,
     pub is_new: bool,
 }
 
@@ -61,7 +67,7 @@ pub enum SingleFilePlan {
     NeedsIndex {
         rel_path: String,
         content_hash: String,
-        chunks: Vec<String>,
+        chunks: Vec<PreparedChunk>,
     },
 }
 
@@ -111,7 +117,7 @@ pub fn plan_single_file(
     rel_path: String,
     stored_hash: Option<&str>,
     content_hash: String,
-    chunks: Vec<String>,
+    chunks: Vec<PreparedChunk>,
 ) -> SingleFilePlan {
     let file_hash = content_hash;
     if stored_hash.is_some_and(|h| h == file_hash) {
@@ -145,8 +151,9 @@ pub async fn execute_directory_plan(
                     .with_context(|| format!("failed to delete {path} from FTS"))?;
             }
             for (path, _, chunks) in &upserts {
-                let texts: Vec<String> = chunks.iter().map(|(text, _)| text.clone()).collect();
-                fts.upsert(path, &texts)
+                let prepared: Vec<PreparedChunk> =
+                    chunks.iter().map(|(chunk, _)| chunk.clone()).collect();
+                fts.upsert(path, &prepared)
                     .await
                     .with_context(|| format!("failed to upsert {path} into FTS"))?;
             }
@@ -202,7 +209,7 @@ pub async fn execute_single_file_plan(
             content_hash,
             chunks,
         } => {
-            let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+            let chunk_refs: Vec<&str> = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
             let embeddings = embedder.embed_documents(&chunk_refs).await?;
             anyhow::ensure!(
                 embeddings.len() == chunks.len(),
@@ -210,10 +217,12 @@ pub async fn execute_single_file_plan(
                 embeddings.len(),
                 chunks.len()
             );
-            let paired: Vec<(String, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
+            let paired: Vec<(PreparedChunk, Vec<f32>)> =
+                chunks.into_iter().zip(embeddings).collect();
             db::upsert_note(conn, &rel_path, &content_hash, &paired).await?;
 
-            let fts_chunks: Vec<String> = paired.into_iter().map(|(text, _)| text).collect();
+            let fts_chunks: Vec<PreparedChunk> =
+                paired.iter().map(|(chunk, _)| chunk.clone()).collect();
             let status = if fts.upsert(&rel_path, &fts_chunks).await.is_ok() {
                 FtsStatus::Current
             } else {
@@ -339,7 +348,7 @@ async fn embed_files(
     for batch in files.chunks(FILE_BATCH_SIZE) {
         let batch_texts: Vec<&str> = batch
             .iter()
-            .flat_map(|f| f.chunks.iter().map(String::as_str))
+            .flat_map(|f| f.chunks.iter().map(|chunk| chunk.content.as_str()))
             .collect();
 
         let batch_embeddings = embedder.embed_documents(&batch_texts).await?;
@@ -352,16 +361,16 @@ async fn embed_files(
 
         let mut offset = 0;
         for file in batch {
-            let paired: Vec<(String, Vec<f32>)> = file
+            let paired: Vec<(PreparedChunk, Vec<f32>)> = file
                 .chunks
                 .iter()
                 .enumerate()
-                .map(|(i, text)| {
+                .map(|(i, chunk)| {
                     let emb = batch_embeddings
                         .get(offset + i)
                         .context("embedding index out of bounds")?
                         .clone();
-                    Ok((text.clone(), emb))
+                    Ok((chunk.clone(), emb))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -456,7 +465,7 @@ mod tests {
                 .find(|(path, _)| path == "note.md")
                 .expect("note chunk")
                 .1,
-            "before"
+            PreparedChunk::from("before".to_string())
         );
     }
 
@@ -468,7 +477,7 @@ mod tests {
                     rel.to_string(),
                     DiskFile {
                         content_hash: h.to_string(),
-                        chunks: vec![rel.to_string()],
+                        chunks: vec![PreparedChunk::from(rel.to_string())],
                     },
                 )
             })
@@ -492,10 +501,16 @@ mod tests {
                 .is_some_and(|extension| extension == "md")
         }
 
-        fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             anyhow::ensure!(!self.fails, "test preparation failure");
-            Ok(vec![std::str::from_utf8(source)?.to_owned()])
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
         }
 
         fn profile(&self) -> &'static str {
@@ -512,8 +527,14 @@ mod tests {
                 .is_some_and(|extension| extension == "note")
         }
 
-        fn prepare(&self, _source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<String>> {
-            Ok(vec![std::str::from_utf8(source)?.to_owned()])
+        fn prepare(
+            &self,
+            _source_path: &Path,
+            source: &[u8],
+        ) -> anyhow::Result<Vec<PreparedChunk>> {
+            Ok(vec![PreparedChunk::from(
+                std::str::from_utf8(source)?.to_owned(),
+            )])
         }
 
         fn profile(&self) -> &'static str {
@@ -592,7 +613,7 @@ mod tests {
             "note.md".to_string(),
             Some(&stored),
             hash::content_hash(content),
-            vec![content.to_string()],
+            vec![PreparedChunk::from(content.to_string())],
         );
         assert!(matches!(plan, SingleFilePlan::Unchanged));
     }
@@ -604,7 +625,7 @@ mod tests {
             "note.md".to_string(),
             None,
             hash::content_hash(content),
-            vec![content.to_string()],
+            vec![PreparedChunk::from(content.to_string())],
         );
         match plan {
             SingleFilePlan::NeedsIndex {
@@ -627,7 +648,7 @@ mod tests {
             "note.md".to_string(),
             Some("oldhash"),
             hash::content_hash(content),
-            vec![content.to_string()],
+            vec![PreparedChunk::from(content.to_string())],
         );
         match plan {
             SingleFilePlan::NeedsIndex { content_hash, .. } => {
@@ -726,7 +747,7 @@ mod tests {
                 .await
                 .expect("chunks")
                 .iter()
-                .any(|(path, content)| path == "guide.txt" && content.contains("search phrase"))
+                .any(|(path, chunk)| path == "guide.txt" && chunk.content.contains("search phrase"))
         );
         assert!(
             db::all_note_hashes(&conn)
@@ -859,7 +880,10 @@ mod tests {
         assert_eq!(stats.added, 1);
         assert_eq!(
             db::all_chunks(&conn).await.expect("chunks"),
-            vec![("entry.note".to_string(), "prepared content".to_string(),)]
+            vec![(
+                "entry.note".to_string(),
+                PreparedChunk::from("prepared content".to_string()),
+            )]
         );
     }
 
@@ -1188,12 +1212,12 @@ mod tests {
         assert_eq!(fts.mutation_count(), 2);
         assert_eq!(
             db::all_chunks(&conn).await.expect("chunks")[0].1,
-            "after token"
+            PreparedChunk::from("after token".to_string())
         );
-        assert_eq!(
-            fts.search("after", 10).await.expect("search")[0].path,
-            "note.md"
-        );
+        let db_chunk = db::all_chunks(&conn).await.expect("chunks").remove(0).1;
+        let fts_result = fts.search("after", 10).await.expect("search").remove(0);
+        assert_eq!(fts_result.path, "note.md");
+        assert_eq!(fts_result.locator, db_chunk.locator);
         assert!(fts.search("before", 10).await.expect("search").is_empty());
     }
 
@@ -1224,7 +1248,7 @@ mod tests {
         assert!(error.contains("FTS recovery failed"));
         assert_eq!(
             db::all_chunks(&conn).await.expect("chunks")[0].1,
-            "after token"
+            PreparedChunk::from("after token".to_string())
         );
     }
 
