@@ -1,6 +1,9 @@
 use std::io::Write;
 
+use serde::Serialize;
+
 use crate::{
+    config::Namespace,
     rank::FusedResult,
     similar::{RelatedResult, SimilarGroup, SimilarPair},
 };
@@ -11,28 +14,109 @@ pub enum OutputMode {
     Json,
 }
 
+#[derive(Serialize)]
+struct NamespaceOutput {
+    name: String,
+    description: Option<String>,
+    paths: Vec<String>,
+}
+
+pub struct SearchResult {
+    pub fused: FusedResult,
+    pub namespaces: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct JsonSearchResult<'a> {
+    path: &'a str,
+    score: f64,
+    snippet: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locator: Option<&'a str>,
+    namespaces: &'a [String],
+}
+
+pub fn print_namespaces(
+    namespaces: &[Namespace],
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    let namespaces = namespace_output(namespaces);
+    match mode {
+        OutputMode::Json => {
+            let json = serde_json::to_string(&namespaces)?;
+            writeln!(writer, "{json}")?;
+        }
+        OutputMode::Human { .. } => {
+            for namespace in namespaces {
+                if let Some(description) = namespace.description {
+                    writeln!(writer, "{}\t{description}", namespace.name)?;
+                } else {
+                    writeln!(writer, "{}", namespace.name)?;
+                }
+                for path in namespace.paths {
+                    writeln!(writer, "  {path}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn namespace_output(namespaces: &[Namespace]) -> Vec<NamespaceOutput> {
+    let mut namespaces: Vec<&Namespace> = namespaces.iter().collect();
+    namespaces.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    namespaces
+        .into_iter()
+        .map(|namespace| {
+            let mut paths: Vec<String> = namespace
+                .paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            paths.sort_unstable();
+            NamespaceOutput {
+                name: namespace.name.clone(),
+                description: namespace.description.clone(),
+                paths,
+            }
+        })
+        .collect()
+}
+
 /// Print search results to `writer`.
 ///
 /// # Errors
 ///
 /// Returns an error if serialization fails or if writing to `writer` fails.
 pub fn print_search(
-    results: &[FusedResult],
+    results: &[SearchResult],
     mode: OutputMode,
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     match mode {
         OutputMode::Json => {
-            let json_str = serde_json::to_string(results)?;
-            writeln!(writer, "{json_str}")?;
+            let json_results: Vec<JsonSearchResult<'_>> = results
+                .iter()
+                .map(|result| JsonSearchResult {
+                    path: &result.fused.path,
+                    score: result.fused.score,
+                    snippet: &result.fused.snippet,
+                    locator: result.fused.locator.as_deref(),
+                    namespaces: &result.namespaces,
+                })
+                .collect();
+            let json = serde_json::to_string(&json_results)?;
+            writeln!(writer, "{json}")?;
         }
         OutputMode::Human { paths_only } => {
             if paths_only {
-                for result in results {
-                    writeln!(writer, "{}", result.path)?;
+                for search_result in results {
+                    writeln!(writer, "{}", search_result.fused.path)?;
                 }
             } else {
-                for result in results {
+                for search_result in results {
+                    let result = &search_result.fused;
                     if let Some(locator) = &result.locator {
                         writeln!(
                             writer,
@@ -161,14 +245,27 @@ fn first_line(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
-    fn make_fused(path: &str, score: f64, snippet: &str) -> FusedResult {
-        FusedResult {
-            path: path.to_owned(),
-            score,
-            snippet: snippet.to_owned(),
-            locator: None,
+    fn make_namespace(name: &str, description: Option<&str>, paths: &[&str]) -> Namespace {
+        Namespace {
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+            paths: paths.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    fn make_fused(path: &str, score: f64, snippet: &str) -> SearchResult {
+        SearchResult {
+            fused: FusedResult {
+                path: path.to_owned(),
+                score,
+                snippet: snippet.to_owned(),
+                locator: None,
+            },
+            namespaces: Vec::new(),
         }
     }
 
@@ -177,12 +274,15 @@ mod tests {
         score: f64,
         snippet: &str,
         locator: &str,
-    ) -> FusedResult {
-        FusedResult {
-            path: path.to_owned(),
-            score,
-            snippet: snippet.to_owned(),
-            locator: Some(locator.to_owned()),
+    ) -> SearchResult {
+        SearchResult {
+            fused: FusedResult {
+                path: path.to_owned(),
+                score,
+                snippet: snippet.to_owned(),
+                locator: Some(locator.to_owned()),
+            },
+            namespaces: Vec::new(),
         }
     }
 
@@ -208,6 +308,49 @@ mod tests {
     }
 
     #[test]
+    fn namespaces_json_is_stable_and_complete() {
+        let namespaces = vec![
+            make_namespace("zeta", None, &["/docs/shared"]),
+            make_namespace(
+                "alpha",
+                Some("Alpha documentation"),
+                &["/docs/z", "/docs/a"],
+            ),
+        ];
+        let output =
+            write_to_string(|writer| print_namespaces(&namespaces, OutputMode::Json, writer));
+        assert_eq!(
+            output,
+            "[{\"name\":\"alpha\",\"description\":\"Alpha documentation\",\"paths\":[\"/docs/a\",\"/docs/z\"]},{\"name\":\"zeta\",\"description\":null,\"paths\":[\"/docs/shared\"]}]\n"
+        );
+    }
+
+    #[test]
+    fn namespaces_human_output_is_stable_and_readable() {
+        let namespaces = vec![
+            make_namespace("zeta", None, &["/docs/shared"]),
+            make_namespace(
+                "alpha",
+                Some("Alpha documentation"),
+                &["/docs/z", "/docs/a"],
+            ),
+        ];
+        let output = write_to_string(|writer| {
+            print_namespaces(&namespaces, OutputMode::Human { paths_only: false }, writer)
+        });
+        assert_eq!(
+            output,
+            "alpha\tAlpha documentation\n  /docs/a\n  /docs/z\nzeta\n  /docs/shared\n"
+        );
+    }
+
+    #[test]
+    fn namespaces_json_empty_output_is_an_array() {
+        let output = write_to_string(|writer| print_namespaces(&[], OutputMode::Json, writer));
+        assert_eq!(output, "[]\n");
+    }
+
+    #[test]
     fn search_json_output_is_valid_json_array() {
         let results = vec![
             make_fused("a.md", 0.9, "snippet a"),
@@ -217,6 +360,18 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(out.trim()).expect("output should parse as JSON");
         assert!(value.is_array(), "output should be a JSON array");
+    }
+
+    #[test]
+    fn search_json_includes_all_namespace_memberships() {
+        let mut result = make_fused("a.md", 0.9, "snippet");
+        result.namespaces = vec!["alpha".to_owned(), "shared".to_owned()];
+        let out = write_to_string(|writer| print_search(&[result], OutputMode::Json, writer));
+        let value: serde_json::Value =
+            serde_json::from_str(out.trim()).expect("output should parse as JSON");
+        let namespaces = value[0]["namespaces"].as_array().expect("namespaces array");
+        assert_eq!(namespaces[0], "alpha");
+        assert_eq!(namespaces[1], "shared");
     }
 
     #[test]
@@ -297,6 +452,75 @@ mod tests {
         let out =
             write_to_string(|w| print_search(&results, OutputMode::Human { paths_only: true }, w));
         assert_eq!(out, "notes/a.md\n");
+    }
+
+    #[test]
+    fn similar_flat_human_output_is_unchanged() {
+        let pairs = vec![
+            make_pair(0.95, "a.md", "b.md"),
+            make_pair(0.90, "b.md", "c.md"),
+        ];
+        let output = write_to_string(|writer| {
+            print_similar(
+                pairs,
+                10,
+                false,
+                OutputMode::Human { paths_only: false },
+                writer,
+            )
+        });
+        assert_eq!(output, "0.9500\ta.md\tb.md\n0.9000\tb.md\tc.md\n");
+    }
+
+    #[test]
+    fn similar_grouped_human_output_is_unchanged() {
+        let pairs = vec![
+            make_pair(0.95, "a.md", "b.md"),
+            make_pair(0.90, "b.md", "c.md"),
+        ];
+        let output = write_to_string(|writer| {
+            print_similar(
+                pairs,
+                10,
+                true,
+                OutputMode::Human { paths_only: false },
+                writer,
+            )
+        });
+        assert_eq!(
+            output,
+            "Group 1 (3 documents):\n  0.9500  a.md <> b.md\n  0.9000  b.md <> c.md\n"
+        );
+    }
+
+    #[test]
+    fn similar_paths_only_outputs_are_unchanged() {
+        let flat = write_to_string(|writer| {
+            print_similar(
+                vec![
+                    make_pair(0.95, "a.md", "b.md"),
+                    make_pair(0.90, "b.md", "c.md"),
+                ],
+                10,
+                false,
+                OutputMode::Human { paths_only: true },
+                writer,
+            )
+        });
+        let grouped = write_to_string(|writer| {
+            print_similar(
+                vec![
+                    make_pair(0.95, "a.md", "b.md"),
+                    make_pair(0.90, "b.md", "c.md"),
+                ],
+                10,
+                true,
+                OutputMode::Human { paths_only: true },
+                writer,
+            )
+        });
+        assert_eq!(flat, "a.md\nb.md\nb.md\nc.md\n");
+        assert_eq!(grouped, "a.md\nb.md\nc.md\n");
     }
 
     #[test]

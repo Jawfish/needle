@@ -390,6 +390,39 @@ pub async fn apply_directory_changes(
     Ok(())
 }
 
+pub async fn document_chunks(
+    conn: &Connection,
+    path: &str,
+) -> anyhow::Result<Option<Vec<PreparedChunk>>> {
+    let mut rows = conn
+        .query(
+            "SELECT n.path, c.content, c.locator
+             FROM notes n
+             LEFT JOIN chunks c ON c.path = n.path
+             WHERE n.path = ?1
+             ORDER BY c.chunk_index",
+            [path],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let mut chunks = Vec::new();
+    if let Some(content) = row.get::<Option<String>>(1)? {
+        chunks.push(PreparedChunk {
+            content,
+            locator: row.get(2)?,
+        });
+    }
+    while let Some(row) = rows.next().await? {
+        chunks.push(PreparedChunk {
+            content: row.get(1)?,
+            locator: row.get(2)?,
+        });
+    }
+    Ok(Some(chunks))
+}
+
 pub async fn all_chunks(conn: &Connection) -> anyhow::Result<Vec<(String, PreparedChunk)>> {
     let mut rows = conn
         .query(
@@ -597,6 +630,32 @@ impl DbPathSource {
 impl PathSource for DbPathSource {
     fn all_paths(&self) -> crate::rank::SearchFuture<'_, Vec<String>> {
         Box::pin(all_note_paths(&self.conn))
+    }
+}
+
+pub trait DocumentChunksSource: Send + Sync {
+    fn document_chunks<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> crate::rank::SearchFuture<'a, Option<Vec<PreparedChunk>>>;
+}
+
+pub struct DbDocumentChunksSource {
+    conn: Connection,
+}
+
+impl DbDocumentChunksSource {
+    pub const fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl DocumentChunksSource for DbDocumentChunksSource {
+    fn document_chunks<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> crate::rank::SearchFuture<'a, Option<Vec<PreparedChunk>>> {
+        Box::pin(document_chunks(&self.conn, path))
     }
 }
 
@@ -1087,6 +1146,63 @@ mod tests {
         let (_dir, _db, conn) = test_db().await;
         let result = delete_note(&conn, "does_not_exist.md").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn document_chunks_returns_only_the_exact_path_in_chunk_order() {
+        let (_dir, _db, conn) = test_db().await;
+        upsert_note(
+            &conn,
+            "nested/note.md",
+            "h1",
+            &[
+                (
+                    PreparedChunk {
+                        content: "second".to_owned(),
+                        locator: None,
+                    },
+                    dummy_embedding(),
+                ),
+                (
+                    PreparedChunk {
+                        content: "third".to_owned(),
+                        locator: Some("p. 3".to_owned()),
+                    },
+                    dummy_embedding(),
+                ),
+            ],
+        )
+        .await
+        .expect("upsert");
+        upsert_note(&conn, "other.md", "h2", &make_chunks(&["other"]))
+            .await
+            .expect("upsert");
+
+        let chunks = document_chunks(&conn, "nested/note.md")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(chunks[0].content, "second");
+        assert_eq!(chunks[0].locator, None);
+        assert_eq!(chunks[1].content, "third");
+        assert_eq!(chunks[1].locator.as_deref(), Some("p. 3"));
+        assert!(
+            document_chunks(&conn, "missing.md")
+                .await
+                .expect("read")
+                .is_none()
+        );
+
+        conn.execute(
+            "INSERT INTO notes (path, content_hash, updated_at) VALUES (?1, 'empty', unixepoch())",
+            ["empty.md"],
+        )
+        .await
+        .expect("empty note");
+        assert_eq!(
+            document_chunks(&conn, "empty.md").await.expect("read"),
+            Some(vec![])
+        );
     }
 
     #[tokio::test]

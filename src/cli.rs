@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::net::IpAddr;
 
 #[derive(clap::Parser)]
 #[command(
@@ -6,9 +6,6 @@ use std::path::PathBuf;
     about = "Semantic search for Markdown, text, PDF, EPUB, HTML, and Word documents"
 )]
 pub struct Cli {
-    #[arg(long = "docs-dir", action = clap::ArgAction::Append)]
-    pub docs_dirs: Vec<PathBuf>,
-
     #[arg(long, env = "NEEDLE_PROVIDER")]
     pub provider: Option<String>,
 
@@ -27,11 +24,15 @@ pub struct Cli {
 
 #[derive(clap::Subcommand)]
 pub enum Command {
+    /// List configured documentation namespaces
+    Namespaces,
     /// Watch for file changes and index automatically
     Watch,
     /// Search notes using fused ranking (semantic + FTS + filename)
     Search {
         query: Option<String>,
+        #[arg(long = "namespace")]
+        namespaces: Vec<String>,
         #[arg(short, long, default_value = "10")]
         limit: usize,
         #[arg(short, long)]
@@ -43,8 +44,17 @@ pub enum Command {
         #[arg(long, env = "NEEDLE_W_FILENAME")]
         w_filename: Option<f64>,
     },
+    /// Serve indexed documents in a browser
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
     /// Find similar document pairs based on embeddings
     Similar {
+        #[arg(long = "namespace")]
+        namespaces: Vec<String>,
         #[arg(long, default_value = "0.85")]
         threshold: f64,
         #[arg(short, long, default_value = "50")]
@@ -64,4 +74,119 @@ pub enum Command {
     },
     /// Reindex all supported documents
     Reindex,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn namespaces_command_parses() {
+        let cli = Cli::try_parse_from(["needle", "namespaces"]).expect("parse");
+        assert!(matches!(cli.command, Command::Namespaces));
+    }
+
+    #[test]
+    fn namespaces_command_accepts_json_output() {
+        let cli = Cli::try_parse_from(["needle", "--json", "namespaces"]).expect("parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Namespaces));
+    }
+
+    #[test]
+    fn search_accepts_repeated_namespace_options() {
+        let cli = Cli::try_parse_from([
+            "needle",
+            "search",
+            "query",
+            "--namespace",
+            "alpha",
+            "--namespace",
+            "shared",
+        ])
+        .expect("parse");
+        let namespaces = match cli.command {
+            Command::Search { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(
+            namespaces,
+            Some(vec!["alpha".to_owned(), "shared".to_owned()])
+        );
+    }
+
+    #[test]
+    fn search_without_namespace_options_is_unscoped() {
+        let cli = Cli::try_parse_from(["needle", "search", "query"]).expect("parse");
+        let namespaces = match cli.command {
+            Command::Search { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(namespaces, Some(Vec::new()));
+    }
+
+    #[test]
+    fn similar_accepts_repeated_namespace_options() {
+        let cli = Cli::try_parse_from([
+            "needle",
+            "similar",
+            "--namespace",
+            "alpha",
+            "--namespace",
+            "shared",
+        ])
+        .expect("parse");
+        let namespaces = match cli.command {
+            Command::Similar { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(
+            namespaces,
+            Some(vec!["alpha".to_owned(), "shared".to_owned()])
+        );
+    }
+
+    #[test]
+    fn similar_without_namespace_options_is_unscoped() {
+        let cli = Cli::try_parse_from(["needle", "similar"]).expect("parse");
+        let namespaces = match cli.command {
+            Command::Similar { namespaces, .. } => Some(namespaces),
+            _ => None,
+        };
+        assert_eq!(namespaces, Some(Vec::new()));
+    }
+
+    #[test]
+    fn docs_dir_is_not_a_supported_option() {
+        assert!(Cli::try_parse_from(["needle", "--docs-dir", "/tmp", "search", "query"]).is_err());
+    }
+
+    #[test]
+    fn serve_uses_default_host_and_port() {
+        let cli = Cli::try_parse_from(["needle", "serve"]).expect("parse");
+        let parsed = match cli.command {
+            Command::Serve { host, port } => Some((host, port)),
+            _ => None,
+        };
+        assert_eq!(
+            parsed,
+            Some(("127.0.0.1".parse::<IpAddr>().expect("IP"), 8080))
+        );
+    }
+
+    #[test]
+    fn serve_accepts_host_and_port_overrides() {
+        let cli = Cli::try_parse_from(["needle", "serve", "--host", "0.0.0.0", "--port", "9090"])
+            .expect("parse");
+        let parsed = match cli.command {
+            Command::Serve { host, port } => Some((host, port)),
+            _ => None,
+        };
+        assert_eq!(
+            parsed,
+            Some(("0.0.0.0".parse::<IpAddr>().expect("IP"), 9090))
+        );
+    }
 }

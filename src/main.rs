@@ -12,6 +12,7 @@ mod output;
 mod query;
 mod rank;
 mod search_merge;
+mod server;
 mod similar;
 mod types;
 mod watch;
@@ -308,8 +309,8 @@ async fn main() -> anyhow::Result<()> {
 fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool {
     match command {
         Command::Watch | Command::Reindex => true,
-        Command::Search { .. } => weights.semantic > 0.0,
-        _ => false,
+        Command::Search { .. } | Command::Serve { .. } => weights.semantic > 0.0,
+        Command::Namespaces | Command::Similar { .. } | Command::Related { .. } => false,
     }
 }
 
@@ -330,6 +331,14 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
             fts: None,
             filename: None,
         },
+    }
+}
+
+const fn output_mode(json: bool, paths_only: bool) -> OutputMode {
+    if json {
+        OutputMode::Json
+    } else {
+        OutputMode::Human { paths_only }
     }
 }
 
@@ -390,34 +399,70 @@ async fn run_reindex_command(
     Ok(())
 }
 
-async fn open_search_adapters(
-    stores: &[config::DirectoryStore],
+async fn open_search_adapters<'a>(
+    stores: impl IntoIterator<Item = &'a config::DirectoryStore>,
     profile: Option<&types::IndexProfile>,
-) -> anyhow::Result<Vec<(db::DbSemanticSource, fts::FtsFtsSource, db::DbPathSource)>> {
-    let mut out = Vec::with_capacity(stores.len());
+) -> anyhow::Result<Vec<server::SearchAdapter>> {
+    let stores = stores.into_iter();
+    let mut out = Vec::with_capacity(stores.size_hint().0);
     for store in stores {
         let (_db, conn) = match profile {
             Some(profile) => db::connect_with_profile(&store.db_path, profile).await?,
             None => db::connect(&store.db_path, None).await?,
         };
         let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
-        out.push((
-            db::DbSemanticSource::new(conn.clone()),
-            fts::FtsFtsSource::new(fts_index),
-            db::DbPathSource::new(conn),
-        ));
+        out.push(server::SearchAdapter {
+            semantic: db::DbSemanticSource::new(conn.clone()),
+            fts: fts::FtsFtsSource::new(fts_index),
+            paths: db::DbPathSource::new(conn.clone()),
+            documents: db::DbDocumentChunksSource::new(conn),
+        });
     }
     Ok(out)
 }
 
+fn run_namespaces(
+    namespaces: &[config::Namespace],
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    output::print_namespaces(namespaces, mode, writer)
+}
+
+fn search_result_memberships(
+    config: &Config,
+    stores: &[&config::DirectoryStore],
+    results: &[rank::FusedResult],
+) -> anyhow::Result<Vec<Vec<String>>> {
+    results
+        .iter()
+        .map(|result| {
+            let store = match stores {
+                [store] => *store,
+                _ => search_merge::owning_store(&config.docs_dirs, &result.path).with_context(
+                    || {
+                        format!(
+                            "search result {} has no configured source directory",
+                            result.path
+                        )
+                    },
+                )?,
+            };
+            Ok(config.namespace_names_for(&store.notes_dir))
+        })
+        .collect()
+}
+
 async fn run_search(
     config: &Config,
+    namespaces: &[String],
     embedder: Option<&Embedder>,
     query: Option<String>,
     limit: usize,
     mode: OutputMode,
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
+    let stores = config.select_stores(namespaces)?;
     let query_str = resolve_query(
         query,
         &mut std::io::stdin().lock(),
@@ -425,45 +470,50 @@ async fn run_search(
     )?;
     let preparer = document::DefaultPreparer::default();
     let profile = embedder.map(|embedder| index_profile(embedder, &preparer));
-    let adapters = open_search_adapters(&config.docs_dirs, profile.as_ref()).await?;
-    let store_ports: Vec<query::SearchStorePorts<'_>> = config
-        .docs_dirs
+    let adapters = open_search_adapters(stores.iter().copied(), profile.as_ref()).await?;
+    let store_ports: Vec<query::SearchStorePorts<'_>> = stores
         .iter()
         .zip(adapters.iter())
-        .map(|(store, (semantic, fts, paths))| query::SearchStorePorts {
+        .map(|(store, adapter)| query::SearchStorePorts {
             notes_dir: &store.notes_dir,
-            semantic,
-            fts,
-            paths,
+            semantic: &adapter.semantic,
+            fts: &adapter.fts,
+            paths: &adapter.paths,
         })
         .collect();
     let per_store =
         query::query_search(&store_ports, embedder, &query_str, limit, &config.weights).await?;
-    let results = search_merge::merge_fused_results(per_store, limit);
+    let fused_results = search_merge::merge_fused_results(per_store, limit);
+    let memberships = search_result_memberships(config, &stores, &fused_results)?;
+    let results = fused_results
+        .into_iter()
+        .zip(memberships)
+        .map(|(fused, namespaces)| output::SearchResult { fused, namespaces })
+        .collect::<Vec<_>>();
     output::print_search(&results, mode, writer)?;
     Ok(())
 }
 
 async fn run_similar(
     config: &Config,
-    dim: Option<usize>,
+    namespaces: &[String],
     threshold: f64,
     limit: usize,
     group: bool,
     mode: OutputMode,
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
+    let stores = config.select_stores(namespaces)?;
     let pair_limit = if group { None } else { Some(limit) };
 
     let mut embeddings_sources: Vec<db::DbAllChunkEmbeddingsSource> =
-        Vec::with_capacity(config.docs_dirs.len());
-    for store in &config.docs_dirs {
-        let (_db, conn) = db::connect(&store.db_path, dim).await?;
+        Vec::with_capacity(stores.len());
+    for store in &stores {
+        let (_db, conn) = db::connect(&store.db_path, None).await?;
         embeddings_sources.push(db::DbAllChunkEmbeddingsSource::new(conn));
     }
 
-    let store_ports: Vec<query::SimilarStorePorts<'_>> = config
-        .docs_dirs
+    let store_ports: Vec<query::SimilarStorePorts<'_>> = stores
         .iter()
         .zip(embeddings_sources.iter())
         .map(|(store, embeddings)| query::SimilarStorePorts {
@@ -492,7 +542,7 @@ async fn run_related(
         } else {
             anyhow::anyhow!(
                 "relative path '{path}' is ambiguous with multiple docs dirs configured; \
-                 pass an absolute path or use --docs-dir to specify a single directory"
+                 pass an absolute path"
             )
         }
     })?;
@@ -523,7 +573,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         model: cli.model,
         api_base: cli.api_base,
     };
-    let config = Config::resolve(cli.docs_dirs, cli_weights, cli_embed)?;
+    let config = Config::resolve(cli_weights, cli_embed)?;
+    tracing::debug!(
+        namespaces = ?config.namespaces.iter().map(|namespace| (
+            &namespace.name,
+            &namespace.description,
+            &namespace.paths,
+        )).collect::<Vec<_>>(),
+        "resolved documentation namespaces"
+    );
 
     let embedder = if search_needs_embedder(&cli.command, &config.weights) {
         Some(Embedder::from_config(&config.embed)?)
@@ -532,48 +590,62 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     match cli.command {
+        Command::Namespaces => run_namespaces(
+            &config.namespaces,
+            output_mode(cli.json, false),
+            &mut std::io::stdout(),
+        ),
         Command::Watch => run_watch(&config, embedder).await,
         Command::Reindex => run_reindex_command(&config, embedder).await,
         Command::Search {
             query,
+            namespaces,
             limit,
             paths_only,
             ..
         } => {
-            let mode = if cli.json {
-                OutputMode::Json
-            } else {
-                OutputMode::Human { paths_only }
-            };
             run_search(
                 &config,
+                &namespaces,
                 embedder.as_ref(),
                 query,
                 limit,
-                mode,
+                output_mode(cli.json, paths_only),
                 &mut std::io::stdout(),
             )
             .await
         }
+        Command::Serve { host, port } => {
+            let preparer = document::DefaultPreparer::default();
+            let profile = embedder
+                .as_ref()
+                .map(|value| index_profile(value, &preparer));
+            let adapters = open_search_adapters(config.docs_dirs.iter(), profile.as_ref()).await?;
+            server::run(
+                host,
+                port,
+                &config.docs_dirs,
+                &config.namespaces,
+                adapters,
+                embedder,
+                config.weights,
+            )
+            .await
+        }
         Command::Similar {
+            namespaces,
             threshold,
             limit,
             group,
             paths_only,
         } => {
-            let dim = embedder.as_ref().map(Embedder::dim);
-            let mode = if cli.json {
-                OutputMode::Json
-            } else {
-                OutputMode::Human { paths_only }
-            };
             run_similar(
                 &config,
-                dim,
+                &namespaces,
                 threshold,
                 limit,
                 group,
-                mode,
+                output_mode(cli.json, paths_only),
                 &mut std::io::stdout(),
             )
             .await
@@ -584,12 +656,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             paths_only,
         } => {
             let dim = embedder.as_ref().map(Embedder::dim);
-            let mode = if cli.json {
-                OutputMode::Json
-            } else {
-                OutputMode::Human { paths_only }
-            };
-            run_related(&config, dim, path, limit, mode, &mut std::io::stdout()).await
+            run_related(
+                &config,
+                dim,
+                path,
+                limit,
+                output_mode(cli.json, paths_only),
+                &mut std::io::stdout(),
+            )
+            .await
         }
     }
 }
@@ -721,6 +796,7 @@ mod tests {
     fn search_command(w_semantic: Option<f64>) -> Command {
         Command::Search {
             query: None,
+            namespaces: Vec::new(),
             limit: 10,
             paths_only: false,
             w_semantic,
@@ -770,6 +846,14 @@ mod tests {
     }
 
     #[test]
+    fn namespaces_never_need_an_embedder() {
+        assert!(!search_needs_embedder(
+            &Command::Namespaces,
+            &rank::RrfWeights::default()
+        ));
+    }
+
+    #[test]
     fn similar_never_needs_embedder() {
         let weights = rank::RrfWeights {
             semantic: 1.5,
@@ -778,6 +862,7 @@ mod tests {
         };
         assert!(!search_needs_embedder(
             &Command::Similar {
+                namespaces: Vec::new(),
                 threshold: 0.85,
                 limit: 50,
                 group: false,
