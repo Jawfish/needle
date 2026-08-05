@@ -24,6 +24,8 @@ pub struct Cli {
 
 #[derive(clap::Subcommand)]
 pub enum Command {
+    /// List configured documentation namespaces
+    Namespaces,
     /// Watch for file changes and index automatically
     Watch,
     /// Search notes using fused ranking (semantic + FTS + filename)
@@ -75,6 +77,19 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn namespaces_command_parses() {
+        let cli = Cli::try_parse_from(["needle", "namespaces"]).expect("parse");
+        assert!(matches!(cli.command, Command::Namespaces));
+    }
+
+    #[test]
+    fn namespaces_command_accepts_json_output() {
+        let cli = Cli::try_parse_from(["needle", "--json", "namespaces"]).expect("parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Namespaces));
+    }
 
     #[test]
     fn docs_dir_is_not_a_supported_option() {

@@ -37,6 +37,15 @@ needle search "authentication" -p | xargs bat
 echo "query from clipboard" | needle search
 ```
 
+### Discover documentation namespaces
+
+List the configured documentation groups before searching:
+
+```bash
+needle namespaces
+needle --json namespaces
+```
+
 ### Find related documents
 
 Given a note, find others like it using the vector index:

@@ -310,7 +310,7 @@ fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool 
     match command {
         Command::Watch | Command::Reindex => true,
         Command::Search { .. } | Command::Serve { .. } => weights.semantic > 0.0,
-        _ => false,
+        Command::Namespaces | Command::Similar { .. } | Command::Related { .. } => false,
     }
 }
 
@@ -331,6 +331,14 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
             fts: None,
             filename: None,
         },
+    }
+}
+
+const fn output_mode(json: bool, paths_only: bool) -> OutputMode {
+    if json {
+        OutputMode::Json
+    } else {
+        OutputMode::Human { paths_only }
     }
 }
 
@@ -410,6 +418,14 @@ async fn open_search_adapters(
         });
     }
     Ok(out)
+}
+
+fn run_namespaces(
+    namespaces: &[config::Namespace],
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    output::print_namespaces(namespaces, mode, writer)
 }
 
 async fn run_search(
@@ -542,6 +558,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     match cli.command {
+        Command::Namespaces => run_namespaces(
+            &config.namespaces,
+            output_mode(cli.json, false),
+            &mut std::io::stdout(),
+        ),
         Command::Watch => run_watch(&config, embedder).await,
         Command::Reindex => run_reindex_command(&config, embedder).await,
         Command::Search {
@@ -550,17 +571,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             paths_only,
             ..
         } => {
-            let mode = if cli.json {
-                OutputMode::Json
-            } else {
-                OutputMode::Human { paths_only }
-            };
             run_search(
                 &config,
                 embedder.as_ref(),
                 query,
                 limit,
-                mode,
+                output_mode(cli.json, paths_only),
                 &mut std::io::stdout(),
             )
             .await
@@ -588,18 +604,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             paths_only,
         } => {
             let dim = embedder.as_ref().map(Embedder::dim);
-            let mode = if cli.json {
-                OutputMode::Json
-            } else {
-                OutputMode::Human { paths_only }
-            };
             run_similar(
                 &config,
                 dim,
                 threshold,
                 limit,
                 group,
-                mode,
+                output_mode(cli.json, paths_only),
                 &mut std::io::stdout(),
             )
             .await
@@ -610,12 +621,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             paths_only,
         } => {
             let dim = embedder.as_ref().map(Embedder::dim);
-            let mode = if cli.json {
-                OutputMode::Json
-            } else {
-                OutputMode::Human { paths_only }
-            };
-            run_related(&config, dim, path, limit, mode, &mut std::io::stdout()).await
+            run_related(
+                &config,
+                dim,
+                path,
+                limit,
+                output_mode(cli.json, paths_only),
+                &mut std::io::stdout(),
+            )
+            .await
         }
     }
 }
@@ -793,6 +807,14 @@ mod tests {
             filename: 0.0,
         };
         assert!(search_needs_embedder(&Command::Reindex, &weights));
+    }
+
+    #[test]
+    fn namespaces_never_need_an_embedder() {
+        assert!(!search_needs_embedder(
+            &Command::Namespaces,
+            &rank::RrfWeights::default()
+        ));
     }
 
     #[test]

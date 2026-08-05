@@ -1,6 +1,9 @@
 use std::io::Write;
 
+use serde::Serialize;
+
 use crate::{
+    config::Namespace,
     rank::FusedResult,
     similar::{RelatedResult, SimilarGroup, SimilarPair},
 };
@@ -9,6 +12,61 @@ use crate::{
 pub enum OutputMode {
     Human { paths_only: bool },
     Json,
+}
+
+#[derive(Serialize)]
+struct NamespaceOutput {
+    name: String,
+    description: Option<String>,
+    paths: Vec<String>,
+}
+
+pub fn print_namespaces(
+    namespaces: &[Namespace],
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    let namespaces = namespace_output(namespaces);
+    match mode {
+        OutputMode::Json => {
+            let json = serde_json::to_string(&namespaces)?;
+            writeln!(writer, "{json}")?;
+        }
+        OutputMode::Human { .. } => {
+            for namespace in namespaces {
+                if let Some(description) = namespace.description {
+                    writeln!(writer, "{}\t{description}", namespace.name)?;
+                } else {
+                    writeln!(writer, "{}", namespace.name)?;
+                }
+                for path in namespace.paths {
+                    writeln!(writer, "  {path}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn namespace_output(namespaces: &[Namespace]) -> Vec<NamespaceOutput> {
+    let mut namespaces: Vec<&Namespace> = namespaces.iter().collect();
+    namespaces.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    namespaces
+        .into_iter()
+        .map(|namespace| {
+            let mut paths: Vec<String> = namespace
+                .paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            paths.sort_unstable();
+            NamespaceOutput {
+                name: namespace.name.clone(),
+                description: namespace.description.clone(),
+                paths,
+            }
+        })
+        .collect()
 }
 
 /// Print search results to `writer`.
@@ -161,7 +219,17 @@ fn first_line(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    fn make_namespace(name: &str, description: Option<&str>, paths: &[&str]) -> Namespace {
+        Namespace {
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+            paths: paths.iter().map(PathBuf::from).collect(),
+        }
+    }
 
     fn make_fused(path: &str, score: f64, snippet: &str) -> FusedResult {
         FusedResult {
@@ -205,6 +273,49 @@ mod tests {
         let mut buf = Vec::new();
         f(&mut buf).expect("write should succeed");
         String::from_utf8(buf).expect("output should be valid UTF-8")
+    }
+
+    #[test]
+    fn namespaces_json_is_stable_and_complete() {
+        let namespaces = vec![
+            make_namespace("zeta", None, &["/docs/shared"]),
+            make_namespace(
+                "alpha",
+                Some("Alpha documentation"),
+                &["/docs/z", "/docs/a"],
+            ),
+        ];
+        let output =
+            write_to_string(|writer| print_namespaces(&namespaces, OutputMode::Json, writer));
+        assert_eq!(
+            output,
+            "[{\"name\":\"alpha\",\"description\":\"Alpha documentation\",\"paths\":[\"/docs/a\",\"/docs/z\"]},{\"name\":\"zeta\",\"description\":null,\"paths\":[\"/docs/shared\"]}]\n"
+        );
+    }
+
+    #[test]
+    fn namespaces_human_output_is_stable_and_readable() {
+        let namespaces = vec![
+            make_namespace("zeta", None, &["/docs/shared"]),
+            make_namespace(
+                "alpha",
+                Some("Alpha documentation"),
+                &["/docs/z", "/docs/a"],
+            ),
+        ];
+        let output = write_to_string(|writer| {
+            print_namespaces(&namespaces, OutputMode::Human { paths_only: false }, writer)
+        });
+        assert_eq!(
+            output,
+            "alpha\tAlpha documentation\n  /docs/a\n  /docs/z\nzeta\n  /docs/shared\n"
+        );
+    }
+
+    #[test]
+    fn namespaces_json_empty_output_is_an_array() {
+        let output = write_to_string(|writer| print_namespaces(&[], OutputMode::Json, writer));
+        assert_eq!(output, "[]\n");
     }
 
     #[test]
