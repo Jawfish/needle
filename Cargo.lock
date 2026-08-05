@@ -7212,8 +7212,7 @@ dependencies = [
 [[package]]
 name = "xberg"
 version = "1.0.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68568d75a993709564cb27361409b46988ec585f9fb59c8f91a113ff7f6b4e29"
+source = "git+https://github.com/Jawfish/xberg?branch=epub-char-boundary#11f5bca560583824d1bf760310e98aa3ac5bc700"
 dependencies = [
  "ahash",
  "async-trait",
