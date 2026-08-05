@@ -15,6 +15,8 @@ use crate::{
 
 const BYTES_PER_F32: usize = 4;
 
+pub type NoteUpsert = (String, String, Vec<(String, Vec<f32>)>);
+
 pub fn decode_embedding(blob: &[u8]) -> anyhow::Result<Vec<f32>> {
     if !blob.len().is_multiple_of(BYTES_PER_F32) {
         bail!(
@@ -329,7 +331,7 @@ pub async fn delete_note(conn: &Connection, path: &str) -> anyhow::Result<()> {
 pub async fn apply_directory_changes(
     conn: &Connection,
     deleted_paths: &[String],
-    upserts: &[(String, String, Vec<(String, Vec<f32>)>)],
+    upserts: &[NoteUpsert],
 ) -> anyhow::Result<()> {
     let tx = conn.transaction().await?;
 
@@ -743,8 +745,10 @@ mod tests {
                 .expect_err("mismatch rejected");
             assert!(matches!(
                 err.downcast_ref::<NeedleError>(),
-                Some(NeedleError::IndexProfileMismatch { .. })
-                    | Some(NeedleError::DimensionMismatch { .. })
+                Some(
+                    NeedleError::IndexProfileMismatch { .. }
+                        | NeedleError::DimensionMismatch { .. }
+                )
             ));
         }
     }

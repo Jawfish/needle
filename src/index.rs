@@ -227,6 +227,7 @@ pub async fn execute_single_file_plan(
     }
 }
 
+#[cfg(test)]
 pub async fn index_directory(
     conn: &Connection,
     fts: &FtsIndex,
@@ -330,7 +331,7 @@ async fn read_disk_sources(
 async fn embed_files(
     embedder: &Embedder,
     files: &[&FileToIndex],
-) -> anyhow::Result<Vec<(String, String, Vec<(String, Vec<f32>)>)>> {
+) -> anyhow::Result<Vec<db::NoteUpsert>> {
     let total_chunks: usize = files.iter().map(|f| f.chunks.len()).sum();
     tracing::info!(files = files.len(), chunks = total_chunks, "embedding");
 

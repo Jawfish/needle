@@ -8,13 +8,9 @@ use std::{
 use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use crate::{
-    db,
-    document::{DocumentPreparer, MarkdownPreparer},
-    embed::Embedder,
-    fts::FtsIndex,
-    index,
-};
+#[cfg(test)]
+use crate::document::MarkdownPreparer;
+use crate::{db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, index};
 
 const DEBOUNCE_MS: u64 = 500;
 
@@ -109,6 +105,7 @@ pub async fn run_watcher(
 /// Route each changed path to its owning store and process it.
 ///
 /// Extracted so tests can drive dispatch directly without a real FS watcher.
+#[cfg(test)]
 pub async fn dispatch_changes(
     stores: &[OpenStore],
     notes_dirs: &[PathBuf],
@@ -147,6 +144,7 @@ pub async fn dispatch_changes_with_preparer(
     }
 }
 
+#[cfg(test)]
 pub fn should_index_path<'a>(
     path: &std::path::Path,
     roots: impl Iterator<Item = &'a PathBuf>,
