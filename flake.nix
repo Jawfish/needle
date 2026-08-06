@@ -21,6 +21,13 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          onnxruntime = pkgs.onnxruntime.override {
+            coremlSupport = false;
+            cudaSupport = false;
+            openvinoSupport = false;
+            pythonSupport = false;
+            rocmSupport = false;
+          };
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "needle";
@@ -35,10 +42,10 @@
           nativeBuildInputs = [ pkgs.pkg-config ];
           nativeCheckInputs = [ pkgs.cacert ];
           buildInputs = [
-            pkgs.onnxruntime
+            onnxruntime
             pkgs.openssl
           ];
-          ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
+          ORT_LIB_LOCATION = "${onnxruntime}/lib";
           ORT_PREFER_DYNAMIC_LINK = "1";
           preCheck = ''
             export HOME="$TMPDIR/home"
