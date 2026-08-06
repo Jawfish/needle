@@ -35,7 +35,7 @@ maud = "0.26"
 percent-encoding = "2.3"
 
 [patch.crates-io]
-xberg = { git = "https://github.com/Jawfish/xberg", branch = "epub-char-boundary" }
+xberg = { git = "https://github.com/Jawfish/xberg", rev = "2bc38b06a72a61f349639178166fc888677fb67e" }
 
 [dev-dependencies]
 tempfile = "3"
