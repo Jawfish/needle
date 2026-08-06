@@ -134,16 +134,15 @@ pub async fn dispatch_changes_with_preparer(
     changed: &HashSet<PathBuf>,
     preparer: &dyn DocumentPreparer,
 ) {
+    let mut mutated_stores = HashSet::new();
     for path in changed {
-        // Non-overlapping roots (enforced at config time) guarantee at
-        // most one store matches, so position is deterministic.
         let store_idx = notes_dirs
             .iter()
             .position(|dir| path.starts_with(dir.as_path()));
 
         if let Some(idx) = store_idx {
             let store = &stores[idx];
-            process_single_file(
+            if process_single_file(
                 &store.conn,
                 &store.fts,
                 embedder,
@@ -152,7 +151,27 @@ pub async fn dispatch_changes_with_preparer(
                 preparer,
                 Some(&store.vector),
             )
-            .await;
+            .await
+            {
+                mutated_stores.insert(idx);
+            }
+        }
+    }
+    flush_vector_indices(stores, &mut mutated_stores).await;
+}
+
+async fn flush_vector_indices(stores: &[OpenStore], mutated_stores: &mut HashSet<usize>) {
+    for index in mutated_stores.drain() {
+        let store = &stores[index];
+        let result = async {
+            store
+                .vector
+                .save(&store.conn, db::chunk_index_state(&store.conn).await?)
+                .await
+        }
+        .await;
+        if result.is_err() {
+            reconcile_vector(&store.conn, &store.vector).await;
         }
     }
 }
@@ -185,21 +204,28 @@ async fn process_single_file(
     path: &Path,
     preparer: &dyn DocumentPreparer,
     vector: Option<&VectorIndex>,
-) {
+) -> bool {
     if path.exists() {
         match index::index_single_file_with_preparer(
             conn, fts, embedder, notes_dir, path, preparer, vector,
         )
         .await
         {
-            Ok(index::IndexStatus::Current) => {}
-            Ok(index::IndexStatus::FtsStale) => reconcile_fts(conn, fts).await,
+            Ok(index::IndexStatus::Current { vector_mutated }) => vector_mutated,
+            Ok(index::IndexStatus::FtsStale { vector_mutated }) => {
+                reconcile_fts(conn, fts).await;
+                vector_mutated
+            }
             Ok(index::IndexStatus::VectorStale) => {
                 if let Some(vector) = vector {
                     reconcile_vector(conn, vector).await;
                 }
+                false
             }
-            Err(e) => tracing::error!(path = %path.display(), error = %e, "failed to index"),
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "failed to index");
+                false
+            }
         }
     } else {
         let rel = path.strip_prefix(notes_dir).map_or_else(
@@ -211,7 +237,7 @@ async fn process_single_file(
                 Ok(embeddings) => embeddings,
                 Err(e) => {
                     tracing::error!(path = rel, error = %e, "failed to read vectors before delete");
-                    return;
+                    return false;
                 }
             };
         match db::delete_note(conn, &rel).await {
@@ -220,20 +246,23 @@ async fn process_single_file(
                     reconcile_fts(conn, fts).await;
                 }
                 if let Some(vector) = vector {
-                    let vector_result = async {
-                        for (id, _) in old_embeddings {
-                            vector.remove(id)?;
-                        }
-                        vector.save(conn, db::chunk_index_state(conn).await?).await
-                    }
-                    .await;
+                    let vector_result = old_embeddings
+                        .iter()
+                        .try_for_each(|(id, _)| vector.remove(*id));
                     if vector_result.is_err() {
                         reconcile_vector(conn, vector).await;
+                        return false;
                     }
+                    tracing::info!(path = rel, "deleted from index");
+                    return !old_embeddings.is_empty();
                 }
                 tracing::info!(path = rel, "deleted from index");
+                false
             }
-            Err(e) => tracing::error!(path = rel, error = %e, "failed to delete from db"),
+            Err(e) => {
+                tracing::error!(path = rel, error = %e, "failed to delete from db");
+                false
+            }
         }
     }
 }
@@ -899,6 +928,211 @@ mod tests {
                 .await
                 .expect("note hash")
                 .is_some()
+        );
+    }
+
+    async fn assert_vector_matches_chunks(store: &OpenStore) {
+        let ids: HashSet<i64> = db::all_chunk_embeddings_with_ids(&store.conn)
+            .await
+            .expect("embeddings")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(store.vector.len(), ids.len());
+        assert!(ids.iter().all(|id| store.vector.contains(*id)));
+    }
+
+    #[tokio::test]
+    async fn a_debounce_batch_saves_each_touched_store_once() {
+        let first_dir = tempfile::tempdir().expect("tempdir");
+        let second_dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..3 {
+            create_file(
+                first_dir.path(),
+                &format!("note{index}.md"),
+                &format!("content {index}"),
+            );
+        }
+        let (_first_temps, first) = open_store(first_dir.path()).await;
+        let (_second_temps, second) = open_store(second_dir.path()).await;
+        first.vector.reset_save_count();
+        second.vector.reset_save_count();
+        let stores = vec![first, second];
+        let dirs = vec![
+            first_dir.path().to_path_buf(),
+            second_dir.path().to_path_buf(),
+        ];
+        let changed = (0..3)
+            .map(|index| first_dir.path().join(format!("note{index}.md")))
+            .collect();
+
+        dispatch_changes(
+            &stores,
+            &dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        assert_eq!(stores[0].vector.save_count(), 1);
+        assert_eq!(stores[1].vector.save_count(), 0);
+        assert_vector_matches_chunks(&stores[0]).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_keeps_the_vector_index_aligned_with_edits_and_deletes() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "edited.md", "before");
+        create_file(notes_dir.path(), "deleted.md", "gone");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let dirs = vec![notes_dir.path().to_path_buf()];
+        let initial = HashSet::from([
+            notes_dir.path().join("edited.md"),
+            notes_dir.path().join("deleted.md"),
+        ]);
+        let embedder = embed::Embedder::create_null(1024);
+        dispatch_changes(std::slice::from_ref(&store), &dirs, &embedder, &initial).await;
+        let deleted_ids: HashSet<i64> =
+            db::chunk_embeddings_for_paths(&store.conn, &["deleted.md".to_owned()])
+                .await
+                .expect("deleted embeddings")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+        create_file(notes_dir.path(), "edited.md", "after");
+        std::fs::remove_file(notes_dir.path().join("deleted.md")).expect("remove");
+        create_file(notes_dir.path(), "added.md", "added");
+        let changed = HashSet::from([
+            notes_dir.path().join("edited.md"),
+            notes_dir.path().join("deleted.md"),
+            notes_dir.path().join("added.md"),
+        ]);
+
+        dispatch_changes(std::slice::from_ref(&store), &dirs, &embedder, &changed).await;
+
+        assert_vector_matches_chunks(&store).await;
+        assert!(deleted_ids.iter().all(|id| !store.vector.contains(*id)));
+    }
+
+    #[tokio::test]
+    async fn a_batch_leaves_nothing_pending_for_shutdown() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..3 {
+            create_file(notes_dir.path(), &format!("note{index}.md"), "content");
+        }
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let dirs = vec![notes_dir.path().to_path_buf()];
+        let changed: HashSet<PathBuf> = (0..3)
+            .map(|index| notes_dir.path().join(format!("note{index}.md")))
+            .collect();
+
+        dispatch_changes(
+            std::slice::from_ref(&store),
+            &dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+        )
+        .await;
+
+        assert_eq!(
+            db::vector_index_state(&store.conn).await.expect("state"),
+            Some(
+                db::chunk_index_state(&store.conn)
+                    .await
+                    .expect("chunk state")
+            ),
+            "a completed batch must persist its state, leaving shutdown nothing to flush"
+        );
+        let persisted = std::fs::read(store.vector.path()).expect("read index");
+
+        crate::vector::VectorIndex::open_or_rebuild(&store.conn, store.vector.path().to_owned())
+            .await
+            .expect("reopen");
+
+        assert_eq!(
+            std::fs::read(store.vector.path()).expect("read index"),
+            persisted,
+            "reopening after a batch must find the index current rather than rebuild it"
+        );
+    }
+
+    #[tokio::test]
+    async fn flushing_pending_changes_persists_the_vector_index_state() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "content");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let changed = process_single_file(
+            &store.conn,
+            &store.fts,
+            &embed::Embedder::create_null(1024),
+            notes_dir.path(),
+            &notes_dir.path().join("note.md"),
+            &DefaultPreparer::default(),
+            Some(&store.vector),
+        )
+        .await;
+        assert!(changed);
+        assert_ne!(
+            db::vector_index_state(&store.conn).await.expect("state"),
+            Some(
+                db::chunk_index_state(&store.conn)
+                    .await
+                    .expect("chunk state")
+            )
+        );
+        let mut pending = HashSet::from([0]);
+
+        flush_vector_indices(std::slice::from_ref(&store), &mut pending).await;
+
+        assert!(store.vector.path().exists());
+        assert_eq!(
+            db::vector_index_state(&store.conn).await.expect("state"),
+            Some(
+                db::chunk_index_state(&store.conn)
+                    .await
+                    .expect("chunk state")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unflushed_batch_rebuilds_from_stored_embeddings() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "note.md", "content");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let changed = process_single_file(
+            &store.conn,
+            &store.fts,
+            &embed::Embedder::create_null(1024),
+            notes_dir.path(),
+            &notes_dir.path().join("note.md"),
+            &DefaultPreparer::default(),
+            Some(&store.vector),
+        )
+        .await;
+        assert!(changed);
+        let before = db::all_chunk_embeddings_with_ids(&store.conn)
+            .await
+            .expect("embeddings");
+
+        let rebuilt = VectorIndex::open_or_rebuild(&store.conn, store.vector.path().to_owned())
+            .await
+            .expect("rebuild");
+
+        assert_eq!(
+            db::all_chunk_embeddings_with_ids(&store.conn)
+                .await
+                .expect("embeddings"),
+            before
+        );
+        assert_eq!(rebuilt.len(), before.len());
+        assert_eq!(
+            db::vector_index_state(&store.conn).await.expect("state"),
+            Some(
+                db::chunk_index_state(&store.conn)
+                    .await
+                    .expect("chunk state")
+            )
         );
     }
 

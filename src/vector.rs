@@ -3,6 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::Context;
 use libsql::Connection;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
@@ -15,6 +18,8 @@ const INITIAL_CAPACITY: usize = 256;
 pub struct VectorIndex {
     path: PathBuf,
     index: Index,
+    #[cfg(test)]
+    save_count: AtomicUsize,
 }
 
 pub struct VectorReader {
@@ -99,6 +104,8 @@ impl VectorIndex {
             Ok(index) if index.size() == state.0 => Ok(Some(Self {
                 path: path.to_owned(),
                 index,
+                #[cfg(test)]
+                save_count: AtomicUsize::new(0),
             })),
             Ok(_) | Err(_) => Ok(None),
         }
@@ -125,7 +132,12 @@ impl VectorIndex {
                     .context("failed to add vector")?;
             }
         }
-        let result = Self { path, index };
+        let result = Self {
+            path,
+            index,
+            #[cfg(test)]
+            save_count: AtomicUsize::new(0),
+        };
         result.save(conn, state).await?;
         Ok(result)
     }
@@ -193,7 +205,19 @@ impl VectorIndex {
         u64::try_from(id).is_ok_and(|key| self.index.contains(key))
     }
 
+    #[cfg(test)]
+    pub fn save_count(&self) -> usize {
+        self.save_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn reset_save_count(&self) {
+        self.save_count.store(0, Ordering::SeqCst);
+    }
+
     pub async fn save(&self, conn: &Connection, state: (usize, i64)) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.save_count.fetch_add(1, Ordering::SeqCst);
         let parent = self.path.parent().context("vector index has no parent")?;
         fs::create_dir_all(parent)?;
         let temporary = parent.join(format!(
@@ -597,6 +621,7 @@ mod tests {
         let stored = VectorIndex {
             path: dir.path().join("vectors.usearch"),
             index,
+            save_count: AtomicUsize::new(0),
         };
         stored.save(&conn, (count, 0)).await.expect("save");
 
