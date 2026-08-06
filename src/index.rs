@@ -927,10 +927,14 @@ mod tests {
                 .any(|(path, _)| path == "empty.txt")
         );
 
+        let vector_path = db_dir.path().join("test.usearch");
+        VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = Arc::new(
-            VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let semantic = db::DbSemanticSource::new(conn.clone(), vector);
         let fts_source = crate::fts::FtsFtsSource::new(fts);
@@ -976,10 +980,14 @@ mod tests {
             .expect("index");
         assert_eq!(stats.added, DOCUMENT_FIXTURES.len());
 
+        let vector_path = db_dir.path().join("test.usearch");
+        VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = Arc::new(
-            VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let semantic = db::DbSemanticSource::new(conn.clone(), vector);
         let semantic_paths: Vec<String> = semantic

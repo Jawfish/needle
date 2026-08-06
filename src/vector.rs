@@ -17,6 +17,64 @@ pub struct VectorIndex {
     index: Index,
 }
 
+pub struct VectorReader {
+    index: Option<Index>,
+}
+
+impl VectorReader {
+    pub async fn open(conn: &Connection, path: &Path) -> anyhow::Result<Self> {
+        let state = db::chunk_index_state(conn).await?;
+        let recorded = db::vector_index_state(conn).await?;
+        let index = if path.exists() {
+            match Index::restore_view(&path.to_string_lossy()) {
+                Ok(index) => {
+                    if recorded != Some(state) || index.size() != state.0 {
+                        tracing::debug!(
+                            path = %path.display(),
+                            ?recorded,
+                            ?state,
+                            index_size = index.size(),
+                            "vector index differs from the chunks table"
+                        );
+                    }
+                    Some(index)
+                }
+                Err(error) => {
+                    if state.0 > 0 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "vector index is unavailable; run `needle reindex`"
+                        );
+                    }
+                    None
+                }
+            }
+        } else {
+            if state.0 > 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    "vector index is unavailable; run `needle reindex`"
+                );
+            }
+            None
+        };
+        Ok(Self { index })
+    }
+
+    pub fn search(&self, query: &[f32], count: usize) -> anyhow::Result<Vec<i64>> {
+        let Some(index) = &self.index else {
+            return Ok(Vec::new());
+        };
+        let matches = index.search(query, count).context("vector search failed")?;
+        matches
+            .keys
+            .into_iter()
+            .map(|key| i64::try_from(key).context("vector key exceeds i64"))
+            .collect()
+    }
+}
+
 impl VectorIndex {
     pub async fn open_or_rebuild(conn: &Connection, path: PathBuf) -> anyhow::Result<Self> {
         let state = db::chunk_index_state(conn).await?;
@@ -108,6 +166,7 @@ impl VectorIndex {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn search(&self, query: &[f32], count: usize) -> anyhow::Result<Vec<i64>> {
         let matches = self
             .index
@@ -416,6 +475,107 @@ mod tests {
             before, after,
             "rebuilding must reuse stored embeddings rather than recomputing them"
         );
+    }
+
+    #[tokio::test]
+    async fn matching_index_searches_without_changing_persistent_state() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 2).await;
+        let path = dir.path().join("vectors.usearch");
+        let writable = VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let bytes = std::fs::read(&path).expect("read index");
+        let modified = std::fs::metadata(&path)
+            .expect("index metadata")
+            .modified()
+            .expect("index modification time");
+        let state = db::vector_index_state(&conn).await.expect("state");
+
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+        assert_eq!(
+            reader.search(&vectors[0], 1).expect("search"),
+            writable.search(&vectors[0], 1).expect("search")
+        );
+
+        assert_eq!(std::fs::read(&path).expect("read index"), bytes);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("index metadata")
+                .modified()
+                .expect("index modification time"),
+            modified
+        );
+        assert_eq!(db::vector_index_state(&conn).await.expect("state"), state);
+    }
+
+    #[tokio::test]
+    async fn diverged_index_searches_without_changing_persistent_state() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 2).await;
+        let path = dir.path().join("vectors.usearch");
+        VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let bytes = std::fs::read(&path).expect("read index");
+        let modified = std::fs::metadata(&path)
+            .expect("index metadata")
+            .modified()
+            .expect("index modification time");
+        let state = db::vector_index_state(&conn).await.expect("state");
+        db::upsert_note(
+            &conn,
+            "extra.md",
+            "hash",
+            &[(
+                PreparedChunk {
+                    content: "extra".to_owned(),
+                    locator: None,
+                },
+                vectors[0].clone(),
+            )],
+        )
+        .await
+        .expect("insert divergence");
+
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+        assert!(!reader.search(&vectors[0], 1).expect("search").is_empty());
+
+        assert_eq!(std::fs::read(&path).expect("read index"), bytes);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("index metadata")
+                .modified()
+                .expect("index modification time"),
+            modified
+        );
+        assert_eq!(db::vector_index_state(&conn).await.expect("state"), state);
+    }
+
+    #[tokio::test]
+    async fn missing_index_returns_no_results_without_creating_a_file() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 1).await;
+        let path = dir.path().join("vectors.usearch");
+
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+
+        assert!(reader.search(&vectors[0], 1).expect("search").is_empty());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn reader_and_writable_index_return_the_same_results() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 16).await;
+        let path = dir.path().join("vectors.usearch");
+        let writable = VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+
+        for query in vectors.iter().take(4) {
+            assert_eq!(
+                reader.search(query, 8).expect("reader search"),
+                writable.search(query, 8).expect("writable search")
+            );
+        }
     }
 
     #[tokio::test]

@@ -463,7 +463,7 @@ async fn open_search_adapters<'a>(
         let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
         let vector_path = store.db_path.with_extension("usearch");
         let vector_index =
-            std::sync::Arc::new(vector::VectorIndex::open_or_rebuild(&conn, vector_path).await?);
+            std::sync::Arc::new(vector::VectorReader::open(&conn, &vector_path).await?);
         let semantic = db::DbSemanticSource::new(conn.clone(), vector_index);
         out.push(server::SearchAdapter {
             semantic,
@@ -624,10 +624,8 @@ async fn run_related(
     let rel_path = store.to_relative(&path)?;
     let (_db, conn) = db::connect(&store.db_path, dim).await?;
     let note_embeddings = db::DbNoteEmbeddingsSource::new(conn.clone());
-    let vector_index = std::sync::Arc::new(
-        vector::VectorIndex::open_or_rebuild(&conn, store.db_path.with_extension("usearch"))
-            .await?,
-    );
+    let vector_path = store.db_path.with_extension("usearch");
+    let vector_index = std::sync::Arc::new(vector::VectorReader::open(&conn, &vector_path).await?);
     let related_search = db::DbRelatedSearchSource::new(conn, vector_index);
     let ports = query::RelatedStorePorts {
         note_embeddings: &note_embeddings,

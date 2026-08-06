@@ -494,7 +494,12 @@ mod tests {
         )
         .await;
 
-        let semantic = db::DbSemanticSource::new(store.conn.clone(), Arc::clone(&store.vector));
+        let vector = Arc::new(
+            crate::vector::VectorReader::open(&store.conn, store.vector.path())
+                .await
+                .expect("reader"),
+        );
+        let semantic = db::DbSemanticSource::new(store.conn.clone(), vector);
         let semantic_paths: Vec<String> = semantic
             .search_semantic(&[0.0; 1024], 10)
             .await
@@ -525,7 +530,12 @@ mod tests {
         )
         .await;
 
-        let semantic = db::DbSemanticSource::new(store.conn.clone(), Arc::clone(&store.vector));
+        let vector = Arc::new(
+            crate::vector::VectorReader::open(&store.conn, store.vector.path())
+                .await
+                .expect("reader"),
+        );
+        let semantic = db::DbSemanticSource::new(store.conn.clone(), vector);
         assert!(
             !semantic
                 .search_semantic(&[0.0; 1024], 10)
