@@ -696,7 +696,7 @@ async fn search_related_candidates(
     query_embedding: &[f32],
     exclude_path: &str,
     limit: usize,
-    vector: &crate::vector::VectorIndex,
+    vector: &crate::vector::VectorReader,
 ) -> anyhow::Result<Vec<RelatedResult>> {
     let embedding_json = serde_json::to_string(query_embedding)?;
     let mut k = limit.saturating_mul(5).max(20);
@@ -756,11 +756,14 @@ pub async fn all_note_paths(conn: &Connection) -> anyhow::Result<Vec<String>> {
 /// Adapter: implements `SemanticSource` against a live libsql connection.
 pub struct DbSemanticSource {
     conn: Connection,
-    vector: std::sync::Arc<crate::vector::VectorIndex>,
+    vector: std::sync::Arc<crate::vector::VectorReader>,
 }
 
 impl DbSemanticSource {
-    pub const fn new(conn: Connection, vector: std::sync::Arc<crate::vector::VectorIndex>) -> Self {
+    pub const fn new(
+        conn: Connection,
+        vector: std::sync::Arc<crate::vector::VectorReader>,
+    ) -> Self {
         Self { conn, vector }
     }
 }
@@ -893,11 +896,14 @@ impl NoteEmbeddingsSource for DbNoteEmbeddingsSource {
 
 pub struct DbRelatedSearchSource {
     conn: Connection,
-    vector: std::sync::Arc<crate::vector::VectorIndex>,
+    vector: std::sync::Arc<crate::vector::VectorReader>,
 }
 
 impl DbRelatedSearchSource {
-    pub const fn new(conn: Connection, vector: std::sync::Arc<crate::vector::VectorIndex>) -> Self {
+    pub const fn new(
+        conn: Connection,
+        vector: std::sync::Arc<crate::vector::VectorReader>,
+    ) -> Self {
         Self { conn, vector }
     }
 }
@@ -937,11 +943,15 @@ mod tests {
     async fn test_vector(
         conn: &Connection,
         dir: &tempfile::TempDir,
-    ) -> std::sync::Arc<crate::vector::VectorIndex> {
+    ) -> std::sync::Arc<crate::vector::VectorReader> {
+        let path = dir.path().join("test.usearch");
+        crate::vector::VectorIndex::open_or_rebuild(conn, path.clone())
+            .await
+            .expect("vector");
         std::sync::Arc::new(
-            crate::vector::VectorIndex::open_or_rebuild(conn, dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(conn, &path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         )
     }
 

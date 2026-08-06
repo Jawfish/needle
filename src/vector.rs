@@ -3,6 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::Context;
 use libsql::Connection;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
@@ -15,6 +18,66 @@ const INITIAL_CAPACITY: usize = 256;
 pub struct VectorIndex {
     path: PathBuf,
     index: Index,
+    #[cfg(test)]
+    save_count: AtomicUsize,
+}
+
+pub struct VectorReader {
+    index: Option<Index>,
+}
+
+impl VectorReader {
+    pub async fn open(conn: &Connection, path: &Path) -> anyhow::Result<Self> {
+        let state = db::chunk_index_state(conn).await?;
+        let recorded = db::vector_index_state(conn).await?;
+        let index = if path.exists() {
+            match Index::restore_view(&path.to_string_lossy()) {
+                Ok(index) => {
+                    if recorded != Some(state) || index.size() != state.0 {
+                        tracing::debug!(
+                            path = %path.display(),
+                            ?recorded,
+                            ?state,
+                            index_size = index.size(),
+                            "vector index differs from the chunks table"
+                        );
+                    }
+                    Some(index)
+                }
+                Err(error) => {
+                    if state.0 > 0 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "vector index is unavailable; run `needle reindex`"
+                        );
+                    }
+                    None
+                }
+            }
+        } else {
+            if state.0 > 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    "vector index is unavailable; run `needle reindex`"
+                );
+            }
+            None
+        };
+        Ok(Self { index })
+    }
+
+    pub fn search(&self, query: &[f32], count: usize) -> anyhow::Result<Vec<i64>> {
+        let Some(index) = &self.index else {
+            return Ok(Vec::new());
+        };
+        let matches = index.search(query, count).context("vector search failed")?;
+        matches
+            .keys
+            .into_iter()
+            .map(|key| i64::try_from(key).context("vector key exceeds i64"))
+            .collect()
+    }
 }
 
 impl VectorIndex {
@@ -41,6 +104,8 @@ impl VectorIndex {
             Ok(index) if index.size() == state.0 => Ok(Some(Self {
                 path: path.to_owned(),
                 index,
+                #[cfg(test)]
+                save_count: AtomicUsize::new(0),
             })),
             Ok(_) | Err(_) => Ok(None),
         }
@@ -67,7 +132,12 @@ impl VectorIndex {
                     .context("failed to add vector")?;
             }
         }
-        let result = Self { path, index };
+        let result = Self {
+            path,
+            index,
+            #[cfg(test)]
+            save_count: AtomicUsize::new(0),
+        };
         result.save(conn, state).await?;
         Ok(result)
     }
@@ -108,6 +178,7 @@ impl VectorIndex {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn search(&self, query: &[f32], count: usize) -> anyhow::Result<Vec<i64>> {
         let matches = self
             .index
@@ -134,7 +205,19 @@ impl VectorIndex {
         u64::try_from(id).is_ok_and(|key| self.index.contains(key))
     }
 
+    #[cfg(test)]
+    pub fn save_count(&self) -> usize {
+        self.save_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn reset_save_count(&self) {
+        self.save_count.store(0, Ordering::SeqCst);
+    }
+
     pub async fn save(&self, conn: &Connection, state: (usize, i64)) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.save_count.fetch_add(1, Ordering::SeqCst);
         let parent = self.path.parent().context("vector index has no parent")?;
         fs::create_dir_all(parent)?;
         let temporary = parent.join(format!(
@@ -419,6 +502,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matching_index_searches_without_changing_persistent_state() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 2).await;
+        let path = dir.path().join("vectors.usearch");
+        let writable = VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let bytes = std::fs::read(&path).expect("read index");
+        let modified = std::fs::metadata(&path)
+            .expect("index metadata")
+            .modified()
+            .expect("index modification time");
+        let state = db::vector_index_state(&conn).await.expect("state");
+
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+        assert_eq!(
+            reader.search(&vectors[0], 1).expect("search"),
+            writable.search(&vectors[0], 1).expect("search")
+        );
+
+        assert_eq!(std::fs::read(&path).expect("read index"), bytes);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("index metadata")
+                .modified()
+                .expect("index modification time"),
+            modified
+        );
+        assert_eq!(db::vector_index_state(&conn).await.expect("state"), state);
+    }
+
+    #[tokio::test]
+    async fn diverged_index_searches_without_changing_persistent_state() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 2).await;
+        let path = dir.path().join("vectors.usearch");
+        VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let bytes = std::fs::read(&path).expect("read index");
+        let modified = std::fs::metadata(&path)
+            .expect("index metadata")
+            .modified()
+            .expect("index modification time");
+        let state = db::vector_index_state(&conn).await.expect("state");
+        db::upsert_note(
+            &conn,
+            "extra.md",
+            "hash",
+            &[(
+                PreparedChunk {
+                    content: "extra".to_owned(),
+                    locator: None,
+                },
+                vectors[0].clone(),
+            )],
+        )
+        .await
+        .expect("insert divergence");
+
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+        assert!(!reader.search(&vectors[0], 1).expect("search").is_empty());
+
+        assert_eq!(std::fs::read(&path).expect("read index"), bytes);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("index metadata")
+                .modified()
+                .expect("index modification time"),
+            modified
+        );
+        assert_eq!(db::vector_index_state(&conn).await.expect("state"), state);
+    }
+
+    #[tokio::test]
+    async fn missing_index_returns_no_results_without_creating_a_file() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 1).await;
+        let path = dir.path().join("vectors.usearch");
+
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+
+        assert!(reader.search(&vectors[0], 1).expect("search").is_empty());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn reader_and_writable_index_return_the_same_results() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 16).await;
+        let path = dir.path().join("vectors.usearch");
+        let writable = VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+
+        for query in vectors.iter().take(4) {
+            assert_eq!(
+                reader.search(query, 8).expect("reader search"),
+                writable.search(query, 8).expect("writable search")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stores_each_vector_within_the_size_budget() {
         let count = 2_000;
         let dimensions = 1_024;
@@ -437,6 +621,7 @@ mod tests {
         let stored = VectorIndex {
             path: dir.path().join("vectors.usearch"),
             index,
+            save_count: AtomicUsize::new(0),
         };
         stored.save(&conn, (count, 0)).await.expect("save");
 

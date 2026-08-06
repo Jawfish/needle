@@ -568,10 +568,14 @@ mod tests {
             .expect("upsert failed");
 
         let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
+        let vector_path = dir.path().join("test.usearch");
+        crate::vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = std::sync::Arc::new(
-            crate::vector::VectorIndex::open_or_rebuild(&conn, dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let related_source = crate::db::DbRelatedSearchSource::new(conn, vector);
         let results = find_related(&note_source, &related_source, "a.md", 10)
@@ -596,10 +600,14 @@ mod tests {
             .expect("upsert failed");
 
         let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
+        let vector_path = dir.path().join("test.usearch");
+        crate::vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = std::sync::Arc::new(
-            crate::vector::VectorIndex::open_or_rebuild(&conn, dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let related_source = crate::db::DbRelatedSearchSource::new(conn, vector);
         let results = find_related(&note_source, &related_source, "a.md", 10)
@@ -620,10 +628,14 @@ mod tests {
             .expect("connect failed");
 
         let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
+        let vector_path = dir.path().join("test.usearch");
+        crate::vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = std::sync::Arc::new(
-            crate::vector::VectorIndex::open_or_rebuild(&conn, dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let related_source = crate::db::DbRelatedSearchSource::new(conn, vector);
         let result = find_related(&note_source, &related_source, "nonexistent.md", 10).await;

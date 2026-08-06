@@ -35,8 +35,8 @@ impl std::fmt::Display for IndexStats {
 }
 
 pub enum IndexStatus {
-    Current,
-    FtsStale,
+    Current { vector_mutated: bool },
+    FtsStale { vector_mutated: bool },
     VectorStale,
 }
 
@@ -175,9 +175,12 @@ pub async fn execute_directory_plan_with_vector(
 
     if let Some(vector) = vector
         && !changed_paths.is_empty()
-        && update_vector(conn, vector, &old_embeddings, &changed_paths)
-            .await
-            .is_err()
+        && async {
+            update_vector(conn, vector, &old_embeddings, &changed_paths).await?;
+            vector.save(conn, db::chunk_index_state(conn).await?).await
+        }
+        .await
+        .is_err()
     {
         tracing::warn!("incremental vector update failed");
     }
@@ -253,7 +256,9 @@ pub async fn execute_single_file_plan_with_vector(
     vector: Option<&VectorIndex>,
 ) -> anyhow::Result<IndexStatus> {
     match plan {
-        SingleFilePlan::Unchanged => Ok(IndexStatus::Current),
+        SingleFilePlan::Unchanged => Ok(IndexStatus::Current {
+            vector_mutated: false,
+        }),
         SingleFilePlan::NeedsIndex {
             rel_path,
             content_hash,
@@ -272,25 +277,28 @@ pub async fn execute_single_file_plan_with_vector(
             let old_embeddings =
                 db::chunk_embeddings_for_paths(conn, std::slice::from_ref(&rel_path)).await?;
             db::upsert_note(conn, &rel_path, &content_hash, &paired).await?;
-            let vector_is_stale = match vector {
-                Some(vector) => update_vector(
-                    conn,
-                    vector,
-                    &old_embeddings,
-                    std::slice::from_ref(&rel_path),
-                )
-                .await
-                .is_err(),
-                None => false,
+            let vector_update = match vector {
+                Some(vector) => {
+                    update_vector(
+                        conn,
+                        vector,
+                        &old_embeddings,
+                        std::slice::from_ref(&rel_path),
+                    )
+                    .await
+                }
+                None => Ok(false),
             };
+            let vector_mutated = vector_update.as_ref().is_ok_and(|mutated| *mutated);
+            let vector_is_stale = vector_update.is_err();
 
             let fts_chunks: Vec<PreparedChunk> =
                 paired.iter().map(|(chunk, _)| chunk.clone()).collect();
             let status = if fts.upsert(&rel_path, &fts_chunks).await.is_ok() {
-                IndexStatus::Current
+                IndexStatus::Current { vector_mutated }
             } else {
                 tracing::warn!(path = rel_path, "FTS upsert failed");
-                IndexStatus::FtsStale
+                IndexStatus::FtsStale { vector_mutated }
             };
 
             tracing::info!(path = rel_path, "indexed");
@@ -389,7 +397,9 @@ pub async fn index_single_file_with_preparer(
     vector: Option<&VectorIndex>,
 ) -> anyhow::Result<IndexStatus> {
     if !preparer.supports_path(abs_path) {
-        return Ok(IndexStatus::Current);
+        return Ok(IndexStatus::Current {
+            vector_mutated: false,
+        });
     }
 
     let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
@@ -400,7 +410,9 @@ pub async fn index_single_file_with_preparer(
         Ok(source) => source,
         Err(error) => {
             tracing::warn!(path = %abs_path.display(), error = %error, "failed to read file");
-            return Ok(IndexStatus::Current);
+            return Ok(IndexStatus::Current {
+                vector_mutated: false,
+            });
         }
     };
     let content_hash = hash::content_hash_bytes(&source);
@@ -414,14 +426,18 @@ pub async fn index_single_file_with_preparer(
             path = rel_path,
             "skipping file with unchanged preparation failure"
         );
-        return Ok(IndexStatus::Current);
+        return Ok(IndexStatus::Current {
+            vector_mutated: false,
+        });
     }
     let chunks = match preparer.prepare(abs_path, &source) {
         Ok(chunks) => chunks,
         Err(error) => {
             db::record_failed_file(conn, &rel_path, &content_hash, &format!("{error:#}")).await?;
             tracing::warn!(path = rel_path, error = %error, "failed to prepare file");
-            return Ok(IndexStatus::Current);
+            return Ok(IndexStatus::Current {
+                vector_mutated: false,
+            });
         }
     };
     let plan = plan_single_file(rel_path, stored_hash.as_deref(), content_hash, chunks);
@@ -461,14 +477,15 @@ async fn update_vector(
     vector: &VectorIndex,
     old_embeddings: &[(i64, Vec<f32>)],
     changed_paths: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let new_embeddings = db::chunk_embeddings_for_paths(conn, changed_paths).await?;
     for (id, _) in old_embeddings {
         vector.remove(*id)?;
     }
-    for (id, embedding) in db::chunk_embeddings_for_paths(conn, changed_paths).await? {
-        vector.add(id, &embedding)?;
+    for (id, embedding) in &new_embeddings {
+        vector.add(*id, embedding)?;
     }
-    vector.save(conn, db::chunk_index_state(conn).await?).await
+    Ok(!old_embeddings.is_empty() || !new_embeddings.is_empty())
 }
 
 async fn embed_files(
@@ -927,10 +944,14 @@ mod tests {
                 .any(|(path, _)| path == "empty.txt")
         );
 
+        let vector_path = db_dir.path().join("test.usearch");
+        VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = Arc::new(
-            VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let semantic = db::DbSemanticSource::new(conn.clone(), vector);
         let fts_source = crate::fts::FtsFtsSource::new(fts);
@@ -976,10 +997,14 @@ mod tests {
             .expect("index");
         assert_eq!(stats.added, DOCUMENT_FIXTURES.len());
 
+        let vector_path = db_dir.path().join("test.usearch");
+        VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = Arc::new(
-            VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let semantic = db::DbSemanticSource::new(conn.clone(), vector);
         let semantic_paths: Vec<String> = semantic

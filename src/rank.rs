@@ -367,10 +367,14 @@ mod tests {
         .await
         .expect("fts upsert");
 
+        let vector_path = db_dir.path().join("test.usearch");
+        crate::vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = std::sync::Arc::new(
-            crate::vector::VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let semantic = crate::db::DbSemanticSource::new(conn.clone(), vector);
         let fts_src = crate::fts::FtsFtsSource::new(fts);
@@ -413,10 +417,14 @@ mod tests {
             .await
             .expect("fts upsert");
 
+        let vector_path = db_dir.path().join("test.usearch");
+        crate::vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = std::sync::Arc::new(
-            crate::vector::VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let semantic = crate::db::DbSemanticSource::new(conn.clone(), vector);
         let fts_src = crate::fts::FtsFtsSource::new(fts);
@@ -453,10 +461,14 @@ mod tests {
         let fts_dir = tempfile::tempdir().expect("tempdir");
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
 
+        let vector_path = db_dir.path().join("test.usearch");
+        crate::vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone())
+            .await
+            .expect("vector");
         let vector = std::sync::Arc::new(
-            crate::vector::VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+            crate::vector::VectorReader::open(&conn, &vector_path)
                 .await
-                .expect("vector"),
+                .expect("reader"),
         );
         let semantic = crate::db::DbSemanticSource::new(conn.clone(), vector);
         let fts_src = crate::fts::FtsFtsSource::new(fts);
