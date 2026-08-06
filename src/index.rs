@@ -311,7 +311,7 @@ pub async fn index_directory_with_preparer(
                     conn,
                     &rel_path,
                     &source_file.content_hash,
-                    &error.to_string(),
+                    &format!("{error:#}"),
                 )
                 .await?;
                 tracing::warn!(path = rel_path, error = %error, "failed to prepare file");
@@ -362,7 +362,7 @@ pub async fn index_single_file_with_preparer(
     let chunks = match preparer.prepare(abs_path, &source) {
         Ok(chunks) => chunks,
         Err(error) => {
-            db::record_failed_file(conn, &rel_path, &content_hash, &error.to_string()).await?;
+            db::record_failed_file(conn, &rel_path, &content_hash, &format!("{error:#}")).await?;
             tracing::warn!(path = rel_path, error = %error, "failed to prepare file");
             return Ok(FtsStatus::Current);
         }
@@ -1047,14 +1047,16 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         create_file(notes_dir.path(), "broken.md", "fixed");
+        let working_calls = Arc::new(AtomicUsize::new(0));
         let working = CountingPreparer {
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::clone(&working_calls),
             fails: false,
         };
         let stats =
             index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &working)
                 .await
                 .expect("retry index");
+        assert_eq!(working_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stats.added, 1);
         assert!(
             db::failed_file_hash(&conn, "broken.md")
@@ -1062,6 +1064,92 @@ mod tests {
                 .expect("failure hash")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn clearing_remembered_failures_reprepares_unchanged_content() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "broken.md", "broken");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let embedder = Embedder::create_null(1024);
+        let failing = CountingPreparer {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fails: true,
+        };
+
+        index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &failing)
+            .await
+            .expect("first index");
+        db::clear_failed_files(&conn).await.expect("clear failures");
+
+        let retry_calls = Arc::new(AtomicUsize::new(0));
+        let working = CountingPreparer {
+            calls: Arc::clone(&retry_calls),
+            fails: false,
+        };
+        let stats =
+            index_directory_with_preparer(&conn, &fts, &embedder, notes_dir.path(), &working)
+                .await
+                .expect("retry index");
+
+        assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn recorded_failure_keeps_the_underlying_cause() {
+        struct ContextualFailurePreparer;
+
+        impl DocumentPreparer for ContextualFailurePreparer {
+            fn supports_path(&self, source_path: &Path) -> bool {
+                source_path
+                    .extension()
+                    .is_some_and(|extension| extension == "md")
+            }
+
+            fn prepare(
+                &self,
+                _source_path: &Path,
+                _source: &[u8],
+            ) -> anyhow::Result<Vec<PreparedChunk>> {
+                Err(anyhow::anyhow!("not a char boundary at byte 71")
+                    .context("extracting book.md with Xberg"))
+            }
+
+            fn profile(&self) -> &'static str {
+                "contextual-failure-v1"
+            }
+        }
+
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "book.md", "content");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (_db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+
+        index_directory_with_preparer(
+            &conn,
+            &fts,
+            &Embedder::create_null(1024),
+            notes_dir.path(),
+            &ContextualFailurePreparer,
+        )
+        .await
+        .expect("index");
+
+        let failures = db::failed_files(&conn).await.expect("failures");
+        let (_, error) = failures.first().expect("one failure");
+        assert!(error.contains("extracting book.md with Xberg"), "{error}");
+        assert!(error.contains("not a char boundary at byte 71"), "{error}");
     }
 
     #[tokio::test]

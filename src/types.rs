@@ -14,7 +14,7 @@ pub struct IndexProfile {
     pub preparer: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct RrfWeights {
     pub semantic: f64,
     pub fts: f64,

@@ -58,17 +58,31 @@ fn index_profile(
 /// locations.  Only after the full reindex succeeds are both swapped over the
 /// originals with rename(2).  On any failure both temp artifacts are removed
 /// and the originals are left untouched.
+#[cfg(test)]
 async fn run_reindex(
     db_path: &std::path::Path,
     fts_dir: &std::path::Path,
     embedder: &embed::Embedder,
     notes_dir: &std::path::Path,
 ) -> anyhow::Result<index::IndexStats> {
+    run_reindex_with_retry(db_path, fts_dir, embedder, notes_dir, false).await
+}
+
+async fn run_reindex_with_retry(
+    db_path: &std::path::Path,
+    fts_dir: &std::path::Path,
+    embedder: &embed::Embedder,
+    notes_dir: &std::path::Path,
+    retry_failed: bool,
+) -> anyhow::Result<index::IndexStats> {
     let preparer = document::DefaultPreparer::default();
     let profile = index_profile(embedder, &preparer);
 
     match db::connect_with_profile(db_path, &profile).await {
         Ok((_db, conn)) => {
+            if retry_failed {
+                db::clear_failed_files(&conn).await?;
+            }
             let fts = fts::FtsIndex::open_or_create(fts_dir)?;
             let stats =
                 index::index_directory_with_preparer(&conn, &fts, embedder, notes_dir, &preparer)
@@ -77,7 +91,16 @@ async fn run_reindex(
         }
         Err(ref e) if requires_reindex(e) => {
             tracing::warn!("index profile mismatch detected; rebuilding index atomically");
-            reindex_via_temp(db_path, fts_dir, embedder, notes_dir, &profile, &preparer).await
+            reindex_via_temp(
+                db_path,
+                fts_dir,
+                embedder,
+                notes_dir,
+                &profile,
+                &preparer,
+                retry_failed,
+            )
+            .await
         }
         Err(e) => Err(e),
     }
@@ -90,6 +113,7 @@ async fn reindex_via_temp(
     notes_dir: &std::path::Path,
     profile: &types::IndexProfile,
     preparer: &dyn document::DocumentPreparer,
+    retry_failed: bool,
 ) -> anyhow::Result<index::IndexStats> {
     let tmp_db_path = db_path.with_extension("reindex-tmp");
     let tmp_fts_dir = sibling_fts_dir(fts_dir, "reindex-tmp");
@@ -109,6 +133,7 @@ async fn reindex_via_temp(
         notes_dir,
         profile,
         preparer,
+        retry_failed,
     )
     .await;
 
@@ -290,10 +315,14 @@ async fn build_index_in_temp(
     notes_dir: &std::path::Path,
     profile: &types::IndexProfile,
     preparer: &dyn document::DocumentPreparer,
+    retry_failed: bool,
 ) -> anyhow::Result<index::IndexStats> {
     std::fs::create_dir_all(tmp_fts_dir)
         .with_context(|| format!("creating temp FTS dir {}", tmp_fts_dir.display()))?;
     let (_tmp_db, tmp_conn) = db::connect_with_profile(tmp_db_path, profile).await?;
+    if retry_failed {
+        db::clear_failed_files(&tmp_conn).await?;
+    }
     let tmp_fts = fts::FtsIndex::open_or_create(tmp_fts_dir)?;
     index::index_directory_with_preparer(&tmp_conn, &tmp_fts, embedder, notes_dir, preparer).await
 }
@@ -308,9 +337,12 @@ async fn main() -> anyhow::Result<()> {
 
 fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool {
     match command {
-        Command::Watch | Command::Reindex => true,
+        Command::Watch | Command::Reindex { .. } => true,
         Command::Search { .. } | Command::Serve { .. } => weights.semantic > 0.0,
-        Command::Namespaces | Command::Similar { .. } | Command::Related { .. } => false,
+        Command::Namespaces
+        | Command::Failures
+        | Command::Similar { .. }
+        | Command::Related { .. } => false,
     }
 }
 
@@ -383,15 +415,17 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
 async fn run_reindex_command(
     config: &config::Config,
     embedder: Option<Embedder>,
+    retry_failed: bool,
 ) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
     for store in &config.docs_dirs {
         let _lock = lock::IndexLock::try_acquire(&store.db_path)?;
-        let stats = run_reindex(
+        let stats = run_reindex_with_retry(
             &store.db_path,
             &store.tantivy_dir,
             &embedder,
             &store.notes_dir,
+            retry_failed,
         )
         .await?;
         tracing::info!(%stats, dir = %store.notes_dir.display(), "reindex complete");
@@ -427,6 +461,25 @@ fn run_namespaces(
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     output::print_namespaces(namespaces, mode, writer)
+}
+
+async fn run_failures(
+    config: &Config,
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for store in &config.docs_dirs {
+        let (_db, conn) = db::connect(&store.db_path, None).await?;
+        for (path, error) in db::failed_files(&conn).await? {
+            failures.push(output::Failure {
+                directory: store.notes_dir.to_string_lossy().into_owned(),
+                path,
+                error,
+            });
+        }
+    }
+    output::print_failures(&failures, mode, writer)
 }
 
 fn search_result_memberships(
@@ -566,6 +619,29 @@ async fn run_related(
     Ok(())
 }
 
+async fn run_serve(
+    config: &Config,
+    embedder: Option<Embedder>,
+    host: std::net::IpAddr,
+    port: u16,
+) -> anyhow::Result<()> {
+    let preparer = document::DefaultPreparer::default();
+    let profile = embedder
+        .as_ref()
+        .map(|value| index_profile(value, &preparer));
+    let adapters = open_search_adapters(config.docs_dirs.iter(), profile.as_ref()).await?;
+    server::run(
+        host,
+        port,
+        &config.docs_dirs,
+        &config.namespaces,
+        adapters,
+        embedder,
+        config.weights,
+    )
+    .await
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let cli_weights = extract_cli_weights(&cli.command);
     let cli_embed = CliEmbedArgs {
@@ -596,7 +672,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             &mut std::io::stdout(),
         ),
         Command::Watch => run_watch(&config, embedder).await,
-        Command::Reindex => run_reindex_command(&config, embedder).await,
+        Command::Failures => {
+            run_failures(
+                &config,
+                output_mode(cli.json, false),
+                &mut std::io::stdout(),
+            )
+            .await
+        }
+        Command::Reindex { retry_failed } => {
+            run_reindex_command(&config, embedder, retry_failed).await
+        }
         Command::Search {
             query,
             namespaces,
@@ -615,23 +701,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Serve { host, port } => {
-            let preparer = document::DefaultPreparer::default();
-            let profile = embedder
-                .as_ref()
-                .map(|value| index_profile(value, &preparer));
-            let adapters = open_search_adapters(config.docs_dirs.iter(), profile.as_ref()).await?;
-            server::run(
-                host,
-                port,
-                &config.docs_dirs,
-                &config.namespaces,
-                adapters,
-                embedder,
-                config.weights,
-            )
-            .await
-        }
+        Command::Serve { host, port } => run_serve(&config, embedder, host, port).await,
         Command::Similar {
             namespaces,
             threshold,
@@ -842,7 +912,12 @@ mod tests {
             fts: 0.0,
             filename: 0.0,
         };
-        assert!(search_needs_embedder(&Command::Reindex, &weights));
+        assert!(search_needs_embedder(
+            &Command::Reindex {
+                retry_failed: false
+            },
+            &weights
+        ));
     }
 
     #[test]

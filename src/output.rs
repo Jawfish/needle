@@ -26,6 +26,19 @@ pub struct SearchResult {
     pub namespaces: Vec<String>,
 }
 
+pub struct Failure {
+    pub directory: String,
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Serialize)]
+struct FailureOutput {
+    directory: String,
+    path: String,
+    error: String,
+}
+
 #[derive(Serialize)]
 struct JsonSearchResult<'a> {
     path: &'a str,
@@ -61,6 +74,50 @@ pub fn print_namespaces(
         }
     }
     Ok(())
+}
+
+pub fn print_failures(
+    failures: &[Failure],
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    let failures = failure_output(failures);
+    match mode {
+        OutputMode::Json => {
+            let json = serde_json::to_string(&failures)?;
+            writeln!(writer, "{json}")?;
+        }
+        OutputMode::Human { .. } => {
+            let mut directory = None;
+            for failure in failures {
+                if directory.as_deref() != Some(failure.directory.as_str()) {
+                    writeln!(writer, "{}", failure.directory)?;
+                    directory = Some(failure.directory.clone());
+                }
+                writeln!(writer, "  {}\t{}", failure.path, failure.error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn failure_output(failures: &[Failure]) -> Vec<FailureOutput> {
+    let mut failures: Vec<&Failure> = failures.iter().collect();
+    failures.sort_unstable_by(|left, right| {
+        (&left.directory, &left.path, &left.error).cmp(&(
+            &right.directory,
+            &right.path,
+            &right.error,
+        ))
+    });
+    failures
+        .into_iter()
+        .map(|failure| FailureOutput {
+            directory: failure.directory.clone(),
+            path: failure.path.clone(),
+            error: failure.error.clone(),
+        })
+        .collect()
 }
 
 fn namespace_output(namespaces: &[Namespace]) -> Vec<NamespaceOutput> {
@@ -257,6 +314,14 @@ mod tests {
         }
     }
 
+    fn make_failure(directory: &str, path: &str, error: &str) -> Failure {
+        Failure {
+            directory: directory.to_owned(),
+            path: path.to_owned(),
+            error: error.to_owned(),
+        }
+    }
+
     fn make_fused(path: &str, score: f64, snippet: &str) -> SearchResult {
         SearchResult {
             fused: FusedResult {
@@ -348,6 +413,35 @@ mod tests {
     fn namespaces_json_empty_output_is_an_array() {
         let output = write_to_string(|writer| print_namespaces(&[], OutputMode::Json, writer));
         assert_eq!(output, "[]\n");
+    }
+
+    #[test]
+    fn failures_human_output_groups_sorted_entries_by_directory() {
+        let failures = vec![
+            make_failure("/docs/zeta", "z.md", "z error"),
+            make_failure("/docs/alpha", "z.md", "second error"),
+            make_failure("/docs/alpha", "a.md", "first error"),
+        ];
+        let output = write_to_string(|writer| {
+            print_failures(&failures, OutputMode::Human { paths_only: false }, writer)
+        });
+        assert_eq!(
+            output,
+            "/docs/alpha\n  a.md\tfirst error\n  z.md\tsecond error\n/docs/zeta\n  z.md\tz error\n"
+        );
+    }
+
+    #[test]
+    fn failures_json_output_is_sorted_and_complete() {
+        let failures = vec![
+            make_failure("/docs/zeta", "z.md", "z error"),
+            make_failure("/docs/alpha", "a.md", "first error"),
+        ];
+        let output = write_to_string(|writer| print_failures(&failures, OutputMode::Json, writer));
+        assert_eq!(
+            output,
+            "[{\"directory\":\"/docs/alpha\",\"path\":\"a.md\",\"error\":\"first error\"},{\"directory\":\"/docs/zeta\",\"path\":\"z.md\",\"error\":\"z error\"}]\n"
+        );
     }
 
     #[test]

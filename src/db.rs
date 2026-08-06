@@ -329,6 +329,17 @@ pub async fn all_failed_file_hashes(conn: &Connection) -> anyhow::Result<HashMap
     Ok(hashes)
 }
 
+pub async fn failed_files(conn: &Connection) -> anyhow::Result<Vec<(String, String)>> {
+    let mut rows = conn
+        .query("SELECT path, error FROM failed_files ORDER BY path", ())
+        .await?;
+    let mut failures = Vec::new();
+    while let Some(row) = rows.next().await? {
+        failures.push((row.get(0)?, row.get(1)?));
+    }
+    Ok(failures)
+}
+
 pub async fn failed_file_hash(conn: &Connection, path: &str) -> anyhow::Result<Option<String>> {
     let mut rows = conn
         .query(
@@ -359,6 +370,11 @@ pub async fn record_failed_file(
 pub async fn clear_failed_file(conn: &Connection, path: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM failed_files WHERE path = ?1", [path])
         .await?;
+    Ok(())
+}
+
+pub async fn clear_failed_files(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM failed_files", ()).await?;
     Ok(())
 }
 
@@ -1134,29 +1150,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_file_helpers_record_and_clear_failures() {
+    async fn failed_file_helpers_list_sorted_failures_and_clear_all() {
         let (_dir, _db, conn) = test_db().await;
-        record_failed_file(&conn, "broken.md", "hash", "bad document")
+        record_failed_file(&conn, "zebra.md", "hash-z", "zebra error")
+            .await
+            .expect("record");
+        record_failed_file(&conn, "alpha.md", "hash-a", "alpha error")
             .await
             .expect("record");
         assert_eq!(
-            failed_file_hash(&conn, "broken.md").await.expect("hash"),
-            Some("hash".to_owned())
+            failed_files(&conn).await.expect("failures"),
+            vec![
+                ("alpha.md".to_owned(), "alpha error".to_owned()),
+                ("zebra.md".to_owned(), "zebra error".to_owned()),
+            ]
+        );
+        assert_eq!(
+            failed_file_hash(&conn, "zebra.md").await.expect("hash"),
+            Some("hash-z".to_owned())
         );
         assert_eq!(
             all_failed_file_hashes(&conn)
                 .await
                 .expect("hashes")
-                .get("broken.md"),
-            Some(&"hash".to_owned())
+                .get("zebra.md"),
+            Some(&"hash-z".to_owned())
         );
-        clear_failed_file(&conn, "broken.md").await.expect("clear");
-        assert!(
-            failed_file_hash(&conn, "broken.md")
-                .await
-                .expect("hash")
-                .is_none()
-        );
+        clear_failed_files(&conn).await.expect("clear all");
+        assert!(failed_files(&conn).await.expect("failures").is_empty());
     }
 
     #[tokio::test]

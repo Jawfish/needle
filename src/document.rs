@@ -66,50 +66,134 @@ impl DocumentPreparer for XbergPreparer {
     }
 
     fn prepare(&self, source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<PreparedChunk>> {
-        let mime_type = mime_type(source_path).expect("supported paths have a MIME type");
-        let input = xberg::ExtractInput::from_bytes(
-            source.to_vec(),
-            mime_type,
-            Some(source_path.to_string_lossy().to_string()),
-        );
-        let extraction = extract_with_xberg(input)
-            .with_context(|| format!("extracting {} with Xberg", source_path.display()))?;
-
-        if let Some(error) = extraction.errors.first() {
-            anyhow::bail!(
-                "extracting {} with Xberg: {}",
-                source_path.display(),
-                error.message
-            );
-        }
-
-        Ok(extraction
-            .results
-            .into_iter()
-            .flat_map(|document| {
-                for warning in document.processing_warnings {
-                    tracing::warn!(
-                        path = %source_path.display(),
-                        source = %warning.source,
-                        message = %warning.message,
-                        "Xberg processing warning"
-                    );
+        match extract_chunks(source_path, source) {
+            Ok(chunks) => Ok(chunks),
+            Err(error) => {
+                if !is_zip_container(source_path) || central_directory_is_readable(source) {
+                    return Err(error);
                 }
-                document
-                    .chunks
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|chunk| PreparedChunk {
-                        locator: chunk_locator(&chunk),
-                        content: chunk.content,
-                    })
-            })
-            .collect())
+                let Some(rebuilt) = rebuild_zip_container(source) else {
+                    return Err(error);
+                };
+                tracing::warn!(
+                    path = %source_path.display(),
+                    "rebuilding damaged zip container in memory"
+                );
+                extract_chunks(source_path, &rebuilt)
+            }
+        }
     }
 
     fn profile(&self) -> &'static str {
         "xberg-1.0.14-pdf-office-html-render-markdown-chunker-markdown-max-1000-overlap-200-trim-sizing-characters-heading-context-page-extraction-locators-v1-ocr-off-cache-off"
     }
+}
+
+#[cfg(feature = "documents")]
+const ZIP_CONTAINER_EXTENSIONS: [&str; 2] = ["epub", "docx"];
+
+#[cfg(feature = "documents")]
+fn is_zip_container(source_path: &Path) -> bool {
+    source_path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| {
+            ZIP_CONTAINER_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+#[cfg(feature = "documents")]
+fn central_directory_is_readable(source: &[u8]) -> bool {
+    zip::ZipArchive::new(std::io::Cursor::new(source)).is_ok()
+}
+
+#[cfg(feature = "documents")]
+fn entries_readable_by_streaming(source: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read as _;
+
+    let mut cursor = std::io::Cursor::new(source);
+    let mut entries = Vec::new();
+    while let Ok(Some(mut file)) = zip::read::read_zipfile_from_stream(&mut cursor) {
+        let name = file.name().to_owned();
+        let is_dir = file.is_dir();
+        let mut content = Vec::new();
+        if file.read_to_end(&mut content).is_err() {
+            break;
+        }
+        if !is_dir {
+            entries.push((name, content));
+        }
+    }
+    entries
+}
+
+#[cfg(feature = "documents")]
+fn rebuild_zip_container(source: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write as _;
+
+    let entries = entries_readable_by_streaming(source);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut writer = zip::write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, content) in entries {
+        let options = if name == "mimetype" {
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+        } else {
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+        };
+        writer.start_file(name, options).ok()?;
+        writer.write_all(&content).ok()?;
+    }
+    Some(writer.finish().ok()?.into_inner())
+}
+
+#[cfg(feature = "documents")]
+fn extract_chunks(source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<PreparedChunk>> {
+    let mime_type = mime_type(source_path).expect("supported paths have a MIME type");
+    let input = xberg::ExtractInput::from_bytes(
+        source.to_vec(),
+        mime_type,
+        Some(source_path.to_string_lossy().to_string()),
+    );
+    let extraction = extract_with_xberg(input)
+        .with_context(|| format!("extracting {} with Xberg", source_path.display()))?;
+
+    if let Some(error) = extraction.errors.first() {
+        anyhow::bail!(
+            "extracting {} with Xberg: {}",
+            source_path.display(),
+            error.message
+        );
+    }
+
+    Ok(extraction
+        .results
+        .into_iter()
+        .flat_map(|document| {
+            for warning in document.processing_warnings {
+                tracing::warn!(
+                    path = %source_path.display(),
+                    source = %warning.source,
+                    message = %warning.message,
+                    "Xberg processing warning"
+                );
+            }
+            document
+                .chunks
+                .unwrap_or_default()
+                .into_iter()
+                .map(|chunk| PreparedChunk {
+                    locator: chunk_locator(&chunk),
+                    content: chunk.content,
+                })
+        })
+        .collect())
 }
 
 #[cfg(feature = "documents")]
@@ -180,19 +264,22 @@ fn extract_with_xberg(input: xberg::ExtractInput) -> xberg::Result<xberg::Extrac
         ..Default::default()
     };
 
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::scope(|scope| {
-            scope
-                .spawn(|| xberg_runtime().block_on(xberg::extract(input, &config)))
-                .join()
-                .map_err(|_| {
-                    xberg::XbergError::Other("Xberg extraction thread panicked".to_owned())
-                })?
-        });
-    }
-
-    xberg_runtime().block_on(xberg::extract(input, &config))
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(EXTRACTION_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                xberg_runtime().block_on(xberg::extract(input, &config))
+            })
+            .map_err(|error| {
+                xberg::XbergError::Other(format!("spawning Xberg extraction thread: {error}"))
+            })?
+            .join()
+            .map_err(|_| xberg::XbergError::Other("Xberg extraction thread panicked".to_owned()))?
+    })
 }
+
+#[cfg(feature = "documents")]
+const EXTRACTION_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(feature = "documents")]
 fn xberg_runtime() -> &'static tokio::runtime::Runtime {
@@ -464,5 +551,180 @@ mod tests {
     fn strip_frontmatter_preserves_non_yaml_block() {
         let content = "---\nthis is not yaml\n---\n\nBody";
         assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[cfg(feature = "documents")]
+    fn minimal_epub() -> Vec<u8> {
+        use std::io::Write as _;
+
+        let container = concat!(
+            "<?xml version=\"1.0\"?>",
+            "<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">",
+            "<rootfiles><rootfile full-path=\"OEBPS/content.opf\" ",
+            "media-type=\"application/oebps-package+xml\"/></rootfiles></container>"
+        );
+        let opf = concat!(
+            "<?xml version=\"1.0\"?>",
+            "<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"id\">",
+            "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">",
+            "<dc:title>Damaged Container Test</dc:title>",
+            "<dc:identifier id=\"id\">urn:uuid:test</dc:identifier>",
+            "<dc:language>en</dc:language></metadata>",
+            "<manifest><item id=\"ch1\" href=\"ch1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>",
+            "<spine><itemref idref=\"ch1\"/></spine></package>"
+        );
+        let chapter = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Chapter One</title></head>",
+            "<body><h1>Chapter One</h1>",
+            "<p>Salvaged prose about resilient indexing of damaged archives.</p>",
+            "</body></html>"
+        );
+
+        let mut writer = zip::write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        writer.start_file("mimetype", stored).expect("mimetype");
+        writer
+            .write_all(b"application/epub+zip")
+            .expect("write mimetype");
+        for (name, body) in [
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/ch1.xhtml", chapter),
+        ] {
+            writer.start_file(name, deflated).expect("start entry");
+            writer.write_all(body.as_bytes()).expect("write entry");
+        }
+        writer.finish().expect("finish archive").into_inner()
+    }
+
+    #[cfg(feature = "documents")]
+    fn without_central_directory(archive: &[u8]) -> Vec<u8> {
+        let signature = [0x50, 0x4b, 0x01, 0x02];
+        let cut = archive
+            .windows(signature.len())
+            .position(|window| window == signature)
+            .expect("archive has a central directory");
+        archive[..cut].to_vec()
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn a_truncated_archive_is_unreadable_through_its_central_directory() {
+        let epub = minimal_epub();
+        assert!(central_directory_is_readable(&epub));
+        assert!(!central_directory_is_readable(&without_central_directory(
+            &epub
+        )));
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn rebuilding_recovers_every_entry_from_a_truncated_archive() {
+        let epub = minimal_epub();
+        let damaged = without_central_directory(&epub);
+
+        let rebuilt = rebuild_zip_container(&damaged).expect("rebuild should recover entries");
+
+        assert!(central_directory_is_readable(&rebuilt));
+        let names: Vec<String> = entries_readable_by_streaming(&rebuilt)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "mimetype".to_owned(),
+                "META-INF/container.xml".to_owned(),
+                "OEBPS/content.opf".to_owned(),
+                "OEBPS/ch1.xhtml".to_owned(),
+            ]
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn rebuilding_reports_nothing_for_bytes_that_are_not_an_archive() {
+        assert!(rebuild_zip_container(b"this is not an archive at all").is_none());
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn preparing_a_truncated_epub_yields_the_same_chunks_as_the_intact_one() {
+        let epub = minimal_epub();
+        let damaged = without_central_directory(&epub);
+        let path = Path::new("damaged.epub");
+
+        let intact_chunks = XbergPreparer.prepare(path, &epub).expect("intact prepares");
+        let damaged_chunks = XbergPreparer
+            .prepare(path, &damaged)
+            .expect("damaged prepares after in-memory rebuild");
+
+        assert!(
+            damaged_chunks
+                .iter()
+                .any(|chunk| chunk.content.contains("Salvaged prose")),
+            "recovered chunks should carry the chapter text: {damaged_chunks:?}"
+        );
+        assert_eq!(
+            damaged_chunks
+                .iter()
+                .map(|c| &c.content)
+                .collect::<Vec<_>>(),
+            intact_chunks.iter().map(|c| &c.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn a_deeply_nested_document_does_not_abort_the_process() {
+        use std::io::Write as _;
+
+        let depth = 3000;
+        let mut chapter = String::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Deep</title></head><body>",
+        );
+        for _ in 0..depth {
+            chapter.push_str("<div>");
+        }
+        chapter.push_str("deeply buried prose");
+        for _ in 0..depth {
+            chapter.push_str("</div>");
+        }
+        chapter.push_str("</body></html>");
+
+        let intact = minimal_epub();
+        let mut rewritten = zip::write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries_readable_by_streaming(&intact) {
+            rewritten.start_file(&name, options).expect("start entry");
+            if name == "OEBPS/ch1.xhtml" {
+                rewritten.write_all(chapter.as_bytes()).expect("write deep");
+            } else {
+                rewritten.write_all(&content).expect("write entry");
+            }
+        }
+        let epub = rewritten.finish().expect("finish archive").into_inner();
+
+        let outcome = XbergPreparer.prepare(Path::new("deep.epub"), &epub);
+
+        assert!(
+            outcome.is_ok(),
+            "a deeply nested document must extract or fail cleanly, never abort: {outcome:?}"
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn only_zip_backed_formats_are_treated_as_containers() {
+        assert!(is_zip_container(Path::new("book.epub")));
+        assert!(is_zip_container(Path::new("REPORT.DOCX")));
+        assert!(!is_zip_container(Path::new("paper.pdf")));
+        assert!(!is_zip_container(Path::new("notes.md")));
     }
 }
