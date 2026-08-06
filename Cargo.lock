@@ -3658,7 +3658,6 @@ dependencies = [
  "clap",
  "fastembed",
  "fs2",
- "hyper 1.8.1",
  "libsql",
  "maud",
  "notify",

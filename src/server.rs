@@ -78,21 +78,14 @@ pub async fn run(
         tracing::warn!("WARNING: unauthenticated indexed content is exposed at http://{address}");
     }
     tracing::info!("serving indexed documents at http://{address}");
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-    axum::Server::from_tcp(
-        listener
-            .into_std()
-            .context("preparing HTTP server listener")?,
-    )?
-    .serve(router(state).into_make_service())
-    .with_graceful_shutdown(async move {
-        if shutdown.await.is_ok() {
-            tracing::info!("shutting down");
-        }
-    })
-    .await
-    .context("running HTTP server")
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("shutting down");
+            }
+        })
+        .await
+        .context("running HTTP server")
 }
 
 impl AppState {
@@ -501,8 +494,10 @@ mod tests {
         config::Namespace,
         rank::{Candidate, SearchFuture},
     };
-    use axum::{body::Body, http::Request};
-    use hyper::body::to_bytes;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use std::{collections::HashMap, path::PathBuf};
     use tower::ServiceExt;
 
@@ -616,8 +611,13 @@ mod tests {
             .await
             .expect("response");
         let status = response.status();
-        let body = String::from_utf8(to_bytes(response.into_body()).await.expect("body").to_vec())
-            .expect("utf8");
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .to_vec(),
+        )
+        .expect("utf8");
         (status, body)
     }
     fn namespace(name: &str, description: Option<&str>, paths: &[&str]) -> Namespace {
