@@ -127,21 +127,6 @@ async fn init_schema(
     )
     .await?;
 
-    let has_vector_idx = conn
-        .query("SELECT 1 FROM sqlite_master WHERE name='chunks_idx'", ())
-        .await?
-        .next()
-        .await?
-        .is_some();
-
-    if !has_vector_idx {
-        conn.execute(
-            "CREATE INDEX chunks_idx ON chunks(libsql_vector_idx(embedding, 'metric=cosine'))",
-            (),
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -218,6 +203,10 @@ async fn resolve_profile(conn: &Connection, expected: &IndexProfile) -> anyhow::
     Ok(())
 }
 
+pub async fn embedding_dimension(conn: &Connection) -> anyhow::Result<Option<usize>> {
+    stored_dim(conn).await
+}
+
 async fn stored_dim(conn: &Connection) -> anyhow::Result<Option<usize>> {
     let mut rows = conn
         .query("SELECT value FROM metadata WHERE key = 'embedding_dim'", ())
@@ -238,6 +227,35 @@ async fn store_dim(conn: &Connection, dim: usize) -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+pub async fn legacy_vector_index_exists(conn: &Connection) -> anyhow::Result<bool> {
+    Ok(conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='chunks_idx'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some())
+}
+
+pub async fn reclaim_legacy_vector_index(conn: &Connection) -> anyhow::Result<bool> {
+    if !legacy_vector_index_exists(conn).await? {
+        return Ok(false);
+    }
+    tracing::info!("dropping the legacy libsql vector index and reclaiming its pages");
+    conn.execute("DROP INDEX chunks_idx", ()).await?;
+    if let Err(error) = conn.execute("VACUUM", ()).await {
+        tracing::warn!(
+            %error,
+            "legacy vector index dropped, but reclaiming its pages needs free space \
+             roughly equal to the database; the space stays available for reuse inside \
+             the database and a later VACUUM will return it to the filesystem"
+        );
+    }
+    Ok(true)
 }
 
 pub async fn chunks_table_exists(conn: &Connection) -> anyhow::Result<bool> {
@@ -515,49 +533,132 @@ pub async fn all_chunks(conn: &Connection) -> anyhow::Result<Vec<(String, Prepar
     Ok(results)
 }
 
-pub async fn search_semantic(
+pub async fn all_chunk_embeddings_with_ids(
     conn: &Connection,
-    query_embedding: &[f32],
-    limit: usize,
-) -> anyhow::Result<Vec<SearchResult>> {
-    let embedding_json = serde_json::to_string(query_embedding)?;
-
+) -> anyhow::Result<Vec<(i64, Vec<f32>)>> {
+    if !chunks_table_exists(conn).await? {
+        return Ok(Vec::new());
+    }
     let mut rows = conn
         .query(
-            "SELECT c.path, c.content, c.locator, vector_distance_cos(c.embedding, vector32(?1)) AS distance
-             FROM vector_top_k('chunks_idx', vector32(?1), ?2) AS v
-             JOIN chunks c ON c.rowid = v.id
-             ORDER BY distance ASC",
-            libsql::params![
-                embedding_json,
-                i64::try_from(limit.saturating_mul(3)).unwrap_or(i64::MAX)
-            ],
+            "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL ORDER BY id",
+            (),
         )
         .await?;
-
-    let mut seen = HashSet::new();
-    let mut results = Vec::new();
-
+    let mut embeddings = Vec::new();
     while let Some(row) = rows.next().await? {
-        let path: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let locator: Option<String> = row.get(2)?;
-
-        if seen.contains(&path) {
-            continue;
-        }
-        seen.insert(path.clone());
-        results.push(SearchResult {
-            path,
-            snippet: content,
-            locator,
-        });
-        if results.len() >= limit {
-            break;
-        }
+        embeddings.push((row.get(0)?, decode_embedding(&row.get::<Vec<u8>>(1)?)?));
     }
+    Ok(embeddings)
+}
 
-    Ok(results)
+pub async fn chunk_embeddings_for_paths(
+    conn: &Connection,
+    paths: &[String],
+) -> anyhow::Result<Vec<(i64, Vec<f32>)>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (1..=paths.len())
+        .map(|position| format!("?{position}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, embedding FROM chunks WHERE path IN ({placeholders}) AND embedding IS NOT NULL ORDER BY id"
+    );
+    let params = paths.iter().cloned().map(libsql::Value::Text);
+    let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
+    let mut embeddings = Vec::new();
+    while let Some(row) = rows.next().await? {
+        embeddings.push((row.get(0)?, decode_embedding(&row.get::<Vec<u8>>(1)?)?));
+    }
+    Ok(embeddings)
+}
+
+pub async fn chunk_index_state(conn: &Connection) -> anyhow::Result<(usize, i64)> {
+    if !chunks_table_exists(conn).await? {
+        return Ok((0, 0));
+    }
+    let row = conn
+        .query("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM chunks", ())
+        .await?
+        .next()
+        .await?
+        .context("missing chunk state")?;
+    Ok((
+        usize::try_from(row.get::<i64>(0)?).context("chunk count exceeds usize")?,
+        row.get(1)?,
+    ))
+}
+
+pub async fn vector_index_state(conn: &Connection) -> anyhow::Result<Option<(usize, i64)>> {
+    let mut rows = conn
+        .query(
+            "SELECT value FROM metadata WHERE key = 'vector_index_state'",
+            (),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let value: String = row.get(0)?;
+    let (count, max_id) = value
+        .split_once(':')
+        .context("invalid vector index state")?;
+    Ok(Some((
+        count.parse().context("invalid vector index count")?,
+        max_id.parse().context("invalid vector index max id")?,
+    )))
+}
+
+pub async fn store_vector_index_state(
+    conn: &Connection,
+    state: (usize, i64),
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('vector_index_state', ?1)",
+        [format!("{}:{}", state.0, state.1)],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn search_semantic_candidates(
+    conn: &Connection,
+    query_embedding: &[f32],
+    candidates: Vec<i64>,
+) -> anyhow::Result<Vec<SearchResult>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (2..=candidates.len() + 1)
+        .map(|position| format!("?{position}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT path, content, locator, vector_distance_cos(embedding, vector32(?1)) FROM chunks WHERE id IN ({placeholders})"
+    );
+    let mut params = Vec::with_capacity(candidates.len() + 1);
+    params.push(libsql::Value::Text(serde_json::to_string(query_embedding)?));
+    params.extend(candidates.into_iter().map(libsql::Value::Integer));
+    let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
+    let mut scored = Vec::new();
+    while let Some(row) = rows.next().await? {
+        scored.push((
+            row.get::<Option<f64>>(3)?.unwrap_or(1.0),
+            SearchResult {
+                path: row.get(0)?,
+                snippet: row.get(1)?,
+                locator: row.get(2)?,
+            },
+        ));
+    }
+    scored.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut paths = HashSet::new();
+    Ok(scored
+        .into_iter()
+        .filter_map(|(_, result)| paths.insert(result.path.clone()).then_some(result))
+        .collect())
 }
 
 pub async fn chunk_embeddings_for_path(
@@ -590,59 +691,54 @@ pub async fn chunk_embeddings_for_path(
 // Prevents unbounded growth if the index is very large and results are scarce.
 const RELATED_MAX_K: usize = 100_000;
 
-pub async fn search_related(
+async fn search_related_candidates(
     conn: &Connection,
     query_embedding: &[f32],
     exclude_path: &str,
     limit: usize,
+    vector: &crate::vector::VectorIndex,
 ) -> anyhow::Result<Vec<RelatedResult>> {
     let embedding_json = serde_json::to_string(query_embedding)?;
-
-    // Start with a modest candidate pool and double until we have enough distinct
-    // non-excluded results or we hit the index ceiling. The excluded note's chunks
-    // can dominate the top-K when it is long, so a fixed small multiplier silently
-    // drops valid related documents.
     let mut k = limit.saturating_mul(5).max(20);
-
     loop {
-        let k_param = i64::try_from(k).unwrap_or(i64::MAX);
-        let mut rows = conn
-            .query(
-                "SELECT c.path, vector_distance_cos(c.embedding, vector32(?1)) AS distance
-                 FROM vector_top_k('chunks_idx', vector32(?1), ?2) AS v
-                 JOIN chunks c ON c.rowid = v.id
-                 ORDER BY distance ASC",
-                libsql::params![embedding_json.clone(), k_param],
-            )
-            .await?;
-
-        let mut seen = HashSet::new();
-        let mut results = Vec::new();
-        let mut total_candidates = 0usize;
-
-        while let Some(row) = rows.next().await? {
-            total_candidates += 1;
-            let path: String = row.get(0)?;
-            let distance: f64 = row.get(1)?;
-
-            if path == exclude_path || seen.contains(&path) {
-                continue;
-            }
-            seen.insert(path.clone());
-            results.push(RelatedResult {
-                path,
-                similarity: 1.0 - distance,
-            });
-            if results.len() >= limit {
-                break;
-            }
+        let candidates = vector.search(query_embedding, k)?;
+        let candidate_count = candidates.len();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let exhausted_index = total_candidates < k;
-        if results.len() >= limit || exhausted_index || k >= RELATED_MAX_K {
+        let placeholders = (2..=candidates.len() + 1)
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT path, vector_distance_cos(embedding, vector32(?1)) FROM chunks WHERE id IN ({placeholders})"
+        );
+        let mut params = Vec::with_capacity(candidates.len() + 1);
+        params.push(libsql::Value::Text(embedding_json.clone()));
+        params.extend(candidates.into_iter().map(libsql::Value::Integer));
+        let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
+        let mut scored = Vec::new();
+        while let Some(row) = rows.next().await? {
+            scored.push((
+                row.get::<Option<f64>>(1)?.unwrap_or(1.0),
+                row.get::<String>(0)?,
+            ));
+        }
+        scored.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let mut paths = HashSet::new();
+        let results: Vec<_> = scored
+            .into_iter()
+            .filter_map(|(distance, path)| {
+                (path != exclude_path && paths.insert(path.clone())).then_some(RelatedResult {
+                    path,
+                    similarity: 1.0 - distance,
+                })
+            })
+            .take(limit)
+            .collect();
+        if results.len() >= limit || k >= RELATED_MAX_K || candidate_count < k {
             return Ok(results);
         }
-
         k = k.saturating_mul(2).min(RELATED_MAX_K);
     }
 }
@@ -660,11 +756,12 @@ pub async fn all_note_paths(conn: &Connection) -> anyhow::Result<Vec<String>> {
 /// Adapter: implements `SemanticSource` against a live libsql connection.
 pub struct DbSemanticSource {
     conn: Connection,
+    vector: std::sync::Arc<crate::vector::VectorIndex>,
 }
 
 impl DbSemanticSource {
-    pub const fn new(conn: Connection) -> Self {
-        Self { conn }
+    pub const fn new(conn: Connection, vector: std::sync::Arc<crate::vector::VectorIndex>) -> Self {
+        Self { conn, vector }
     }
 }
 
@@ -675,15 +772,21 @@ impl SemanticSource for DbSemanticSource {
         limit: usize,
     ) -> crate::rank::SearchFuture<'a, Vec<Candidate>> {
         Box::pin(async move {
-            let results = search_semantic(&self.conn, query_embedding, limit).await?;
-            Ok(results
-                .into_iter()
-                .map(|r| Candidate {
-                    path: r.path,
-                    snippet: r.snippet,
-                    locator: r.locator,
-                })
-                .collect())
+            Ok(search_semantic_candidates(
+                &self.conn,
+                query_embedding,
+                self.vector
+                    .search(query_embedding, limit.saturating_mul(3))?,
+            )
+            .await?
+            .into_iter()
+            .take(limit)
+            .map(|r| Candidate {
+                path: r.path,
+                snippet: r.snippet,
+                locator: r.locator,
+            })
+            .collect())
         })
     }
 }
@@ -790,11 +893,12 @@ impl NoteEmbeddingsSource for DbNoteEmbeddingsSource {
 
 pub struct DbRelatedSearchSource {
     conn: Connection,
+    vector: std::sync::Arc<crate::vector::VectorIndex>,
 }
 
 impl DbRelatedSearchSource {
-    pub const fn new(conn: Connection) -> Self {
-        Self { conn }
+    pub const fn new(conn: Connection, vector: std::sync::Arc<crate::vector::VectorIndex>) -> Self {
+        Self { conn, vector }
     }
 }
 
@@ -805,7 +909,13 @@ impl RelatedSearchSource for DbRelatedSearchSource {
         exclude_path: &'a str,
         limit: usize,
     ) -> crate::similar::SimilarFuture<'a, Vec<RelatedResult>> {
-        Box::pin(search_related(&self.conn, embedding, exclude_path, limit))
+        Box::pin(search_related_candidates(
+            &self.conn,
+            embedding,
+            exclude_path,
+            limit,
+            &self.vector,
+        ))
     }
 }
 
@@ -822,6 +932,17 @@ mod tests {
             .await
             .expect("connect failed");
         (dir, db, conn)
+    }
+
+    async fn test_vector(
+        conn: &Connection,
+        dir: &tempfile::TempDir,
+    ) -> std::sync::Arc<crate::vector::VectorIndex> {
+        std::sync::Arc::new(
+            crate::vector::VectorIndex::open_or_rebuild(conn, dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        )
     }
 
     fn dummy_embedding() -> Vec<f32> {
@@ -949,6 +1070,105 @@ mod tests {
                 )
             ));
         }
+    }
+
+    async fn create_legacy_vector_index(conn: &Connection) {
+        conn.execute(
+            "CREATE INDEX chunks_idx ON chunks(libsql_vector_idx(embedding, 'metric=cosine'))",
+            (),
+        )
+        .await
+        .expect("create legacy index");
+    }
+
+    #[tokio::test]
+    async fn reclaims_a_database_still_carrying_the_legacy_vector_index() {
+        let (_dir, _db, conn) = test_db().await;
+        upsert_note(
+            &conn,
+            "note.md",
+            "abc",
+            &[("content".to_owned(), vec![0.5; TEST_DIM])],
+        )
+        .await
+        .expect("upsert");
+        create_legacy_vector_index(&conn).await;
+        assert!(
+            legacy_vector_index_exists(&conn).await.expect("exists"),
+            "fixture must start from a database carrying the legacy index"
+        );
+
+        let reclaimed = reclaim_legacy_vector_index(&conn)
+            .await
+            .expect("reclaim failed");
+
+        assert!(reclaimed);
+        assert!(!legacy_vector_index_exists(&conn).await.expect("exists"));
+        let shadow = conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE name LIKE 'chunks_idx%'",
+                (),
+            )
+            .await
+            .expect("query")
+            .next()
+            .await
+            .expect("row");
+        assert!(shadow.is_none(), "shadow tables must be gone too");
+    }
+
+    #[tokio::test]
+    async fn leaves_chunk_data_intact_when_reclaiming() {
+        let (_dir, _db, conn) = test_db().await;
+        upsert_note(
+            &conn,
+            "note.md",
+            "abc",
+            &[("content".to_owned(), vec![0.5; TEST_DIM])],
+        )
+        .await
+        .expect("upsert");
+        create_legacy_vector_index(&conn).await;
+        let before = all_chunk_embeddings_with_ids(&conn).await.expect("before");
+
+        reclaim_legacy_vector_index(&conn).await.expect("reclaim");
+
+        let after = all_chunk_embeddings_with_ids(&conn).await.expect("after");
+        assert_eq!(
+            before, after,
+            "reclaiming must preserve every stored embedding"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_is_a_no_op_on_a_database_without_the_legacy_index() {
+        let (_dir, _db, conn) = test_db().await;
+
+        let reclaimed = reclaim_legacy_vector_index(&conn).await.expect("reclaim");
+
+        assert!(!reclaimed);
+    }
+
+    #[tokio::test]
+    async fn reads_work_against_a_database_that_has_not_been_reclaimed() {
+        let (_dir, _db, conn) = test_db().await;
+        upsert_note(
+            &conn,
+            "note.md",
+            "abc",
+            &[("content".to_owned(), vec![0.5; TEST_DIM])],
+        )
+        .await
+        .expect("upsert");
+        create_legacy_vector_index(&conn).await;
+
+        let paths = all_note_paths(&conn).await.expect("read paths");
+
+        assert_eq!(paths, vec!["note.md".to_owned()]);
+        assert!(
+            legacy_vector_index_exists(&conn).await.expect("exists"),
+            "a read must not migrate the database"
+        );
     }
 
     fn make_chunks(texts: &[&str]) -> Vec<(String, Vec<f32>)> {
@@ -1354,7 +1574,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_semantic_returns_stored_locator() {
-        let (_dir, _db, conn) = test_db().await;
+        let (dir, _db, conn) = test_db().await;
         let chunk = PreparedChunk {
             content: "test content".to_owned(),
             locator: Some("Heading > Details".to_owned()),
@@ -1363,7 +1583,9 @@ mod tests {
             .await
             .expect("upsert failed");
 
-        let results = search_semantic(&conn, &vec![1.0; TEST_DIM], 10)
+        let source = DbSemanticSource::new(conn.clone(), test_vector(&conn, &dir).await);
+        let results = source
+            .search_semantic(&vec![1.0; TEST_DIM], 10)
             .await
             .expect("search failed");
         assert_eq!(results[0].locator.as_deref(), Some("Heading > Details"));
@@ -1371,7 +1593,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_semantic_returns_results() {
-        let (_dir, _db, conn) = test_db().await;
+        let (dir, _db, conn) = test_db().await;
         let embedding = vec![1.0; TEST_DIM];
         let chunks = vec![("test content".to_owned(), embedding)];
         upsert_note(&conn, "note.md", "abc", &chunks)
@@ -1379,7 +1601,9 @@ mod tests {
             .expect("upsert failed");
 
         let query_embedding = vec![1.0; TEST_DIM];
-        let results = search_semantic(&conn, &query_embedding, 10)
+        let source = DbSemanticSource::new(conn.clone(), test_vector(&conn, &dir).await);
+        let results = source
+            .search_semantic(&query_embedding, 10)
             .await
             .expect("search failed");
 
@@ -1390,7 +1614,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_semantic_deduplicates_by_path() {
-        let (_dir, _db, conn) = test_db().await;
+        let (dir, _db, conn) = test_db().await;
         let embedding = vec![1.0; TEST_DIM];
         let chunks = vec![
             ("chunk one".to_owned(), embedding.clone()),
@@ -1401,7 +1625,9 @@ mod tests {
             .expect("upsert failed");
 
         let query_embedding = vec![1.0; TEST_DIM];
-        let results = search_semantic(&conn, &query_embedding, 10)
+        let source = DbSemanticSource::new(conn.clone(), test_vector(&conn, &dir).await);
+        let results = source
+            .search_semantic(&query_embedding, 10)
             .await
             .expect("search failed");
 
@@ -1410,7 +1636,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_semantic_respects_limit() {
-        let (_dir, _db, conn) = test_db().await;
+        let (dir, _db, conn) = test_db().await;
         for i in 0..5 {
             let embedding = vec![1.0; TEST_DIM];
             let chunks = vec![(format!("content {i}"), embedding)];
@@ -1420,7 +1646,9 @@ mod tests {
         }
 
         let query_embedding = vec![1.0; TEST_DIM];
-        let results = search_semantic(&conn, &query_embedding, 2)
+        let source = DbSemanticSource::new(conn.clone(), test_vector(&conn, &dir).await);
+        let results = source
+            .search_semantic(&query_embedding, 2)
             .await
             .expect("search failed");
 
@@ -1461,7 +1689,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_related_excludes_specified_path() {
-        let (_dir, _db, conn) = test_db().await;
+        let (dir, _db, conn) = test_db().await;
         let embedding = vec![1.0; TEST_DIM];
         upsert_note(
             &conn,
@@ -1480,7 +1708,9 @@ mod tests {
         .await
         .expect("upsert failed");
 
-        let results = search_related(&conn, &embedding, "a.md", 10)
+        let source = DbRelatedSearchSource::new(conn.clone(), test_vector(&conn, &dir).await);
+        let results = source
+            .search_related(&embedding, "a.md", 10)
             .await
             .expect("search failed");
 
@@ -1497,7 +1727,7 @@ mod tests {
         // Reproduce: excluded note has many chunks that fill the initial candidate
         // pool, leaving no room for other documents. The adaptive loop must expand K
         // until the other document appears.
-        let (_dir, _db, conn) = test_db().await;
+        let (dir, _db, conn) = test_db().await;
         let embedding = vec![1.0; TEST_DIM];
 
         // "source.md" has 12 chunks -- more than limit(1) * 5 = 5 initial candidates.
@@ -1517,7 +1747,9 @@ mod tests {
         .await
         .expect("upsert failed");
 
-        let results = search_related(&conn, &embedding, "source.md", 1)
+        let source = DbRelatedSearchSource::new(conn.clone(), test_vector(&conn, &dir).await);
+        let results = source
+            .search_related(&embedding, "source.md", 1)
             .await
             .expect("search failed");
 
@@ -1531,7 +1763,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_related_deduplicates_by_path() {
-        let (_dir, _db, conn) = test_db().await;
+        let (dir, _db, conn) = test_db().await;
         let embedding = vec![1.0; TEST_DIM];
         upsert_note(
             &conn,
@@ -1553,7 +1785,9 @@ mod tests {
         .await
         .expect("upsert failed");
 
-        let results = search_related(&conn, &embedding, "a.md", 10)
+        let source = DbRelatedSearchSource::new(conn.clone(), test_vector(&conn, &dir).await);
+        let results = source
+            .search_related(&embedding, "a.md", 10)
             .await
             .expect("search failed");
 

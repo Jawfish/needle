@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Increase needle's log verbosity (repeatable)
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
     #[command(subcommand)]
     pub command: Command,
 }

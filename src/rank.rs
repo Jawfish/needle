@@ -367,7 +367,12 @@ mod tests {
         .await
         .expect("fts upsert");
 
-        let semantic = crate::db::DbSemanticSource::new(conn.clone());
+        let vector = std::sync::Arc::new(
+            crate::vector::VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let semantic = crate::db::DbSemanticSource::new(conn.clone(), vector);
         let fts_src = crate::fts::FtsFtsSource::new(fts);
         let path_src = crate::db::DbPathSource::new(conn.clone());
 
@@ -408,7 +413,12 @@ mod tests {
             .await
             .expect("fts upsert");
 
-        let semantic = crate::db::DbSemanticSource::new(conn.clone());
+        let vector = std::sync::Arc::new(
+            crate::vector::VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let semantic = crate::db::DbSemanticSource::new(conn.clone(), vector);
         let fts_src = crate::fts::FtsFtsSource::new(fts);
         let path_src = crate::db::DbPathSource::new(conn.clone());
 
@@ -443,7 +453,12 @@ mod tests {
         let fts_dir = tempfile::tempdir().expect("tempdir");
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
 
-        let semantic = crate::db::DbSemanticSource::new(conn.clone());
+        let vector = std::sync::Arc::new(
+            crate::vector::VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let semantic = crate::db::DbSemanticSource::new(conn.clone(), vector);
         let fts_src = crate::fts::FtsFtsSource::new(fts);
         let path_src = crate::db::DbPathSource::new(conn.clone());
 

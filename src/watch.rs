@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use crate::document::DefaultPreparer;
 #[cfg(test)]
 use crate::document::PreparedChunk;
-use crate::{db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, index};
+use crate::{
+    db, document::DocumentPreparer, embed::Embedder, fts::FtsIndex, index, vector::VectorIndex,
+};
 
 const DEBOUNCE_MS: u64 = 500;
 
@@ -24,6 +26,7 @@ pub struct OpenStore {
     pub notes_dir: PathBuf,
     pub conn: libsql::Connection,
     pub fts: FtsIndex,
+    pub vector: Arc<VectorIndex>,
 }
 
 /// Watch all `stores` for filesystem changes and keep their indices up to date.
@@ -147,6 +150,7 @@ pub async fn dispatch_changes_with_preparer(
                 &store.notes_dir,
                 path,
                 preparer,
+                Some(&store.vector),
             )
             .await;
         }
@@ -180,13 +184,21 @@ async fn process_single_file(
     notes_dir: &Path,
     path: &Path,
     preparer: &dyn DocumentPreparer,
+    vector: Option<&VectorIndex>,
 ) {
     if path.exists() {
-        match index::index_single_file_with_preparer(conn, fts, embedder, notes_dir, path, preparer)
-            .await
+        match index::index_single_file_with_preparer(
+            conn, fts, embedder, notes_dir, path, preparer, vector,
+        )
+        .await
         {
-            Ok(index::FtsStatus::Current) => {}
-            Ok(index::FtsStatus::Stale) => reconcile_fts(conn, fts).await,
+            Ok(index::IndexStatus::Current) => {}
+            Ok(index::IndexStatus::FtsStale) => reconcile_fts(conn, fts).await,
+            Ok(index::IndexStatus::VectorStale) => {
+                if let Some(vector) = vector {
+                    reconcile_vector(conn, vector).await;
+                }
+            }
             Err(e) => tracing::error!(path = %path.display(), error = %e, "failed to index"),
         }
     } else {
@@ -194,15 +206,42 @@ async fn process_single_file(
             |_| path.to_string_lossy().to_string(),
             |p| p.to_string_lossy().to_string(),
         );
+        let old_embeddings =
+            match db::chunk_embeddings_for_paths(conn, std::slice::from_ref(&rel)).await {
+                Ok(embeddings) => embeddings,
+                Err(e) => {
+                    tracing::error!(path = rel, error = %e, "failed to read vectors before delete");
+                    return;
+                }
+            };
         match db::delete_note(conn, &rel).await {
             Ok(()) => {
                 if fts.delete(&rel).await.is_err() {
                     reconcile_fts(conn, fts).await;
                 }
+                if let Some(vector) = vector {
+                    let vector_result = async {
+                        for (id, _) in old_embeddings {
+                            vector.remove(id)?;
+                        }
+                        vector.save(conn, db::chunk_index_state(conn).await?).await
+                    }
+                    .await;
+                    if vector_result.is_err() {
+                        reconcile_vector(conn, vector).await;
+                    }
+                }
                 tracing::info!(path = rel, "deleted from index");
             }
             Err(e) => tracing::error!(path = rel, error = %e, "failed to delete from db"),
         }
+    }
+}
+
+async fn reconcile_vector(conn: &libsql::Connection, vector: &VectorIndex) {
+    tracing::info!("reconciling vector index after partial failures");
+    if let Err(e) = VectorIndex::rebuild(conn, vector.path().to_owned()).await {
+        tracing::error!(error = %e, "vector reconciliation failed");
     }
 }
 
@@ -234,6 +273,7 @@ async fn process_batch(
             notes_dir,
             path,
             &DefaultPreparer::default(),
+            None,
         )
         .await;
     }
@@ -250,7 +290,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{db, embed, fts::FtsIndex};
+    use crate::{db, embed, fts::FtsIndex, rank::SemanticSource};
 
     struct CountingMarkdownPreparer(Arc<AtomicUsize>);
 
@@ -342,10 +382,16 @@ mod tests {
             .await
             .expect("connect");
         let fts = FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let vector = Arc::new(
+            VectorIndex::rebuild(&conn, db_dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
         let store = OpenStore {
             notes_dir: notes_dir.to_path_buf(),
             conn,
             fts,
+            vector,
         };
         (vec![db_dir, fts_dir], store)
     }
@@ -448,7 +494,9 @@ mod tests {
         )
         .await;
 
-        let semantic_paths: Vec<String> = db::search_semantic(&store.conn, &[0.0; 1024], 10)
+        let semantic = db::DbSemanticSource::new(store.conn.clone(), Arc::clone(&store.vector));
+        let semantic_paths: Vec<String> = semantic
+            .search_semantic(&[0.0; 1024], 10)
             .await
             .expect("semantic search")
             .into_iter()
@@ -477,8 +525,10 @@ mod tests {
         )
         .await;
 
+        let semantic = db::DbSemanticSource::new(store.conn.clone(), Arc::clone(&store.vector));
         assert!(
-            !db::search_semantic(&store.conn, &[0.0; 1024], 10)
+            !semantic
+                .search_semantic(&[0.0; 1024], 10)
                 .await
                 .expect("semantic search")
                 .into_iter()
@@ -765,10 +815,28 @@ mod tests {
         let initial = embed::Embedder::create_null(1024);
         let path = notes_dir.path().join("note.md");
 
-        process_single_file(&conn, &fts, &initial, notes_dir.path(), &path, &preparer).await;
+        process_single_file(
+            &conn,
+            &fts,
+            &initial,
+            notes_dir.path(),
+            &path,
+            &preparer,
+            None,
+        )
+        .await;
         prepare_calls.store(0, Ordering::SeqCst);
         let (embedder, embed_calls) = embed::Embedder::create_counting(1024, false);
-        process_single_file(&conn, &fts, &embedder, notes_dir.path(), &path, &preparer).await;
+        process_single_file(
+            &conn,
+            &fts,
+            &embedder,
+            notes_dir.path(),
+            &path,
+            &preparer,
+            None,
+        )
+        .await;
 
         assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
         assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
@@ -789,6 +857,7 @@ mod tests {
             notes_dir.path(),
             &path,
             &FailingContentPreparer,
+            None,
         )
         .await;
         assert!(
@@ -806,6 +875,7 @@ mod tests {
             notes_dir.path(),
             &path,
             &FailingContentPreparer,
+            None,
         )
         .await;
         assert!(

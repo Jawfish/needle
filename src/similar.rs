@@ -568,7 +568,12 @@ mod tests {
             .expect("upsert failed");
 
         let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
-        let related_source = crate::db::DbRelatedSearchSource::new(conn);
+        let vector = std::sync::Arc::new(
+            crate::vector::VectorIndex::open_or_rebuild(&conn, dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let related_source = crate::db::DbRelatedSearchSource::new(conn, vector);
         let results = find_related(&note_source, &related_source, "a.md", 10)
             .await
             .expect("find failed");
@@ -591,7 +596,12 @@ mod tests {
             .expect("upsert failed");
 
         let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
-        let related_source = crate::db::DbRelatedSearchSource::new(conn);
+        let vector = std::sync::Arc::new(
+            crate::vector::VectorIndex::open_or_rebuild(&conn, dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let related_source = crate::db::DbRelatedSearchSource::new(conn, vector);
         let results = find_related(&note_source, &related_source, "a.md", 10)
             .await
             .expect("find failed");
@@ -610,7 +620,12 @@ mod tests {
             .expect("connect failed");
 
         let note_source = crate::db::DbNoteEmbeddingsSource::new(conn.clone());
-        let related_source = crate::db::DbRelatedSearchSource::new(conn);
+        let vector = std::sync::Arc::new(
+            crate::vector::VectorIndex::open_or_rebuild(&conn, dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let related_source = crate::db::DbRelatedSearchSource::new(conn, vector);
         let result = find_related(&note_source, &related_source, "nonexistent.md", 10).await;
         assert!(result.is_err());
     }

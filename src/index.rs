@@ -12,6 +12,7 @@ use crate::{
     embed::Embedder,
     fts::FtsIndex,
     hash,
+    vector::VectorIndex,
 };
 
 #[derive(Debug)]
@@ -33,9 +34,10 @@ impl std::fmt::Display for IndexStats {
     }
 }
 
-pub enum FtsStatus {
+pub enum IndexStatus {
     Current,
-    Stale,
+    FtsStale,
+    VectorStale,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,12 +149,38 @@ pub async fn execute_directory_plan(
     embedder: &Embedder,
     plan: DirectoryIndexPlan,
 ) -> anyhow::Result<IndexStats> {
+    execute_directory_plan_with_vector(conn, fts, embedder, plan, None).await
+}
+
+pub async fn execute_directory_plan_with_vector(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    plan: DirectoryIndexPlan,
+    vector: Option<&VectorIndex>,
+) -> anyhow::Result<IndexStats> {
     let added_count = plan.to_add.len();
     let updated_count = plan.to_update.len();
     let to_embed: Vec<&FileToIndex> = plan.to_add.iter().chain(plan.to_update.iter()).collect();
     let upserts = embed_files(embedder, &to_embed).await?;
 
+    let changed_paths: Vec<String> = plan
+        .to_delete
+        .iter()
+        .chain(upserts.iter().map(|(path, _, _)| path))
+        .cloned()
+        .collect();
+    let old_embeddings = db::chunk_embeddings_for_paths(conn, &changed_paths).await?;
     db::apply_directory_changes(conn, &plan.to_delete, &upserts).await?;
+
+    if let Some(vector) = vector
+        && !changed_paths.is_empty()
+        && update_vector(conn, vector, &old_embeddings, &changed_paths)
+            .await
+            .is_err()
+    {
+        tracing::warn!("incremental vector update failed");
+    }
 
     if !plan.to_delete.is_empty() || !upserts.is_empty() {
         let incremental_result = async {
@@ -213,9 +241,19 @@ pub async fn execute_single_file_plan(
     fts: &FtsIndex,
     embedder: &Embedder,
     plan: SingleFilePlan,
-) -> anyhow::Result<FtsStatus> {
+) -> anyhow::Result<IndexStatus> {
+    execute_single_file_plan_with_vector(conn, fts, embedder, plan, None).await
+}
+
+pub async fn execute_single_file_plan_with_vector(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    plan: SingleFilePlan,
+    vector: Option<&VectorIndex>,
+) -> anyhow::Result<IndexStatus> {
     match plan {
-        SingleFilePlan::Unchanged => Ok(FtsStatus::Current),
+        SingleFilePlan::Unchanged => Ok(IndexStatus::Current),
         SingleFilePlan::NeedsIndex {
             rel_path,
             content_hash,
@@ -231,19 +269,37 @@ pub async fn execute_single_file_plan(
             );
             let paired: Vec<(PreparedChunk, Vec<f32>)> =
                 chunks.into_iter().zip(embeddings).collect();
+            let old_embeddings =
+                db::chunk_embeddings_for_paths(conn, std::slice::from_ref(&rel_path)).await?;
             db::upsert_note(conn, &rel_path, &content_hash, &paired).await?;
+            let vector_is_stale = match vector {
+                Some(vector) => update_vector(
+                    conn,
+                    vector,
+                    &old_embeddings,
+                    std::slice::from_ref(&rel_path),
+                )
+                .await
+                .is_err(),
+                None => false,
+            };
 
             let fts_chunks: Vec<PreparedChunk> =
                 paired.iter().map(|(chunk, _)| chunk.clone()).collect();
             let status = if fts.upsert(&rel_path, &fts_chunks).await.is_ok() {
-                FtsStatus::Current
+                IndexStatus::Current
             } else {
                 tracing::warn!(path = rel_path, "FTS upsert failed");
-                FtsStatus::Stale
+                IndexStatus::FtsStale
             };
 
             tracing::info!(path = rel_path, "indexed");
-            Ok(status)
+            if vector_is_stale {
+                tracing::warn!(path = rel_path, "incremental vector update failed");
+                Ok(IndexStatus::VectorStale)
+            } else {
+                Ok(status)
+            }
         }
     }
 }
@@ -330,9 +386,10 @@ pub async fn index_single_file_with_preparer(
     notes_dir: &Path,
     abs_path: &Path,
     preparer: &dyn DocumentPreparer,
-) -> anyhow::Result<FtsStatus> {
+    vector: Option<&VectorIndex>,
+) -> anyhow::Result<IndexStatus> {
     if !preparer.supports_path(abs_path) {
-        return Ok(FtsStatus::Current);
+        return Ok(IndexStatus::Current);
     }
 
     let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
@@ -343,7 +400,7 @@ pub async fn index_single_file_with_preparer(
         Ok(source) => source,
         Err(error) => {
             tracing::warn!(path = %abs_path.display(), error = %error, "failed to read file");
-            return Ok(FtsStatus::Current);
+            return Ok(IndexStatus::Current);
         }
     };
     let content_hash = hash::content_hash_bytes(&source);
@@ -357,18 +414,18 @@ pub async fn index_single_file_with_preparer(
             path = rel_path,
             "skipping file with unchanged preparation failure"
         );
-        return Ok(FtsStatus::Current);
+        return Ok(IndexStatus::Current);
     }
     let chunks = match preparer.prepare(abs_path, &source) {
         Ok(chunks) => chunks,
         Err(error) => {
             db::record_failed_file(conn, &rel_path, &content_hash, &format!("{error:#}")).await?;
             tracing::warn!(path = rel_path, error = %error, "failed to prepare file");
-            return Ok(FtsStatus::Current);
+            return Ok(IndexStatus::Current);
         }
     };
     let plan = plan_single_file(rel_path, stored_hash.as_deref(), content_hash, chunks);
-    execute_single_file_plan(conn, fts, embedder, plan).await
+    execute_single_file_plan_with_vector(conn, fts, embedder, plan, vector).await
 }
 
 async fn read_disk_sources(
@@ -397,6 +454,21 @@ async fn read_disk_sources(
         }
     }
     Ok((sources, failed_paths))
+}
+
+async fn update_vector(
+    conn: &Connection,
+    vector: &VectorIndex,
+    old_embeddings: &[(i64, Vec<f32>)],
+    changed_paths: &[String],
+) -> anyhow::Result<()> {
+    for (id, _) in old_embeddings {
+        vector.remove(*id)?;
+    }
+    for (id, embedding) in db::chunk_embeddings_for_paths(conn, changed_paths).await? {
+        vector.add(id, &embedding)?;
+    }
+    vector.save(conn, db::chunk_index_state(conn).await?).await
 }
 
 async fn embed_files(
@@ -508,7 +580,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::embed;
+    use crate::{embed, rank::SemanticSource};
 
     fn create_file(dir: &Path, relative: &str, content: &str) {
         let path = dir.join(relative);
@@ -855,7 +927,12 @@ mod tests {
                 .any(|(path, _)| path == "empty.txt")
         );
 
-        let semantic = db::DbSemanticSource::new(conn.clone());
+        let vector = Arc::new(
+            VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let semantic = db::DbSemanticSource::new(conn.clone(), vector);
         let fts_source = crate::fts::FtsFtsSource::new(fts);
         let paths = db::DbPathSource::new(conn);
         let results = crate::rank::search(
@@ -899,7 +976,14 @@ mod tests {
             .expect("index");
         assert_eq!(stats.added, DOCUMENT_FIXTURES.len());
 
-        let semantic_paths: Vec<String> = db::search_semantic(&conn, &[0.0; 1024], 10)
+        let vector = Arc::new(
+            VectorIndex::open_or_rebuild(&conn, db_dir.path().join("test.usearch"))
+                .await
+                .expect("vector"),
+        );
+        let semantic = db::DbSemanticSource::new(conn.clone(), vector);
+        let semantic_paths: Vec<String> = semantic
+            .search_semantic(&[0.0; 1024], 10)
             .await
             .expect("semantic search")
             .into_iter()

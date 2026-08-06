@@ -8,6 +8,7 @@ mod fts;
 mod hash;
 mod index;
 mod lock;
+mod logging;
 mod output;
 mod query;
 mod rank;
@@ -15,6 +16,7 @@ mod search_merge;
 mod server;
 mod similar;
 mod types;
+mod vector;
 mod watch;
 
 use std::io::{IsTerminal, Read, Write};
@@ -83,10 +85,12 @@ async fn run_reindex_with_retry(
             if retry_failed {
                 db::clear_failed_files(&conn).await?;
             }
+            db::reclaim_legacy_vector_index(&conn).await?;
             let fts = fts::FtsIndex::open_or_create(fts_dir)?;
             let stats =
                 index::index_directory_with_preparer(&conn, &fts, embedder, notes_dir, &preparer)
                     .await?;
+            vector::VectorIndex::rebuild(&conn, db_path.with_extension("usearch")).await?;
             Ok(stats)
         }
         Err(ref e) if requires_reindex(e) => {
@@ -329,10 +333,16 @@ async fn build_index_in_temp(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("needle=info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-    run(Cli::parse()).await
+    let cli = Cli::parse();
+    let directives = logging::filter_directives(
+        std::env::var("RUST_LOG").ok().as_deref(),
+        std::env::var("NEEDLE_LOG").ok().as_deref(),
+        cli.verbose,
+    );
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(directives))
+        .init();
+    run(cli).await
 }
 
 fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool {
@@ -388,6 +398,7 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
     for store in &config.docs_dirs {
         let lock = lock::IndexLock::try_acquire(&store.db_path)?;
         let (_db, conn) = db::connect_with_profile(&store.db_path, &profile).await?;
+        db::reclaim_legacy_vector_index(&conn).await?;
         let fts = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
 
         tracing::info!(dir = %store.notes_dir.display(), "initial indexing");
@@ -401,11 +412,16 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         .await?;
         tracing::info!(%stats, dir = %store.notes_dir.display(), "initial index complete");
 
+        let vector = std::sync::Arc::new(
+            vector::VectorIndex::open_or_rebuild(&conn, store.db_path.with_extension("usearch"))
+                .await?,
+        );
         held_locks.push(lock);
         open_stores.push(watch::OpenStore {
             notes_dir: store.notes_dir.clone(),
             conn,
             fts,
+            vector,
         });
     }
 
@@ -445,8 +461,12 @@ async fn open_search_adapters<'a>(
             None => db::connect(&store.db_path, None).await?,
         };
         let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
+        let vector_path = store.db_path.with_extension("usearch");
+        let vector_index =
+            std::sync::Arc::new(vector::VectorIndex::open_or_rebuild(&conn, vector_path).await?);
+        let semantic = db::DbSemanticSource::new(conn.clone(), vector_index);
         out.push(server::SearchAdapter {
-            semantic: db::DbSemanticSource::new(conn.clone()),
+            semantic,
             fts: fts::FtsFtsSource::new(fts_index),
             paths: db::DbPathSource::new(conn.clone()),
             documents: db::DbDocumentChunksSource::new(conn),
@@ -604,7 +624,11 @@ async fn run_related(
     let rel_path = store.to_relative(&path)?;
     let (_db, conn) = db::connect(&store.db_path, dim).await?;
     let note_embeddings = db::DbNoteEmbeddingsSource::new(conn.clone());
-    let related_search = db::DbRelatedSearchSource::new(conn);
+    let vector_index = std::sync::Arc::new(
+        vector::VectorIndex::open_or_rebuild(&conn, store.db_path.with_extension("usearch"))
+            .await?,
+    );
+    let related_search = db::DbRelatedSearchSource::new(conn, vector_index);
     let ports = query::RelatedStorePorts {
         note_embeddings: &note_embeddings,
         related_search: &related_search,
