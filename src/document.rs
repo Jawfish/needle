@@ -264,19 +264,22 @@ fn extract_with_xberg(input: xberg::ExtractInput) -> xberg::Result<xberg::Extrac
         ..Default::default()
     };
 
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::scope(|scope| {
-            scope
-                .spawn(|| xberg_runtime().block_on(xberg::extract(input, &config)))
-                .join()
-                .map_err(|_| {
-                    xberg::XbergError::Other("Xberg extraction thread panicked".to_owned())
-                })?
-        });
-    }
-
-    xberg_runtime().block_on(xberg::extract(input, &config))
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(EXTRACTION_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                xberg_runtime().block_on(xberg::extract(input, &config))
+            })
+            .map_err(|error| {
+                xberg::XbergError::Other(format!("spawning Xberg extraction thread: {error}"))
+            })?
+            .join()
+            .map_err(|_| xberg::XbergError::Other("Xberg extraction thread panicked".to_owned()))?
+    })
 }
+
+#[cfg(feature = "documents")]
+const EXTRACTION_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(feature = "documents")]
 fn xberg_runtime() -> &'static tokio::runtime::Runtime {
@@ -673,6 +676,46 @@ mod tests {
                 .map(|c| &c.content)
                 .collect::<Vec<_>>(),
             intact_chunks.iter().map(|c| &c.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    #[test]
+    fn a_deeply_nested_document_does_not_abort_the_process() {
+        use std::io::Write as _;
+
+        let depth = 3000;
+        let mut chapter = String::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Deep</title></head><body>",
+        );
+        for _ in 0..depth {
+            chapter.push_str("<div>");
+        }
+        chapter.push_str("deeply buried prose");
+        for _ in 0..depth {
+            chapter.push_str("</div>");
+        }
+        chapter.push_str("</body></html>");
+
+        let intact = minimal_epub();
+        let mut rewritten = zip::write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries_readable_by_streaming(&intact) {
+            rewritten.start_file(&name, options).expect("start entry");
+            if name == "OEBPS/ch1.xhtml" {
+                rewritten.write_all(chapter.as_bytes()).expect("write deep");
+            } else {
+                rewritten.write_all(&content).expect("write entry");
+            }
+        }
+        let epub = rewritten.finish().expect("finish archive").into_inner();
+
+        let outcome = XbergPreparer.prepare(Path::new("deep.epub"), &epub);
+
+        assert!(
+            outcome.is_ok(),
+            "a deeply nested document must extract or fail cleanly, never abort: {outcome:?}"
         );
     }
 
