@@ -8,6 +8,7 @@ mod fts;
 mod hash;
 mod index;
 mod lock;
+mod logging;
 mod output;
 mod query;
 mod rank;
@@ -329,10 +330,16 @@ async fn build_index_in_temp(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("needle=info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-    run(Cli::parse()).await
+    let cli = Cli::parse();
+    let directives = logging::filter_directives(
+        std::env::var("RUST_LOG").ok().as_deref(),
+        std::env::var("NEEDLE_LOG").ok().as_deref(),
+        cli.verbose,
+    );
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(directives))
+        .init();
+    run(cli).await
 }
 
 fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool {

@@ -140,10 +140,17 @@ Environment variables override the config file. CLI flags override everything.
 | Semantic weight          | `NEEDLE_W_SEMANTIC`     | `w_semantic`     |
 | Full-text weight         | `NEEDLE_W_FTS`          | `w_fts`          |
 | Filename weight          | `NEEDLE_W_FILENAME`     | `w_filename`     |
+| Log verbosity            | `NEEDLE_LOG`            | No config key    |
 
 Each namespace has a unique, case-sensitive `name`, an optional `description`, and one or more `paths`. A directory may belong to more than one namespace, but Needle creates and searches one index per canonical path. Distinct paths must not overlap: configuring both `/docs` and `/docs/project` is invalid.
 
 Index data lives under `~/.local/share/needle/` (or `$XDG_DATA_HOME/needle/`), one store per directory.
+
+### Logging
+
+Needle logs its own activity at `info` and stays quiet about its dependencies. Raise its level with `-v` for debug or `-vv` for trace, or set `NEEDLE_LOG` to a level such as `debug`. Both affect Needle only, so a noisy dependency cannot bury the output.
+
+`RUST_LOG` keeps its conventional meaning: it is passed through verbatim and outranks both `-v` and `NEEDLE_LOG`, so `RUST_LOG=debug` enables every dependency as usual.
 
 ### Embedding providers
 

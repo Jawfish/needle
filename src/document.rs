@@ -177,7 +177,7 @@ fn extract_chunks(source_path: &Path, source: &[u8]) -> anyhow::Result<Vec<Prepa
         .into_iter()
         .flat_map(|document| {
             for warning in document.processing_warnings {
-                tracing::warn!(
+                tracing::debug!(
                     path = %source_path.display(),
                     source = %warning.source,
                     message = %warning.message,
