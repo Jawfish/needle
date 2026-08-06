@@ -85,6 +85,7 @@ async fn run_reindex_with_retry(
             if retry_failed {
                 db::clear_failed_files(&conn).await?;
             }
+            db::reclaim_legacy_vector_index(&conn).await?;
             let fts = fts::FtsIndex::open_or_create(fts_dir)?;
             let stats =
                 index::index_directory_with_preparer(&conn, &fts, embedder, notes_dir, &preparer)
@@ -397,6 +398,7 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
     for store in &config.docs_dirs {
         let lock = lock::IndexLock::try_acquire(&store.db_path)?;
         let (_db, conn) = db::connect_with_profile(&store.db_path, &profile).await?;
+        db::reclaim_legacy_vector_index(&conn).await?;
         let fts = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
 
         tracing::info!(dir = %store.notes_dir.display(), "initial indexing");

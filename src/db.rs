@@ -229,6 +229,35 @@ async fn store_dim(conn: &Connection, dim: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn legacy_vector_index_exists(conn: &Connection) -> anyhow::Result<bool> {
+    Ok(conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='chunks_idx'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some())
+}
+
+pub async fn reclaim_legacy_vector_index(conn: &Connection) -> anyhow::Result<bool> {
+    if !legacy_vector_index_exists(conn).await? {
+        return Ok(false);
+    }
+    tracing::info!("dropping the legacy libsql vector index and reclaiming its pages");
+    conn.execute("DROP INDEX chunks_idx", ()).await?;
+    if let Err(error) = conn.execute("VACUUM", ()).await {
+        tracing::warn!(
+            %error,
+            "legacy vector index dropped, but reclaiming its pages needs free space \
+             roughly equal to the database; the space stays available for reuse inside \
+             the database and a later VACUUM will return it to the filesystem"
+        );
+    }
+    Ok(true)
+}
+
 pub async fn chunks_table_exists(conn: &Connection) -> anyhow::Result<bool> {
     Ok(conn
         .query(
@@ -1041,6 +1070,105 @@ mod tests {
                 )
             ));
         }
+    }
+
+    async fn create_legacy_vector_index(conn: &Connection) {
+        conn.execute(
+            "CREATE INDEX chunks_idx ON chunks(libsql_vector_idx(embedding, 'metric=cosine'))",
+            (),
+        )
+        .await
+        .expect("create legacy index");
+    }
+
+    #[tokio::test]
+    async fn reclaims_a_database_still_carrying_the_legacy_vector_index() {
+        let (_dir, _db, conn) = test_db().await;
+        upsert_note(
+            &conn,
+            "note.md",
+            "abc",
+            &[("content".to_owned(), vec![0.5; TEST_DIM])],
+        )
+        .await
+        .expect("upsert");
+        create_legacy_vector_index(&conn).await;
+        assert!(
+            legacy_vector_index_exists(&conn).await.expect("exists"),
+            "fixture must start from a database carrying the legacy index"
+        );
+
+        let reclaimed = reclaim_legacy_vector_index(&conn)
+            .await
+            .expect("reclaim failed");
+
+        assert!(reclaimed);
+        assert!(!legacy_vector_index_exists(&conn).await.expect("exists"));
+        let shadow = conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE name LIKE 'chunks_idx%'",
+                (),
+            )
+            .await
+            .expect("query")
+            .next()
+            .await
+            .expect("row");
+        assert!(shadow.is_none(), "shadow tables must be gone too");
+    }
+
+    #[tokio::test]
+    async fn leaves_chunk_data_intact_when_reclaiming() {
+        let (_dir, _db, conn) = test_db().await;
+        upsert_note(
+            &conn,
+            "note.md",
+            "abc",
+            &[("content".to_owned(), vec![0.5; TEST_DIM])],
+        )
+        .await
+        .expect("upsert");
+        create_legacy_vector_index(&conn).await;
+        let before = all_chunk_embeddings_with_ids(&conn).await.expect("before");
+
+        reclaim_legacy_vector_index(&conn).await.expect("reclaim");
+
+        let after = all_chunk_embeddings_with_ids(&conn).await.expect("after");
+        assert_eq!(
+            before, after,
+            "reclaiming must preserve every stored embedding"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_is_a_no_op_on_a_database_without_the_legacy_index() {
+        let (_dir, _db, conn) = test_db().await;
+
+        let reclaimed = reclaim_legacy_vector_index(&conn).await.expect("reclaim");
+
+        assert!(!reclaimed);
+    }
+
+    #[tokio::test]
+    async fn reads_work_against_a_database_that_has_not_been_reclaimed() {
+        let (_dir, _db, conn) = test_db().await;
+        upsert_note(
+            &conn,
+            "note.md",
+            "abc",
+            &[("content".to_owned(), vec![0.5; TEST_DIM])],
+        )
+        .await
+        .expect("upsert");
+        create_legacy_vector_index(&conn).await;
+
+        let paths = all_note_paths(&conn).await.expect("read paths");
+
+        assert_eq!(paths, vec!["note.md".to_owned()]);
+        assert!(
+            legacy_vector_index_exists(&conn).await.expect("exists"),
+            "a read must not migrate the database"
+        );
     }
 
     fn make_chunks(texts: &[&str]) -> Vec<(String, Vec<f32>)> {
