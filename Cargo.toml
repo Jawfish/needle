@@ -33,6 +33,7 @@ fs2 = "0.4.3"
 axum = "0.6.20"
 maud = "0.26"
 percent-encoding = "2.3"
+usearch = "2"
 
 [patch.crates-io]
 xberg = { git = "https://github.com/Jawfish/xberg", rev = "2bc38b06a72a61f349639178166fc888677fb67e" }

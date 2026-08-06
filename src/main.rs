@@ -16,6 +16,7 @@ mod search_merge;
 mod server;
 mod similar;
 mod types;
+mod vector;
 mod watch;
 
 use std::io::{IsTerminal, Read, Write};
@@ -88,6 +89,7 @@ async fn run_reindex_with_retry(
             let stats =
                 index::index_directory_with_preparer(&conn, &fts, embedder, notes_dir, &preparer)
                     .await?;
+            vector::VectorIndex::rebuild(&conn, db_path.with_extension("usearch")).await?;
             Ok(stats)
         }
         Err(ref e) if requires_reindex(e) => {
@@ -408,11 +410,16 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         .await?;
         tracing::info!(%stats, dir = %store.notes_dir.display(), "initial index complete");
 
+        let vector = std::sync::Arc::new(
+            vector::VectorIndex::open_or_rebuild(&conn, store.db_path.with_extension("usearch"))
+                .await?,
+        );
         held_locks.push(lock);
         open_stores.push(watch::OpenStore {
             notes_dir: store.notes_dir.clone(),
             conn,
             fts,
+            vector,
         });
     }
 
@@ -452,8 +459,12 @@ async fn open_search_adapters<'a>(
             None => db::connect(&store.db_path, None).await?,
         };
         let fts_index = fts::FtsIndex::open_or_create(&store.tantivy_dir)?;
+        let vector_path = store.db_path.with_extension("usearch");
+        let vector_index =
+            std::sync::Arc::new(vector::VectorIndex::open_or_rebuild(&conn, vector_path).await?);
+        let semantic = db::DbSemanticSource::new(conn.clone(), vector_index);
         out.push(server::SearchAdapter {
-            semantic: db::DbSemanticSource::new(conn.clone()),
+            semantic,
             fts: fts::FtsFtsSource::new(fts_index),
             paths: db::DbPathSource::new(conn.clone()),
             documents: db::DbDocumentChunksSource::new(conn),
@@ -611,7 +622,11 @@ async fn run_related(
     let rel_path = store.to_relative(&path)?;
     let (_db, conn) = db::connect(&store.db_path, dim).await?;
     let note_embeddings = db::DbNoteEmbeddingsSource::new(conn.clone());
-    let related_search = db::DbRelatedSearchSource::new(conn);
+    let vector_index = std::sync::Arc::new(
+        vector::VectorIndex::open_or_rebuild(&conn, store.db_path.with_extension("usearch"))
+            .await?,
+    );
+    let related_search = db::DbRelatedSearchSource::new(conn, vector_index);
     let ports = query::RelatedStorePorts {
         note_embeddings: &note_embeddings,
         related_search: &related_search,
