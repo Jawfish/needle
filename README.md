@@ -1,6 +1,6 @@
 # Needle
 
-Semantic search for directories of Markdown, plain-text, PDF, EPUB, HTML, and Word (`.docx`) documents. Needle fuses vector similarity, full-text search, and filename matching into one ranked result list. It reads queries from stdin and writes tab-separated lines, so it fits into shell pipelines.
+Semantic search for directories of Markdown, plain-text, PDF, EPUB, HTML, and Word (`.docx`) documents, including documents stored inside `.zip` archives. Needle fuses vector similarity, full-text search, and filename matching into one ranked result list. It reads queries from stdin and writes tab-separated lines, so it fits into shell pipelines.
 
 ## Install
 
@@ -89,6 +89,10 @@ needle watch
 ```
 
 Needle watches every configured directory at once. A change re-indexes only the affected file.
+
+### Archives
+
+Supported documents inside a `.zip` archive are indexed as separate results, identified as `archive.zip!path/inside.md`. Needle reads the archive index to decide which members changed, so a reindex extracts only new or edited members, one at a time. Nested archives, encrypted members, and members that expand beyond internal limits are reported by `needle failures` instead of being indexed.
 
 ## Output and flags
 

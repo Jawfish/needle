@@ -192,8 +192,10 @@ pub fn should_index_path_with_preparer<'a>(
     let owning_root = roots
         .into_iter()
         .find(|dir| path.starts_with(dir.as_path()));
-    owning_root
-        .is_some_and(|root| !index::is_in_hidden_dir(path, root) && preparer.supports_path(path))
+    owning_root.is_some_and(|root| {
+        !index::is_in_hidden_dir(path, root)
+            && (preparer.supports_path(path) || crate::archive::is_archive(path))
+    })
 }
 
 async fn process_single_file(
@@ -206,11 +208,18 @@ async fn process_single_file(
     vector: Option<&VectorIndex>,
 ) -> bool {
     if path.exists() {
-        match index::index_single_file_with_preparer(
-            conn, fts, embedder, notes_dir, path, preparer, vector,
-        )
-        .await
-        {
+        let indexed = if crate::archive::is_archive(path) {
+            index::index_archive_with_preparer(
+                conn, fts, embedder, notes_dir, path, preparer, vector,
+            )
+            .await
+        } else {
+            index::index_single_file_with_preparer(
+                conn, fts, embedder, notes_dir, path, preparer, vector,
+            )
+            .await
+        };
+        match indexed {
             Ok(index::IndexStatus::Current { vector_mutated }) => vector_mutated,
             Ok(index::IndexStatus::FtsStale { vector_mutated }) => {
                 reconcile_fts(conn, fts).await;
@@ -227,6 +236,13 @@ async fn process_single_file(
                 false
             }
         }
+    } else if crate::archive::is_archive(path) {
+        if let Err(e) =
+            index::delete_archive_members(conn, fts, embedder, notes_dir, path, vector).await
+        {
+            tracing::error!(path = %path.display(), error = %e, "failed to delete archive members");
+        }
+        false
     } else {
         let rel = path.strip_prefix(notes_dir).map_or_else(
             |_| path.to_string_lossy().to_string(),
@@ -1165,6 +1181,92 @@ mod tests {
         assert!(
             !should_index_path(&unrelated, configured_dirs.iter()),
             "file not under any configured root must not be indexed"
+        );
+    }
+
+    fn write_archive(path: &Path, entries: &[(&str, &str)]) {
+        use std::io::Write as _;
+
+        let file = std::fs::File::create(path).expect("create archive");
+        let mut writer = zip::write::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(*name, options).expect("start entry");
+            writer.write_all(content.as_bytes()).expect("write entry");
+        }
+        writer.finish().expect("finish archive");
+    }
+
+    async fn dispatch_archive_change(
+        store: &OpenStore,
+        archive_path: &Path,
+        calls: &Arc<AtomicUsize>,
+    ) {
+        let notes_dirs = vec![store.notes_dir.clone()];
+        let mut changed = HashSet::new();
+        changed.insert(archive_path.to_path_buf());
+        dispatch_changes_with_preparer(
+            std::slice::from_ref(store),
+            &notes_dirs,
+            &embed::Embedder::create_null(1024),
+            &changed,
+            &CountingMarkdownPreparer(Arc::clone(calls)),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn editing_an_archive_reindexes_only_the_members_that_changed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let archive_path = notes_dir.path().join("docs.zip");
+        write_archive(&archive_path, &[("one.md", "one"), ("two.md", "two")]);
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        dispatch_archive_change(&store, &archive_path, &calls).await;
+
+        write_archive(
+            &archive_path,
+            &[("one.md", "one"), ("two.md", "two edited")],
+        );
+        dispatch_archive_change(&store, &archive_path, &calls).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "only the edited member is prepared on the second pass"
+        );
+        assert!(
+            db::all_chunks(&store.conn)
+                .await
+                .expect("chunks")
+                .iter()
+                .any(|(path, chunk)| path == "docs.zip!two.md" && chunk.content == "two edited")
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_archive_removes_every_member_it_contributed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let archive_path = notes_dir.path().join("docs.zip");
+        write_archive(&archive_path, &[("one.md", "one"), ("two.md", "two")]);
+        create_file(notes_dir.path(), "loose.md", "loose");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        dispatch_archive_change(&store, &archive_path, &calls).await;
+        dispatch_archive_change(&store, &notes_dir.path().join("loose.md"), &calls).await;
+
+        std::fs::remove_file(&archive_path).expect("remove archive");
+        dispatch_archive_change(&store, &archive_path, &calls).await;
+
+        assert_eq!(
+            db::all_note_hashes(&store.conn)
+                .await
+                .expect("hashes")
+                .into_keys()
+                .collect::<Vec<String>>(),
+            vec!["loose.md"],
+            "archive members go, unrelated documents stay"
         );
     }
 }
