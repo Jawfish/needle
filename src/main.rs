@@ -15,6 +15,7 @@ mod query;
 mod rank;
 mod search_merge;
 mod server;
+mod service;
 mod shutdown;
 mod similar;
 mod types;
@@ -356,7 +357,8 @@ fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool 
         Command::Namespaces
         | Command::Failures
         | Command::Similar { .. }
-        | Command::Related { .. } => false,
+        | Command::Related { .. }
+        | Command::Service(_) => false,
     }
 }
 
@@ -372,7 +374,14 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
             fts: *w_fts,
             filename: *w_filename,
         },
-        _ => CliWeights {
+        Command::Namespaces
+        | Command::Watch
+        | Command::Serve { .. }
+        | Command::Service(_)
+        | Command::Similar { .. }
+        | Command::Related { .. }
+        | Command::Failures
+        | Command::Reindex { .. } => CliWeights {
             semantic: None,
             fts: None,
             filename: None,
@@ -677,7 +686,39 @@ async fn run_serve(
     .await
 }
 
+fn render_service_definition(args: &cli::ServiceArgs) -> anyhow::Result<String> {
+    let exec_path = match &args.exec_path {
+        Some(path) => path.clone(),
+        None => std::env::current_exe().context("resolving needle executable path")?,
+    };
+    if !exec_path.is_absolute() {
+        anyhow::bail!("--exec-path must be absolute");
+    }
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let definition = service::Definition {
+        exec_path: exec_path.to_string_lossy().into_owned(),
+        home,
+        log_level: args.log_level.clone(),
+        interval: args.interval.clone(),
+        host: args.host.to_string(),
+        port: args.port,
+    };
+    Ok(service::render(args.role, args.backend, &definition))
+}
+
+fn write_service_definition(args: &cli::ServiceArgs) -> anyhow::Result<()> {
+    let rendered = render_service_definition(args)?;
+    std::io::stdout()
+        .write_all(rendered.as_bytes())
+        .context("writing service definition")
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    if let Command::Service(args) = &cli.command {
+        return write_service_definition(args);
+    }
+
     let cli_weights = extract_cli_weights(&cli.command);
     let cli_embed = CliEmbedArgs {
         provider: cli.provider,
@@ -737,6 +778,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Command::Serve { host, port } => run_serve(&config, embedder, host, port).await,
+        Command::Service(_) => Ok(()),
         Command::Similar {
             namespaces,
             threshold,
