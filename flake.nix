@@ -71,7 +71,7 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
-          version = "0.5.0";
+          version = "0.6.0";
           releases = {
             x86_64-linux = {
               platform = "linux-x86_64";
@@ -122,7 +122,7 @@
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "needle";
-          version = "0.5.0";
+          version = "0.6.0";
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
