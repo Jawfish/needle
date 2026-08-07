@@ -24,8 +24,10 @@ mod tests {
             let root = tempfile::tempdir().expect("create temp directory");
             let config_dir = root.path().join("config");
             let notes_dir = root.path().join("notes");
+            let runtime_dir = root.path().join("runtime");
             std::fs::create_dir_all(config_dir.join("needle")).expect("create config directory");
             std::fs::create_dir(&notes_dir).expect("create notes directory");
+            std::fs::create_dir(&runtime_dir).expect("create runtime directory");
             let notes_path = notes_dir.to_str().expect("temp path is UTF-8");
             std::fs::write(
                 config_dir.join("needle/config.toml"),
@@ -54,6 +56,22 @@ paths = ["{notes_path}"]
         fn data_dir(&self) -> std::path::PathBuf {
             self.root.path().join("data")
         }
+
+        fn runtime_dir(&self) -> std::path::PathBuf {
+            self.root.path().join("runtime")
+        }
+
+        fn command(&self, args: &[&str]) -> Command {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_needle"));
+            command
+                .args(args)
+                .env("XDG_CONFIG_HOME", self.config_dir())
+                .env("XDG_DATA_HOME", self.data_dir())
+                .env("XDG_RUNTIME_DIR", self.runtime_dir())
+                .env_remove("RUST_LOG")
+                .env_remove("NEEDLE_LOG");
+            command
+        }
     }
 
     struct ServiceProcess {
@@ -65,12 +83,8 @@ paths = ["{notes_path}"]
 
     impl ServiceProcess {
         fn spawn(environment: &ServiceEnvironment, args: &[&str]) -> Self {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_needle"))
-                .args(args)
-                .env("XDG_CONFIG_HOME", environment.config_dir())
-                .env("XDG_DATA_HOME", environment.data_dir())
-                .env_remove("RUST_LOG")
-                .env_remove("NEEDLE_LOG")
+            let mut child = environment
+                .command(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -215,6 +229,43 @@ paths = ["{notes_path}"]
             .wait_for_marker("watching for changes")
             .expect("observe watch readiness");
         stop_and_assert_successfully(&mut process, "-TERM");
+    }
+
+    #[test]
+    fn status_reports_live_and_local_watcher_states() {
+        let environment = ServiceEnvironment::new();
+        let mut process = ServiceProcess::spawn(&environment, &["watch"]);
+        process
+            .wait_for_marker("watching for changes")
+            .expect("observe watch readiness");
+
+        let live = environment
+            .command(&["status", "--json"])
+            .output()
+            .expect("read live status");
+        assert!(
+            live.status.success(),
+            "status failed while watcher ran: {}",
+            String::from_utf8_lossy(&live.stderr)
+        );
+        let live_status: serde_json::Value =
+            serde_json::from_slice(&live.stdout).expect("parse live status JSON");
+        assert_eq!(live_status[0]["watcher_live"], true);
+
+        stop_and_assert_successfully(&mut process, "-TERM");
+
+        let local = environment
+            .command(&["status", "--json"])
+            .output()
+            .expect("read local status");
+        assert!(
+            local.status.success(),
+            "status failed after watcher exited: {}",
+            String::from_utf8_lossy(&local.stderr)
+        );
+        let local_status: serde_json::Value =
+            serde_json::from_slice(&local.stdout).expect("parse local status JSON");
+        assert_eq!(local_status[0]["watcher_live"], false);
     }
 
     #[test]

@@ -98,6 +98,8 @@ pub enum Command {
         #[arg(short, long)]
         paths_only: bool,
     },
+    /// List watcher and index status for configured roots
+    Status,
     /// List remembered document preparation failures
     Failures,
     /// Reindex all supported documents
@@ -124,6 +126,13 @@ mod tests {
         let cli = Cli::try_parse_from(["needle", "--json", "namespaces"]).expect("parse");
         assert!(cli.json);
         assert!(matches!(cli.command, Command::Namespaces));
+    }
+
+    #[test]
+    fn status_command_accepts_json_output() {
+        let cli = Cli::try_parse_from(["needle", "status", "--json"]).expect("parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Status));
     }
 
     #[test]

@@ -8,6 +8,8 @@ use std::{
 use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+use std::time::Instant;
+
 #[cfg(test)]
 use crate::document::DefaultPreparer;
 #[cfg(test)]
@@ -80,6 +82,8 @@ pub async fn run_watcher(
     embedder: &Embedder,
     preparer: Arc<dyn DocumentPreparer>,
 ) -> anyhow::Result<()> {
+    let started_at = Instant::now();
+
     let WatchedRoots {
         _watcher,
         mut events,
@@ -89,6 +93,7 @@ pub async fn run_watcher(
     // at most one entry here.
     let notes_dirs: Vec<PathBuf> = stores.iter().map(|s| s.notes_dir.clone()).collect();
     let mut shutdown = crate::shutdown::Shutdown::install()?;
+    let control = crate::control::ControlSocket::bind()?;
 
     index_pending(&stores, &notes_dirs, embedder, &preparer, &mut events).await;
     tracing::info!(roots = ?notes_dirs, "watching for changes");
@@ -103,11 +108,16 @@ pub async fn run_watcher(
                 while let Ok(path) = events.try_recv() {
                     changed.insert(path);
                 }
-            }
+            },
             () = shutdown.requested() => {
                 tracing::info!("shutting down");
                 break;
-            }
+            },
+            result = control.serve_next(&stores, started_at) => {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "failed to serve control request");
+                }
+            },
         }
 
         if !changed.is_empty() {

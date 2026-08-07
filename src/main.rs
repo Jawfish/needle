@@ -1,6 +1,7 @@
 mod archive;
 mod cli;
 mod config;
+mod control;
 mod db;
 mod document;
 mod embed;
@@ -355,6 +356,7 @@ fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool 
         Command::Watch | Command::Reindex { .. } => true,
         Command::Search { .. } | Command::Serve { .. } => weights.semantic > 0.0,
         Command::Namespaces
+        | Command::Status
         | Command::Failures
         | Command::Similar { .. }
         | Command::Related { .. }
@@ -380,6 +382,7 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
         | Command::Service(_)
         | Command::Similar { .. }
         | Command::Related { .. }
+        | Command::Status
         | Command::Failures
         | Command::Reindex { .. } => CliWeights {
             semantic: None,
@@ -503,6 +506,19 @@ fn run_namespaces(
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     output::print_namespaces(namespaces, mode, writer)
+}
+
+async fn run_status(
+    config: &Config,
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    let status = control::status(&config.docs_dirs).await?;
+    output::print_status(&status, mode, writer)
+}
+
+async fn run_status_command(config: &Config, json: bool) -> anyhow::Result<()> {
+    run_status(config, output_mode(json, false), &mut std::io::stdout()).await
 }
 
 async fn run_failures(
@@ -748,6 +764,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             &mut std::io::stdout(),
         ),
         Command::Watch => run_watch(&config, embedder).await,
+        Command::Status => run_status_command(&config, cli.json).await,
         Command::Failures => {
             run_failures(
                 &config,
@@ -1001,6 +1018,14 @@ mod tests {
     fn namespaces_never_need_an_embedder() {
         assert!(!search_needs_embedder(
             &Command::Namespaces,
+            &rank::RrfWeights::default()
+        ));
+    }
+
+    #[test]
+    fn status_never_needs_an_embedder() {
+        assert!(!search_needs_embedder(
+            &Command::Status,
             &rank::RrfWeights::default()
         ));
     }
