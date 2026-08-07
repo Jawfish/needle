@@ -29,59 +29,78 @@ pub struct OpenStore {
     pub vector: Arc<VectorIndex>,
 }
 
+pub struct WatchedRoots {
+    _watcher: notify::RecommendedWatcher,
+    events: mpsc::UnboundedReceiver<PathBuf>,
+}
+
+pub fn arm(
+    roots: Vec<PathBuf>,
+    preparer: Arc<dyn DocumentPreparer>,
+) -> anyhow::Result<WatchedRoots> {
+    let (tx, events) = mpsc::unbounded_channel::<PathBuf>();
+    let roots_for_callback = roots.clone();
+    let mut watcher = notify::recommended_watcher(move |event: Result<notify::Event, _>| {
+        if let Ok(event) = event {
+            match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                    for path in event.paths {
+                        if should_index_path_with_preparer(
+                            &path,
+                            roots_for_callback.iter(),
+                            preparer.as_ref(),
+                        ) {
+                            let _ = tx.send(path);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    })?;
+
+    for root in roots {
+        watcher.watch(&root, RecursiveMode::Recursive)?;
+        tracing::debug!(dir = %root.display(), "watching for changes");
+    }
+
+    Ok(WatchedRoots {
+        _watcher: watcher,
+        events,
+    })
+}
+
 /// Watch all `stores` for filesystem changes and keep their indices up to date.
 ///
 /// Callers are responsible for opening each store (DB connection, FTS index,
 /// initial indexing pass, lock acquisition) before calling this function.
 pub async fn run_watcher(
+    watched_roots: WatchedRoots,
     stores: Vec<OpenStore>,
     embedder: &Embedder,
     preparer: Arc<dyn DocumentPreparer>,
 ) -> anyhow::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
+    let WatchedRoots {
+        _watcher,
+        mut events,
+    } = watched_roots;
 
-    // Collect notes_dirs for the watcher closure. Config resolution guarantees
-    // non-overlapping roots, so each path matches at most one entry here.
+    // Config resolution guarantees non-overlapping roots, so each path matches
+    // at most one entry here.
     let notes_dirs: Vec<PathBuf> = stores.iter().map(|s| s.notes_dir.clone()).collect();
-
-    let mut watcher = {
-        let notes_dirs_clone = notes_dirs.clone();
-        let preparer = Arc::clone(&preparer);
-        notify::recommended_watcher(move |event: Result<notify::Event, _>| {
-            if let Ok(event) = event {
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        for path in event.paths {
-                            if should_index_path_with_preparer(
-                                &path,
-                                notes_dirs_clone.iter(),
-                                preparer.as_ref(),
-                            ) {
-                                let _ = tx.send(path);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        })?
-    };
-
-    for notes_dir in &notes_dirs {
-        watcher.watch(notes_dir, RecursiveMode::Recursive)?;
-        tracing::info!(dir = %notes_dir.display(), "watching for changes");
-    }
-
     let mut shutdown = crate::shutdown::Shutdown::install()?;
+
+    index_pending(&stores, &notes_dirs, embedder, &preparer, &mut events).await;
+    tracing::info!(roots = ?notes_dirs, "watching for changes");
 
     loop {
         let mut changed = HashSet::new();
 
         tokio::select! {
-            Some(path) = rx.recv() => {
+            Some(path) = events.recv() => {
                 changed.insert(path);
                 tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-                while let Ok(path) = rx.try_recv() {
+                while let Ok(path) = events.try_recv() {
                     changed.insert(path);
                 }
             }
@@ -104,6 +123,23 @@ pub async fn run_watcher(
     }
 
     Ok(())
+}
+
+async fn index_pending(
+    stores: &[OpenStore],
+    notes_dirs: &[PathBuf],
+    embedder: &Embedder,
+    preparer: &Arc<dyn DocumentPreparer>,
+    events: &mut mpsc::UnboundedReceiver<PathBuf>,
+) {
+    let mut changed = HashSet::new();
+    while let Ok(path) = events.try_recv() {
+        changed.insert(path);
+    }
+    if !changed.is_empty() {
+        dispatch_changes_with_preparer(stores, notes_dirs, embedder, &changed, preparer.as_ref())
+            .await;
+    }
 }
 
 /// Route each changed path to its owning store and process it.
@@ -440,6 +476,61 @@ mod tests {
             vector,
         };
         (vec![db_dir, fts_dir], store)
+    }
+
+    #[tokio::test]
+    async fn a_change_buffered_before_startup_is_indexed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let stores = vec![store];
+        let dirs = vec![notes_dir.path().to_path_buf()];
+        let embedder = embed::Embedder::create_null(1024);
+        let preparer: Arc<dyn DocumentPreparer> = Arc::new(DefaultPreparer::default());
+        let path = notes_dir.path().join("buffered.md");
+        create_file(notes_dir.path(), "buffered.md", "buffered content");
+        let (sender, mut events) = mpsc::unbounded_channel();
+        sender.send(path).expect("queue path");
+
+        index_pending(&stores, &dirs, &embedder, &preparer, &mut events).await;
+
+        assert!(
+            db::all_note_hashes(&stores[0].conn)
+                .await
+                .expect("hashes")
+                .contains_key("buffered.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deletion_buffered_before_startup_is_removed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "removed.md", "removed content");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let stores = vec![store];
+        let dirs = vec![notes_dir.path().to_path_buf()];
+        let embedder = embed::Embedder::create_null(1024);
+        let preparer: Arc<dyn DocumentPreparer> = Arc::new(DefaultPreparer::default());
+        let path = notes_dir.path().join("removed.md");
+        let (sender, mut events) = mpsc::unbounded_channel();
+        sender.send(path.clone()).expect("queue initial path");
+        index_pending(&stores, &dirs, &embedder, &preparer, &mut events).await;
+        assert!(
+            db::all_note_hashes(&stores[0].conn)
+                .await
+                .expect("hashes")
+                .contains_key("removed.md")
+        );
+
+        std::fs::remove_file(&path).expect("remove file");
+        sender.send(path).expect("queue deleted path");
+        index_pending(&stores, &dirs, &embedder, &preparer, &mut events).await;
+
+        assert!(
+            !db::all_note_hashes(&stores[0].conn)
+                .await
+                .expect("hashes")
+                .contains_key("removed.md")
+        );
     }
 
     // ---------- routing tests -------------------------------------------------

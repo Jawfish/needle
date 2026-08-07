@@ -390,8 +390,17 @@ const fn output_mode(json: bool, paths_only: bool) -> OutputMode {
 
 async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-    let preparer = std::sync::Arc::new(document::DefaultPreparer::default());
+    let preparer: std::sync::Arc<dyn document::DocumentPreparer> =
+        std::sync::Arc::new(document::DefaultPreparer::default());
     let profile = index_profile(&embedder, preparer.as_ref());
+    let watched_roots = watch::arm(
+        config
+            .docs_dirs
+            .iter()
+            .map(|store| store.notes_dir.clone())
+            .collect(),
+        std::sync::Arc::clone(&preparer),
+    )?;
 
     let mut open_stores: Vec<watch::OpenStore> = Vec::with_capacity(config.docs_dirs.len());
     // Locks are held for the watcher's lifetime and released on drop when
@@ -429,7 +438,7 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         });
     }
 
-    watch::run_watcher(open_stores, &embedder, preparer).await
+    watch::run_watcher(watched_roots, open_stores, &embedder, preparer).await
 }
 
 async fn run_reindex_command(
