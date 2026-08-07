@@ -78,11 +78,11 @@ pub async fn run(
         tracing::warn!("WARNING: unauthenticated indexed content is exposed at http://{address}");
     }
     tracing::info!("serving indexed documents at http://{address}");
+    let mut shutdown = crate::shutdown::Shutdown::install()?;
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("shutting down");
-            }
+        .with_graceful_shutdown(async move {
+            shutdown.requested().await;
+            tracing::info!("shutting down");
         })
         .await
         .context("running HTTP server")

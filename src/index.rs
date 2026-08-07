@@ -795,7 +795,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{embed, rank::SemanticSource};
+    use crate::embed;
+    #[cfg(feature = "documents")]
+    use crate::rank::SemanticSource;
 
     fn create_file(dir: &Path, relative: &str, content: &str) {
         let path = dir.join(relative);

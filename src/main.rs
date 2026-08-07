@@ -15,6 +15,7 @@ mod query;
 mod rank;
 mod search_merge;
 mod server;
+mod shutdown;
 mod similar;
 mod types;
 mod vector;
@@ -341,6 +342,8 @@ async fn main() -> anyhow::Result<()> {
         cli.verbose,
     );
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(tracing_subscriber::EnvFilter::new(directives))
         .init();
     run(cli).await
@@ -1032,15 +1035,13 @@ mod tests {
     ///
     /// Steps:
     ///   1. Build a populated index at dimension 384.
-    ///   2. Drop a non-UTF8 file into the notes dir so `index_directory` fails.
+    ///   2. Use an embedder that fails while rebuilding into the temporary index.
     ///   3. Call `run_reindex` with dimension 1024 (triggers mismatch path).
     ///   4. Assert the original DB file still exists and still contains the old
     ///      data (the prior index is preserved, not destroyed).
     #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_original_db_on_dimension_mismatch() {
-        use std::io::Write;
-
         let notes_dir = tempfile::tempdir().expect("notes tempdir");
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let fts_dir = tempfile::tempdir().expect("fts tempdir");
@@ -1061,17 +1062,10 @@ mod tests {
 
         assert!(db_path.exists(), "original DB must exist before test");
 
-        // Place a non-UTF8 file that will cause `read_to_string` to fail.
-        let bad_file = notes_dir.path().join("corrupt.md");
-        {
-            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
-            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
-        }
-
-        // Run reindex with dim=1024 (mismatch). The corrupt file should cause failure.
-        let embedder = crate::embed::Embedder::create_null(1024);
+        // Run reindex with dim=1024 (mismatch). The failing embedder aborts the temp build.
+        let (embedder, _) = crate::embed::Embedder::create_counting(1024, true);
         let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
-        assert!(result.is_err(), "reindex must fail due to corrupt file");
+        assert!(result.is_err(), "reindex must fail when embedding fails");
 
         // The original DB file must still be present and contain the prior data.
         assert!(
@@ -1090,16 +1084,14 @@ mod tests {
 
     /// Dimension mismatch + reindex failure must not corrupt the live FTS index.
     ///
-    /// Reproduction of the divergence bug: a temp reindex build fails (corrupt
-    /// file causes `read_to_string` to error), but the old code called fts.rebuild
+    /// Reproduction of the divergence bug: a temp reindex build fails while
+    /// embedding, but the old code called fts.rebuild
     /// on the live index before propagating the error, wiping it. After the fix
     /// the live FTS must still answer queries for content indexed before the
     /// failed reindex.
     #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_fts_index_on_dimension_mismatch() {
-        use std::io::Write;
-
         let notes_dir = tempfile::tempdir().expect("notes tempdir");
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let fts_dir = tempfile::tempdir().expect("fts tempdir");
@@ -1129,17 +1121,10 @@ mod tests {
             );
         }
 
-        // Drop a corrupt file so the mismatch reindex fails before completing.
-        let bad_file = notes_dir.path().join("corrupt.md");
-        {
-            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
-            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
-        }
-
-        // Run reindex with dim=1024 (mismatch). Must fail.
-        let embedder = crate::embed::Embedder::create_null(1024);
+        // Run reindex with dim=1024 (mismatch). The failing embedder aborts the temp build.
+        let (embedder, _) = crate::embed::Embedder::create_counting(1024, true);
         let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
-        assert!(result.is_err(), "reindex must fail due to corrupt file");
+        assert!(result.is_err(), "reindex must fail when embedding fails");
 
         // The live FTS index must still answer queries for the original content.
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
@@ -1293,8 +1278,6 @@ mod tests {
     #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn interrupted_reindex_restores_fts_backup_on_next_attempt() {
-        use std::io::Write;
-
         let notes_dir = tempfile::tempdir().expect("notes tempdir");
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let fts_dir = tempfile::tempdir().expect("fts tempdir");
@@ -1327,18 +1310,10 @@ mod tests {
             "live FTS must be absent to reproduce the crash state"
         );
 
-        // Add a corrupt file so the new build deterministically fails, verifying
-        // that recovery holds even when the subsequent rebuild does not succeed.
-        let bad_file = notes_dir.path().join("corrupt.md");
-        {
-            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
-            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
-        }
-
-        // Trigger mismatch reindex (dim=1024). Must fail due to corrupt file.
-        let embedder = embed::Embedder::create_null(1024);
+        // Make the new build fail, verifying recovery holds when reindexing does not succeed.
+        let (embedder, _) = embed::Embedder::create_counting(1024, true);
         let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
-        assert!(result.is_err(), "reindex must fail due to corrupt file");
+        assert!(result.is_err(), "reindex must fail when embedding fails");
 
         // The backup must have been restored to the live FTS location before the
         // build started, so the original content is intact regardless of the

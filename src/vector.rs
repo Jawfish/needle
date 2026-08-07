@@ -112,6 +112,7 @@ impl VectorIndex {
     }
 
     pub async fn rebuild(conn: &Connection, path: PathBuf) -> anyhow::Result<Self> {
+        tracing::info!(path = %path.display(), "rebuilding vector index");
         let state = db::chunk_index_state(conn).await?;
         let embeddings = db::all_chunk_embeddings_with_ids(conn).await?;
         let dimensions = match embeddings.first() {

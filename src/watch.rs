@@ -72,8 +72,7 @@ pub async fn run_watcher(
         tracing::info!(dir = %notes_dir.display(), "watching for changes");
     }
 
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
+    let mut shutdown = crate::shutdown::Shutdown::install()?;
 
     loop {
         let mut changed = HashSet::new();
@@ -86,7 +85,7 @@ pub async fn run_watcher(
                     changed.insert(path);
                 }
             }
-            Ok(()) = &mut shutdown => {
+            () = shutdown.requested() => {
                 tracing::info!("shutting down");
                 break;
             }
@@ -335,7 +334,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{db, embed, fts::FtsIndex, rank::SemanticSource};
+    #[cfg(feature = "documents")]
+    use crate::rank::SemanticSource;
+    use crate::{db, embed, fts::FtsIndex};
 
     struct CountingMarkdownPreparer(Arc<AtomicUsize>);
 
