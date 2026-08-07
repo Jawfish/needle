@@ -65,6 +65,55 @@
               platforms = builtins.attrNames releases;
             };
           };
+      # Release binaries statically link the runtime, so installing one costs a
+      # download rather than a Rust build.
+      needleBinFor =
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          version = "0.4.0";
+          releases = {
+            x86_64-linux = {
+              platform = "linux-x86_64";
+              hash = "sha256-qZzBFvgEqQZ1Yf0+jupz44DAs2vmaQhpz+1u4MYQTmA=";
+            };
+            aarch64-darwin = {
+              platform = "macos-aarch64";
+              hash = "sha256-WHh2Iqn3nnJ/NYwoATAzKvmF4TaYtCKxqALKZ3fbJto=";
+            };
+          };
+          release = releases.${system} or null;
+        in
+        if release == null then
+          needleFor system
+        else
+          pkgs.stdenv.mkDerivation {
+            pname = "needle";
+            inherit version;
+            src = pkgs.fetchurl {
+              url = "https://github.com/Jawfish/needle/releases/download/v${version}/needle-v${version}-${release.platform}.tar.gz";
+              inherit (release) hash;
+            };
+            sourceRoot = ".";
+            nativeBuildInputs = pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.autoPatchelfHook;
+            buildInputs = [
+              pkgs.stdenv.cc.cc.lib
+              pkgs.openssl
+            ];
+            dontBuild = true;
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 needle "$out/bin/needle"
+              runHook postInstall
+            '';
+            meta = {
+              description = "Local semantic search for documents";
+              homepage = "https://github.com/Jawfish/needle";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "needle";
+              platforms = builtins.attrNames releases;
+            };
+          };
       needleFor =
         system:
         let
@@ -112,6 +161,7 @@
         in
         {
           inherit needle;
+          needle-bin = needleBinFor system;
           default = needle;
         }
       );
