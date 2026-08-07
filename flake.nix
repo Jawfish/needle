@@ -17,17 +17,59 @@
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      # Upstream prebuilt runtime. nixpkgs builds onnxruntime from source with
+      # LTO and its full test suite, which costs an hour whenever the binary
+      # cache misses.
+      onnxruntimeFor =
+        pkgs:
+        let
+          version = "1.27.1";
+          releases = {
+            x86_64-linux = {
+              platform = "linux-x64";
+              hash = "sha256-JbHvH+oazSENY/jyTchwrW4Hd5XOH1SHYlLG04A8Fa8=";
+            };
+            aarch64-linux = {
+              platform = "linux-aarch64";
+              hash = "sha256-M8Z+M9HiW4FoeDZuonZYmgJPcfAA5/+VXEszIk1jnt0=";
+            };
+            aarch64-darwin = {
+              platform = "osx-arm64";
+              hash = "sha256-5Ct3pygcxuVRQb9E/PusLHgrgjpJG7tqwzx4HdmR+KY=";
+            };
+          };
+          release = releases.${pkgs.stdenv.hostPlatform.system} or null;
+        in
+        if release == null then
+          pkgs.onnxruntime
+        else
+          pkgs.stdenv.mkDerivation {
+            pname = "onnxruntime-bin";
+            inherit version;
+            src = pkgs.fetchurl {
+              url = "https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-${release.platform}-${version}.tgz";
+              inherit (release) hash;
+            };
+            nativeBuildInputs = pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.autoPatchelfHook;
+            buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+            dontBuild = true;
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out"
+              cp -r include lib "$out/"
+              runHook postInstall
+            '';
+            meta = {
+              inherit (pkgs.onnxruntime.meta) description homepage;
+              license = pkgs.lib.licenses.mit;
+              platforms = builtins.attrNames releases;
+            };
+          };
       needleFor =
         system:
         let
           pkgs = import nixpkgs { inherit system; };
-          onnxruntime = pkgs.onnxruntime.override {
-            coremlSupport = false;
-            cudaSupport = false;
-            openvinoSupport = false;
-            pythonSupport = false;
-            rocmSupport = false;
-          };
+          onnxruntime = onnxruntimeFor pkgs;
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "needle";
