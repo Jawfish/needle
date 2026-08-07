@@ -1,5 +1,7 @@
 use std::net::IpAddr;
 
+use crate::service;
+
 #[derive(clap::Parser)]
 #[command(
     name = "needle",
@@ -24,6 +26,24 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(clap::Args)]
+pub struct ServiceArgs {
+    #[arg(value_enum)]
+    pub role: service::Role,
+    #[arg(long, value_enum, default_value_t = service::Backend::host())]
+    pub backend: service::Backend,
+    #[arg(long)]
+    pub exec_path: Option<std::path::PathBuf>,
+    #[arg(long, default_value = "15m")]
+    pub interval: service::Interval,
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: IpAddr,
+    #[arg(long, default_value_t = 8080)]
+    pub port: u16,
 }
 
 #[derive(clap::Subcommand)]
@@ -55,6 +75,8 @@ pub enum Command {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// Print a service definition for the selected backend
+    Service(ServiceArgs),
     /// Find similar document pairs based on embeddings
     Similar {
         #[arg(long = "namespace")]
@@ -76,6 +98,8 @@ pub enum Command {
         #[arg(short, long)]
         paths_only: bool,
     },
+    /// List watcher and index status for configured roots
+    Status,
     /// List remembered document preparation failures
     Failures,
     /// Reindex all supported documents
@@ -102,6 +126,13 @@ mod tests {
         let cli = Cli::try_parse_from(["needle", "--json", "namespaces"]).expect("parse");
         assert!(cli.json);
         assert!(matches!(cli.command, Command::Namespaces));
+    }
+
+    #[test]
+    fn status_command_accepts_json_output() {
+        let cli = Cli::try_parse_from(["needle", "status", "--json"]).expect("parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Status));
     }
 
     #[test]
@@ -206,6 +237,35 @@ mod tests {
         assert_eq!(
             parsed,
             Some(("127.0.0.1".parse::<IpAddr>().expect("IP"), 8080))
+        );
+    }
+
+    #[test]
+    fn service_role_parses_with_defaults() {
+        let cli = Cli::try_parse_from(["needle", "service", "serve"]).expect("parse");
+        let parsed = match cli.command {
+            Command::Service(args) => Some((
+                args.role,
+                args.backend,
+                args.exec_path,
+                args.interval,
+                args.log_level,
+                args.host,
+                args.port,
+            )),
+            _ => None,
+        };
+        assert_eq!(
+            parsed,
+            Some((
+                service::Role::Serve,
+                service::Backend::host(),
+                None,
+                "15m".parse().expect("interval"),
+                "info".to_owned(),
+                "127.0.0.1".parse::<IpAddr>().expect("IP"),
+                8080,
+            ))
         );
     }
 

@@ -22,15 +22,37 @@ pub struct VectorIndex {
     save_count: AtomicUsize,
 }
 
-pub struct VectorReader {
+struct VectorView {
     index: Option<Index>,
+    recorded: Option<(usize, i64)>,
+}
+
+pub struct VectorReader {
+    path: PathBuf,
+    view: tokio::sync::RwLock<VectorView>,
+    #[cfg(test)]
+    reopen_count: AtomicUsize,
 }
 
 impl VectorReader {
     pub async fn open(conn: &Connection, path: &Path) -> anyhow::Result<Self> {
-        let state = db::chunk_index_state(conn).await?;
         let recorded = db::vector_index_state(conn).await?;
-        let index = if path.exists() {
+        let index = Self::restore_view(conn, path, recorded).await?;
+        Ok(Self {
+            path: path.to_owned(),
+            view: tokio::sync::RwLock::new(VectorView { index, recorded }),
+            #[cfg(test)]
+            reopen_count: AtomicUsize::new(0),
+        })
+    }
+
+    async fn restore_view(
+        conn: &Connection,
+        path: &Path,
+        recorded: Option<(usize, i64)>,
+    ) -> anyhow::Result<Option<Index>> {
+        let state = db::chunk_index_state(conn).await?;
+        if path.exists() {
             match Index::restore_view(&path.to_string_lossy()) {
                 Ok(index) => {
                     if recorded != Some(state) || index.size() != state.0 {
@@ -42,7 +64,7 @@ impl VectorReader {
                             "vector index differs from the chunks table"
                         );
                     }
-                    Some(index)
+                    Ok(Some(index))
                 }
                 Err(error) => {
                     if state.0 > 0 {
@@ -52,7 +74,7 @@ impl VectorReader {
                             "vector index is unavailable; run `needle reindex`"
                         );
                     }
-                    None
+                    Ok(None)
                 }
             }
         } else {
@@ -62,13 +84,36 @@ impl VectorReader {
                     "vector index is unavailable; run `needle reindex`"
                 );
             }
-            None
-        };
-        Ok(Self { index })
+            Ok(None)
+        }
     }
 
-    pub fn search(&self, query: &[f32], count: usize) -> anyhow::Result<Vec<i64>> {
-        let Some(index) = &self.index else {
+    pub async fn search(
+        &self,
+        conn: &Connection,
+        query: &[f32],
+        count: usize,
+    ) -> anyhow::Result<Vec<i64>> {
+        let recorded = db::vector_index_state(conn).await?;
+        {
+            let view = self.view.read().await;
+            if view.recorded == recorded {
+                return Self::search_view(view.index.as_ref(), query, count);
+            }
+        }
+
+        let mut view = self.view.write().await;
+        if view.recorded != recorded {
+            #[cfg(test)]
+            self.reopen_count.fetch_add(1, Ordering::SeqCst);
+            view.index = Self::restore_view(conn, &self.path, recorded).await?;
+            view.recorded = recorded;
+        }
+        Self::search_view(view.index.as_ref(), query, count)
+    }
+
+    fn search_view(index: Option<&Index>, query: &[f32], count: usize) -> anyhow::Result<Vec<i64>> {
+        let Some(index) = index else {
             return Ok(Vec::new());
         };
         let matches = index.search(query, count).context("vector search failed")?;
@@ -77,6 +122,11 @@ impl VectorReader {
             .into_iter()
             .map(|key| i64::try_from(key).context("vector key exceeds i64"))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub fn reopen_count(&self) -> usize {
+        self.reopen_count.load(Ordering::SeqCst)
     }
 }
 
@@ -112,6 +162,7 @@ impl VectorIndex {
     }
 
     pub async fn rebuild(conn: &Connection, path: PathBuf) -> anyhow::Result<Self> {
+        tracing::info!(path = %path.display(), "rebuilding vector index");
         let state = db::chunk_index_state(conn).await?;
         let embeddings = db::all_chunk_embeddings_with_ids(conn).await?;
         let dimensions = match embeddings.first() {
@@ -517,7 +568,7 @@ mod tests {
 
         let reader = VectorReader::open(&conn, &path).await.expect("reader");
         assert_eq!(
-            reader.search(&vectors[0], 1).expect("search"),
+            reader.search(&conn, &vectors[0], 1).await.expect("search"),
             writable.search(&vectors[0], 1).expect("search")
         );
 
@@ -561,7 +612,13 @@ mod tests {
         .expect("insert divergence");
 
         let reader = VectorReader::open(&conn, &path).await.expect("reader");
-        assert!(!reader.search(&vectors[0], 1).expect("search").is_empty());
+        assert!(
+            !reader
+                .search(&conn, &vectors[0], 1)
+                .await
+                .expect("search")
+                .is_empty()
+        );
 
         assert_eq!(std::fs::read(&path).expect("read index"), bytes);
         assert_eq!(
@@ -581,7 +638,13 @@ mod tests {
 
         let reader = VectorReader::open(&conn, &path).await.expect("reader");
 
-        assert!(reader.search(&vectors[0], 1).expect("search").is_empty());
+        assert!(
+            reader
+                .search(&conn, &vectors[0], 1)
+                .await
+                .expect("search")
+                .is_empty()
+        );
         assert!(!path.exists());
     }
 
@@ -596,10 +659,94 @@ mod tests {
 
         for query in vectors.iter().take(4) {
             assert_eq!(
-                reader.search(query, 8).expect("reader search"),
+                reader.search(&conn, query, 8).await.expect("reader search"),
                 writable.search(query, 8).expect("writable search")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reader_returns_content_added_after_it_opens() {
+        let (dir, _database, conn, _vectors) = corpus_db(CORPUS_DIM, 1).await;
+        let path = dir.path().join("vectors.usearch");
+        let writable = VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+
+        let mut rng = Rng(99);
+        let embedding = rng.vector(CORPUS_DIM);
+        db::upsert_note(
+            &conn,
+            "added.md",
+            "hash",
+            &[(
+                PreparedChunk {
+                    content: "added after open".to_owned(),
+                    locator: None,
+                },
+                embedding.clone(),
+            )],
+        )
+        .await
+        .expect("upsert");
+        let added = chunk_ids(&conn, "added.md").await;
+        for id in &added {
+            writable.add(*id, &embedding).expect("add");
+        }
+        writable
+            .save(&conn, db::chunk_index_state(&conn).await.expect("state"))
+            .await
+            .expect("save");
+
+        let results = reader.search(&conn, &embedding, 10).await.expect("search");
+        assert!(results.iter().any(|id| added.contains(id)));
+        assert_eq!(reader.reopen_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reader_stops_returning_content_removed_after_it_opens() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 1).await;
+        let path = dir.path().join("vectors.usearch");
+        let writable = VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+        let removed = chunk_ids(&conn, "note0.md").await;
+        for id in &removed {
+            writable.remove(*id).expect("remove");
+        }
+        db::delete_note(&conn, "note0.md").await.expect("delete");
+        writable
+            .save(&conn, db::chunk_index_state(&conn).await.expect("state"))
+            .await
+            .expect("save");
+
+        let results = reader.search(&conn, &vectors[0], 10).await.expect("search");
+        assert!(!results.iter().any(|id| removed.contains(id)));
+        assert_eq!(reader.reopen_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_index_searches_do_not_reopen_reader() {
+        let (dir, _database, conn, vectors) = corpus_db(CORPUS_DIM, 1).await;
+        let path = dir.path().join("vectors.usearch");
+        VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("build");
+        let reader = VectorReader::open(&conn, &path).await.expect("reader");
+
+        for _ in 0..3 {
+            assert!(
+                !reader
+                    .search(&conn, &vectors[0], 1)
+                    .await
+                    .expect("search")
+                    .is_empty()
+            );
+        }
+
+        assert_eq!(reader.reopen_count(), 0);
     }
 
     #[tokio::test]

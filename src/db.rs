@@ -701,7 +701,7 @@ async fn search_related_candidates(
     let embedding_json = serde_json::to_string(query_embedding)?;
     let mut k = limit.saturating_mul(5).max(20);
     loop {
-        let candidates = vector.search(query_embedding, k)?;
+        let candidates = vector.search(conn, query_embedding, k).await?;
         let candidate_count = candidates.len();
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -779,7 +779,8 @@ impl SemanticSource for DbSemanticSource {
                 &self.conn,
                 query_embedding,
                 self.vector
-                    .search(query_embedding, limit.saturating_mul(3))?,
+                    .search(&self.conn, query_embedding, limit.saturating_mul(3))
+                    .await?,
             )
             .await?
             .into_iter()
@@ -1580,6 +1581,56 @@ mod tests {
         let blob = vec![0u8; 12]; // 3 floats
         let decoded = decode_embedding(&blob).expect("decode failed");
         assert_eq!(decoded.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn semantic_source_returns_documents_indexed_after_construction() {
+        let (dir, _db, conn) = test_db().await;
+        let embedding = vec![1.0; TEST_DIM];
+        upsert_note(
+            &conn,
+            "existing.md",
+            "existing",
+            &[("existing content".to_owned(), embedding.clone())],
+        )
+        .await
+        .expect("upsert existing");
+
+        let path = dir.path().join("test.usearch");
+        let writable = crate::vector::VectorIndex::open_or_rebuild(&conn, path.clone())
+            .await
+            .expect("vector");
+        let reader = std::sync::Arc::new(
+            crate::vector::VectorReader::open(&conn, &path)
+                .await
+                .expect("reader"),
+        );
+        let source = DbSemanticSource::new(conn.clone(), reader);
+
+        upsert_note(
+            &conn,
+            "added.md",
+            "added",
+            &[("added content".to_owned(), embedding.clone())],
+        )
+        .await
+        .expect("upsert added");
+        let added = chunk_embeddings_for_paths(&conn, &["added.md".to_owned()])
+            .await
+            .expect("added chunks");
+        for (id, embedding) in added {
+            writable.add(id, &embedding).expect("add");
+        }
+        writable
+            .save(&conn, chunk_index_state(&conn).await.expect("state"))
+            .await
+            .expect("save");
+
+        let results = source
+            .search_semantic(&embedding, 10)
+            .await
+            .expect("search");
+        assert!(results.iter().any(|result| result.path == "added.md"));
     }
 
     #[tokio::test]

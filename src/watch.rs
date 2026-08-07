@@ -8,6 +8,8 @@ use std::{
 use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+use std::time::Instant;
+
 #[cfg(test)]
 use crate::document::DefaultPreparer;
 #[cfg(test)]
@@ -26,7 +28,49 @@ pub struct OpenStore {
     pub notes_dir: PathBuf,
     pub conn: libsql::Connection,
     pub fts: FtsIndex,
+    pub vector_path: PathBuf,
     pub vector: Arc<VectorIndex>,
+}
+
+pub struct WatchedRoots {
+    _watcher: notify::RecommendedWatcher,
+    events: mpsc::UnboundedReceiver<PathBuf>,
+}
+
+pub fn arm(
+    roots: Vec<PathBuf>,
+    preparer: Arc<dyn DocumentPreparer>,
+) -> anyhow::Result<WatchedRoots> {
+    let (tx, events) = mpsc::unbounded_channel::<PathBuf>();
+    let roots_for_callback = roots.clone();
+    let mut watcher = notify::recommended_watcher(move |event: Result<notify::Event, _>| {
+        if let Ok(event) = event {
+            match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                    for path in event.paths {
+                        if should_index_path_with_preparer(
+                            &path,
+                            roots_for_callback.iter(),
+                            preparer.as_ref(),
+                        ) {
+                            let _ = tx.send(path);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    })?;
+
+    for root in roots {
+        watcher.watch(&root, RecursiveMode::Recursive)?;
+        tracing::debug!(dir = %root.display(), "watching for changes");
+    }
+
+    Ok(WatchedRoots {
+        _watcher: watcher,
+        events,
+    })
 }
 
 /// Watch all `stores` for filesystem changes and keep their indices up to date.
@@ -34,62 +78,54 @@ pub struct OpenStore {
 /// Callers are responsible for opening each store (DB connection, FTS index,
 /// initial indexing pass, lock acquisition) before calling this function.
 pub async fn run_watcher(
-    stores: Vec<OpenStore>,
+    watched_roots: WatchedRoots,
+    mut stores: Vec<OpenStore>,
     embedder: &Embedder,
     preparer: Arc<dyn DocumentPreparer>,
+    profile: crate::types::IndexProfile,
 ) -> anyhow::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
+    let started_at = Instant::now();
 
-    // Collect notes_dirs for the watcher closure. Config resolution guarantees
-    // non-overlapping roots, so each path matches at most one entry here.
+    let WatchedRoots {
+        _watcher,
+        mut events,
+    } = watched_roots;
+
+    // Config resolution guarantees non-overlapping roots, so each path matches
+    // at most one entry here.
     let notes_dirs: Vec<PathBuf> = stores.iter().map(|s| s.notes_dir.clone()).collect();
+    let mut shutdown = crate::shutdown::Shutdown::install()?;
+    let control = crate::control::ControlSocket::bind()?;
 
-    let mut watcher = {
-        let notes_dirs_clone = notes_dirs.clone();
-        let preparer = Arc::clone(&preparer);
-        notify::recommended_watcher(move |event: Result<notify::Event, _>| {
-            if let Ok(event) = event {
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        for path in event.paths {
-                            if should_index_path_with_preparer(
-                                &path,
-                                notes_dirs_clone.iter(),
-                                preparer.as_ref(),
-                            ) {
-                                let _ = tx.send(path);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        })?
-    };
-
-    for notes_dir in &notes_dirs {
-        watcher.watch(notes_dir, RecursiveMode::Recursive)?;
-        tracing::info!(dir = %notes_dir.display(), "watching for changes");
-    }
-
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
+    index_pending(&stores, &notes_dirs, embedder, &preparer, &mut events).await;
+    tracing::info!(roots = ?notes_dirs, "watching for changes");
 
     loop {
         let mut changed = HashSet::new();
 
         tokio::select! {
-            Some(path) = rx.recv() => {
+            Some(path) = events.recv() => {
                 changed.insert(path);
                 tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-                while let Ok(path) = rx.try_recv() {
+                while let Ok(path) = events.try_recv() {
                     changed.insert(path);
                 }
-            }
-            Ok(()) = &mut shutdown => {
+            },
+            () = shutdown.requested() => {
                 tracing::info!("shutting down");
                 break;
-            }
+            },
+            result = control.serve_next(
+                &mut stores,
+                started_at,
+                embedder,
+                preparer.as_ref(),
+                &profile,
+            ) => {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "failed to serve control request");
+                }
+            },
         }
 
         if !changed.is_empty() {
@@ -105,6 +141,64 @@ pub async fn run_watcher(
     }
 
     Ok(())
+}
+
+async fn index_pending(
+    stores: &[OpenStore],
+    notes_dirs: &[PathBuf],
+    embedder: &Embedder,
+    preparer: &Arc<dyn DocumentPreparer>,
+    events: &mut mpsc::UnboundedReceiver<PathBuf>,
+) {
+    let mut changed = HashSet::new();
+    while let Ok(path) = events.try_recv() {
+        changed.insert(path);
+    }
+    if !changed.is_empty() {
+        dispatch_changes_with_preparer(stores, notes_dirs, embedder, &changed, preparer.as_ref())
+            .await;
+    }
+}
+
+pub async fn reindex_in_place(
+    stores: &mut [OpenStore],
+    embedder: &Embedder,
+    preparer: &dyn DocumentPreparer,
+    retry_failed: bool,
+) -> anyhow::Result<Vec<(String, index::IndexStats)>> {
+    let mut results = Vec::with_capacity(stores.len());
+    for store in stores {
+        if retry_failed {
+            db::clear_failed_files(&store.conn).await?;
+        }
+        let indexed = index::index_directory_with_preparer(
+            &store.conn,
+            &store.fts,
+            embedder,
+            &store.notes_dir,
+            preparer,
+        )
+        .await;
+        let refreshed = VectorIndex::open_or_rebuild(&store.conn, store.vector_path.clone()).await;
+        match (indexed, refreshed) {
+            (Ok(stats), Ok(vector)) => {
+                store.vector = Arc::new(vector);
+                tracing::info!(%stats, dir = %store.notes_dir.display(), "reindex complete");
+                results.push((store.notes_dir.to_string_lossy().into_owned(), stats));
+            }
+            (Err(index_error), Ok(vector)) => {
+                store.vector = Arc::new(vector);
+                return Err(index_error);
+            }
+            (Ok(_), Err(vector_error)) => return Err(vector_error),
+            (Err(index_error), Err(vector_error)) => {
+                return Err(anyhow::anyhow!(
+                    "reindex failed: {index_error:#}; vector refresh failed: {vector_error:#}"
+                ));
+            }
+        }
+    }
+    Ok(results)
 }
 
 /// Route each changed path to its owning store and process it.
@@ -335,7 +429,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{db, embed, fts::FtsIndex, rank::SemanticSource};
+    #[cfg(feature = "documents")]
+    use crate::rank::SemanticSource;
+    use crate::{db, embed, fts::FtsIndex};
 
     struct CountingMarkdownPreparer(Arc<AtomicUsize>);
 
@@ -427,8 +523,9 @@ mod tests {
             .await
             .expect("connect");
         let fts = FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let vector_path = db_dir.path().join("test.usearch");
         let vector = Arc::new(
-            VectorIndex::rebuild(&conn, db_dir.path().join("test.usearch"))
+            VectorIndex::rebuild(&conn, vector_path.clone())
                 .await
                 .expect("vector"),
         );
@@ -436,9 +533,65 @@ mod tests {
             notes_dir: notes_dir.to_path_buf(),
             conn,
             fts,
+            vector_path,
             vector,
         };
         (vec![db_dir, fts_dir], store)
+    }
+
+    #[tokio::test]
+    async fn a_change_buffered_before_startup_is_indexed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let stores = vec![store];
+        let dirs = vec![notes_dir.path().to_path_buf()];
+        let embedder = embed::Embedder::create_null(1024);
+        let preparer: Arc<dyn DocumentPreparer> = Arc::new(DefaultPreparer::default());
+        let path = notes_dir.path().join("buffered.md");
+        create_file(notes_dir.path(), "buffered.md", "buffered content");
+        let (sender, mut events) = mpsc::unbounded_channel();
+        sender.send(path).expect("queue path");
+
+        index_pending(&stores, &dirs, &embedder, &preparer, &mut events).await;
+
+        assert!(
+            db::all_note_hashes(&stores[0].conn)
+                .await
+                .expect("hashes")
+                .contains_key("buffered.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deletion_buffered_before_startup_is_removed() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "removed.md", "removed content");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let stores = vec![store];
+        let dirs = vec![notes_dir.path().to_path_buf()];
+        let embedder = embed::Embedder::create_null(1024);
+        let preparer: Arc<dyn DocumentPreparer> = Arc::new(DefaultPreparer::default());
+        let path = notes_dir.path().join("removed.md");
+        let (sender, mut events) = mpsc::unbounded_channel();
+        sender.send(path.clone()).expect("queue initial path");
+        index_pending(&stores, &dirs, &embedder, &preparer, &mut events).await;
+        assert!(
+            db::all_note_hashes(&stores[0].conn)
+                .await
+                .expect("hashes")
+                .contains_key("removed.md")
+        );
+
+        std::fs::remove_file(&path).expect("remove file");
+        sender.send(path).expect("queue deleted path");
+        index_pending(&stores, &dirs, &embedder, &preparer, &mut events).await;
+
+        assert!(
+            !db::all_note_hashes(&stores[0].conn)
+                .await
+                .expect("hashes")
+                .contains_key("removed.md")
+        );
     }
 
     // ---------- routing tests -------------------------------------------------
@@ -945,6 +1098,71 @@ mod tests {
                 .expect("note hash")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn retrying_failed_reindex_indexes_the_fixed_file() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "fixed.md", "fixed");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        db::record_failed_file(
+            &store.conn,
+            "fixed.md",
+            &crate::hash::content_hash("fixed"),
+            "embedder outage",
+        )
+        .await
+        .expect("record failure");
+        let mut stores = vec![store];
+
+        let stats = reindex_in_place(
+            &mut stores,
+            &embed::Embedder::create_null(1024),
+            &DefaultPreparer::default(),
+            true,
+        )
+        .await
+        .expect("retry reindex");
+
+        assert_eq!(stats[0].1.added, 1);
+        assert!(
+            db::failed_files(&stores[0].conn)
+                .await
+                .expect("failures")
+                .is_empty()
+        );
+        assert!(
+            db::note_hash(&stores[0].conn, "fixed.md")
+                .await
+                .expect("note hash")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn reindexing_in_place_refreshes_the_vector_for_new_files() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let mut stores = vec![store];
+        create_file(notes_dir.path(), "new.md", "new content");
+
+        let stats = reindex_in_place(
+            &mut stores,
+            &embed::Embedder::create_null(1024),
+            &DefaultPreparer::default(),
+            false,
+        )
+        .await
+        .expect("reindex");
+
+        assert_eq!(stats[0].1.added, 1);
+        assert!(
+            db::note_hash(&stores[0].conn, "new.md")
+                .await
+                .expect("note hash")
+                .is_some()
+        );
+        assert_vector_matches_chunks(&stores[0]).await;
     }
 
     async fn assert_vector_matches_chunks(store: &OpenStore) {

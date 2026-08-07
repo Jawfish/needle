@@ -1,6 +1,7 @@
 mod archive;
 mod cli;
 mod config;
+mod control;
 mod db;
 mod document;
 mod embed;
@@ -15,6 +16,8 @@ mod query;
 mod rank;
 mod search_merge;
 mod server;
+mod service;
+mod shutdown;
 mod similar;
 mod types;
 mod vector;
@@ -341,6 +344,8 @@ async fn main() -> anyhow::Result<()> {
         cli.verbose,
     );
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(tracing_subscriber::EnvFilter::new(directives))
         .init();
     run(cli).await
@@ -351,9 +356,11 @@ fn search_needs_embedder(command: &Command, weights: &rank::RrfWeights) -> bool 
         Command::Watch | Command::Reindex { .. } => true,
         Command::Search { .. } | Command::Serve { .. } => weights.semantic > 0.0,
         Command::Namespaces
+        | Command::Status
         | Command::Failures
         | Command::Similar { .. }
-        | Command::Related { .. } => false,
+        | Command::Related { .. }
+        | Command::Service(_) => false,
     }
 }
 
@@ -369,7 +376,15 @@ const fn extract_cli_weights(command: &Command) -> CliWeights {
             fts: *w_fts,
             filename: *w_filename,
         },
-        _ => CliWeights {
+        Command::Namespaces
+        | Command::Watch
+        | Command::Serve { .. }
+        | Command::Service(_)
+        | Command::Similar { .. }
+        | Command::Related { .. }
+        | Command::Status
+        | Command::Failures
+        | Command::Reindex { .. } => CliWeights {
             semantic: None,
             fts: None,
             filename: None,
@@ -387,8 +402,17 @@ const fn output_mode(json: bool, paths_only: bool) -> OutputMode {
 
 async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
-    let preparer = std::sync::Arc::new(document::DefaultPreparer::default());
+    let preparer: std::sync::Arc<dyn document::DocumentPreparer> =
+        std::sync::Arc::new(document::DefaultPreparer::default());
     let profile = index_profile(&embedder, preparer.as_ref());
+    let watched_roots = watch::arm(
+        config
+            .docs_dirs
+            .iter()
+            .map(|store| store.notes_dir.clone())
+            .collect(),
+        std::sync::Arc::clone(&preparer),
+    )?;
 
     let mut open_stores: Vec<watch::OpenStore> = Vec::with_capacity(config.docs_dirs.len());
     // Locks are held for the watcher's lifetime and released on drop when
@@ -413,20 +437,21 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         .await?;
         tracing::info!(%stats, dir = %store.notes_dir.display(), "initial index complete");
 
+        let vector_path = store.db_path.with_extension("usearch");
         let vector = std::sync::Arc::new(
-            vector::VectorIndex::open_or_rebuild(&conn, store.db_path.with_extension("usearch"))
-                .await?,
+            vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone()).await?,
         );
         held_locks.push(lock);
         open_stores.push(watch::OpenStore {
             notes_dir: store.notes_dir.clone(),
             conn,
             fts,
+            vector_path,
             vector,
         });
     }
 
-    watch::run_watcher(open_stores, &embedder, preparer).await
+    watch::run_watcher(watched_roots, open_stores, &embedder, preparer, profile).await
 }
 
 async fn run_reindex_command(
@@ -435,6 +460,17 @@ async fn run_reindex_command(
     retry_failed: bool,
 ) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
+    #[cfg(unix)]
+    {
+        let preparer = document::DefaultPreparer::default();
+        let profile = index_profile(&embedder, &preparer);
+        if let Some(roots) = control::request_reindex(retry_failed, profile).await? {
+            for root in roots {
+                tracing::info!(stats = %root, dir = %root.directory, "reindex complete");
+            }
+            return Ok(());
+        }
+    }
     for store in &config.docs_dirs {
         let _lock = lock::IndexLock::try_acquire(&store.db_path)?;
         let stats = run_reindex_with_retry(
@@ -482,6 +518,19 @@ fn run_namespaces(
     writer: &mut impl Write,
 ) -> anyhow::Result<()> {
     output::print_namespaces(namespaces, mode, writer)
+}
+
+async fn run_status(
+    config: &Config,
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    let status = control::status(&config.docs_dirs).await?;
+    output::print_status(&status, mode, writer)
+}
+
+async fn run_status_command(config: &Config, json: bool) -> anyhow::Result<()> {
+    run_status(config, output_mode(json, false), &mut std::io::stdout()).await
 }
 
 async fn run_failures(
@@ -665,7 +714,39 @@ async fn run_serve(
     .await
 }
 
+fn render_service_definition(args: &cli::ServiceArgs) -> anyhow::Result<String> {
+    let exec_path = match &args.exec_path {
+        Some(path) => path.clone(),
+        None => std::env::current_exe().context("resolving needle executable path")?,
+    };
+    if !exec_path.is_absolute() {
+        anyhow::bail!("--exec-path must be absolute");
+    }
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let definition = service::Definition {
+        exec_path: exec_path.to_string_lossy().into_owned(),
+        home,
+        log_level: args.log_level.clone(),
+        interval: args.interval.clone(),
+        host: args.host.to_string(),
+        port: args.port,
+    };
+    Ok(service::render(args.role, args.backend, &definition))
+}
+
+fn write_service_definition(args: &cli::ServiceArgs) -> anyhow::Result<()> {
+    let rendered = render_service_definition(args)?;
+    std::io::stdout()
+        .write_all(rendered.as_bytes())
+        .context("writing service definition")
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    if let Command::Service(args) = &cli.command {
+        return write_service_definition(args);
+    }
+
     let cli_weights = extract_cli_weights(&cli.command);
     let cli_embed = CliEmbedArgs {
         provider: cli.provider,
@@ -695,6 +776,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             &mut std::io::stdout(),
         ),
         Command::Watch => run_watch(&config, embedder).await,
+        Command::Status => run_status_command(&config, cli.json).await,
         Command::Failures => {
             run_failures(
                 &config,
@@ -725,6 +807,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Command::Serve { host, port } => run_serve(&config, embedder, host, port).await,
+        Command::Service(_) => Ok(()),
         Command::Similar {
             namespaces,
             threshold,
@@ -952,6 +1035,14 @@ mod tests {
     }
 
     #[test]
+    fn status_never_needs_an_embedder() {
+        assert!(!search_needs_embedder(
+            &Command::Status,
+            &rank::RrfWeights::default()
+        ));
+    }
+
+    #[test]
     fn similar_never_needs_embedder() {
         let weights = rank::RrfWeights {
             semantic: 1.5,
@@ -1032,15 +1123,13 @@ mod tests {
     ///
     /// Steps:
     ///   1. Build a populated index at dimension 384.
-    ///   2. Drop a non-UTF8 file into the notes dir so `index_directory` fails.
+    ///   2. Use an embedder that fails while rebuilding into the temporary index.
     ///   3. Call `run_reindex` with dimension 1024 (triggers mismatch path).
     ///   4. Assert the original DB file still exists and still contains the old
     ///      data (the prior index is preserved, not destroyed).
     #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_original_db_on_dimension_mismatch() {
-        use std::io::Write;
-
         let notes_dir = tempfile::tempdir().expect("notes tempdir");
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let fts_dir = tempfile::tempdir().expect("fts tempdir");
@@ -1061,17 +1150,10 @@ mod tests {
 
         assert!(db_path.exists(), "original DB must exist before test");
 
-        // Place a non-UTF8 file that will cause `read_to_string` to fail.
-        let bad_file = notes_dir.path().join("corrupt.md");
-        {
-            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
-            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
-        }
-
-        // Run reindex with dim=1024 (mismatch). The corrupt file should cause failure.
-        let embedder = crate::embed::Embedder::create_null(1024);
+        // Run reindex with dim=1024 (mismatch). The failing embedder aborts the temp build.
+        let (embedder, _) = crate::embed::Embedder::create_counting(1024, true);
         let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
-        assert!(result.is_err(), "reindex must fail due to corrupt file");
+        assert!(result.is_err(), "reindex must fail when embedding fails");
 
         // The original DB file must still be present and contain the prior data.
         assert!(
@@ -1090,16 +1172,14 @@ mod tests {
 
     /// Dimension mismatch + reindex failure must not corrupt the live FTS index.
     ///
-    /// Reproduction of the divergence bug: a temp reindex build fails (corrupt
-    /// file causes `read_to_string` to error), but the old code called fts.rebuild
+    /// Reproduction of the divergence bug: a temp reindex build fails while
+    /// embedding, but the old code called fts.rebuild
     /// on the live index before propagating the error, wiping it. After the fix
     /// the live FTS must still answer queries for content indexed before the
     /// failed reindex.
     #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn reindex_failure_preserves_fts_index_on_dimension_mismatch() {
-        use std::io::Write;
-
         let notes_dir = tempfile::tempdir().expect("notes tempdir");
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let fts_dir = tempfile::tempdir().expect("fts tempdir");
@@ -1129,17 +1209,10 @@ mod tests {
             );
         }
 
-        // Drop a corrupt file so the mismatch reindex fails before completing.
-        let bad_file = notes_dir.path().join("corrupt.md");
-        {
-            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
-            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
-        }
-
-        // Run reindex with dim=1024 (mismatch). Must fail.
-        let embedder = crate::embed::Embedder::create_null(1024);
+        // Run reindex with dim=1024 (mismatch). The failing embedder aborts the temp build.
+        let (embedder, _) = crate::embed::Embedder::create_counting(1024, true);
         let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
-        assert!(result.is_err(), "reindex must fail due to corrupt file");
+        assert!(result.is_err(), "reindex must fail when embedding fails");
 
         // The live FTS index must still answer queries for the original content.
         let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
@@ -1293,8 +1366,6 @@ mod tests {
     #[cfg(not(feature = "documents"))]
     #[tokio::test]
     async fn interrupted_reindex_restores_fts_backup_on_next_attempt() {
-        use std::io::Write;
-
         let notes_dir = tempfile::tempdir().expect("notes tempdir");
         let db_dir = tempfile::tempdir().expect("db tempdir");
         let fts_dir = tempfile::tempdir().expect("fts tempdir");
@@ -1327,18 +1398,10 @@ mod tests {
             "live FTS must be absent to reproduce the crash state"
         );
 
-        // Add a corrupt file so the new build deterministically fails, verifying
-        // that recovery holds even when the subsequent rebuild does not succeed.
-        let bad_file = notes_dir.path().join("corrupt.md");
-        {
-            let mut f = std::fs::File::create(&bad_file).expect("create corrupt file");
-            f.write_all(&[0xFF, 0xFE, 0xFD]).expect("write bad bytes");
-        }
-
-        // Trigger mismatch reindex (dim=1024). Must fail due to corrupt file.
-        let embedder = embed::Embedder::create_null(1024);
+        // Make the new build fail, verifying recovery holds when reindexing does not succeed.
+        let (embedder, _) = embed::Embedder::create_counting(1024, true);
         let result = run_reindex(&db_path, fts_dir.path(), &embedder, notes_dir.path()).await;
-        assert!(result.is_err(), "reindex must fail due to corrupt file");
+        assert!(result.is_err(), "reindex must fail when embedding fails");
 
         // The backup must have been restored to the live FTS location before the
         // build started, so the original content is intact regardless of the

@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::{
     config::Namespace,
+    control::StatusRoot,
     rank::FusedResult,
     similar::{RelatedResult, SimilarGroup, SimilarPair},
 };
@@ -95,6 +96,40 @@ pub fn print_failures(
                     directory = Some(failure.directory.clone());
                 }
                 writeln!(writer, "  {}\t{}", failure.path, failure.error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn print_status(
+    status: &[StatusRoot],
+    mode: OutputMode,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    match mode {
+        OutputMode::Json => {
+            let json = serde_json::to_string(status)?;
+            writeln!(writer, "{json}")?;
+        }
+        OutputMode::Human { .. } => {
+            for root in status {
+                let uptime = root
+                    .uptime_seconds
+                    .map_or_else(|| "-".to_owned(), |seconds| format!("{seconds}s"));
+                writeln!(
+                    writer,
+                    "{}\twatcher: {}\tuptime: {uptime}\tdocuments: {}\tchunks: {}\tpreparation failures: {}",
+                    root.directory,
+                    if root.watcher_live {
+                        "live"
+                    } else {
+                        "not live"
+                    },
+                    root.documents,
+                    root.chunks,
+                    root.preparation_failures,
+                )?;
             }
         }
     }
@@ -322,6 +357,17 @@ mod tests {
         }
     }
 
+    fn make_status(directory: &str, watcher_live: bool) -> StatusRoot {
+        StatusRoot {
+            directory: directory.to_owned(),
+            watcher_live,
+            uptime_seconds: watcher_live.then_some(12),
+            documents: 3,
+            chunks: 7,
+            preparation_failures: 1,
+        }
+    }
+
     fn make_fused(path: &str, score: f64, snippet: &str) -> SearchResult {
         SearchResult {
             fused: FusedResult {
@@ -442,6 +488,27 @@ mod tests {
             output,
             "[{\"directory\":\"/docs/alpha\",\"path\":\"a.md\",\"error\":\"first error\"},{\"directory\":\"/docs/zeta\",\"path\":\"z.md\",\"error\":\"z error\"}]\n"
         );
+    }
+
+    #[test]
+    fn status_output_reports_watcher_and_index_counts() {
+        let status = vec![make_status("/notes", true), make_status("/archive", false)];
+        let human = write_to_string(|writer| {
+            print_status(&status, OutputMode::Human { paths_only: false }, writer)
+        });
+        assert_eq!(
+            human,
+            "/notes\twatcher: live\tuptime: 12s\tdocuments: 3\tchunks: 7\tpreparation failures: 1\n/archive\twatcher: not live\tuptime: -\tdocuments: 3\tchunks: 7\tpreparation failures: 1\n"
+        );
+
+        let json = write_to_string(|writer| print_status(&status, OutputMode::Json, writer));
+        let value: serde_json::Value =
+            serde_json::from_str(json.trim()).expect("parse status JSON");
+        assert_eq!(value[0]["watcher_live"], true);
+        assert_eq!(value[1]["uptime_seconds"], serde_json::Value::Null);
+        assert_eq!(value[0]["documents"], 3);
+        assert_eq!(value[0]["chunks"], 7);
+        assert_eq!(value[0]["preparation_failures"], 1);
     }
 
     #[test]

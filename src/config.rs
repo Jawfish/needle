@@ -334,7 +334,7 @@ fn config_path() -> anyhow::Result<PathBuf> {
     Ok(base.join("needle/config.toml"))
 }
 
-fn data_dir() -> anyhow::Result<PathBuf> {
+pub fn data_dir() -> anyhow::Result<PathBuf> {
     let base = if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(dir)
     } else {

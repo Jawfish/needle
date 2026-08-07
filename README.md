@@ -21,6 +21,86 @@ Embeddings run locally by default using [fastembed](https://github.com/Anush008/
 
 The default build enables the `local` and `documents` Cargo features. `documents` uses Xberg to prepare Markdown (`.md`, `.markdown`), plain text (`.txt`), PDF (`.pdf`), EPUB (`.epub`), HTML (`.html`, `.htm`), and Word (`.docx`) files. For a smaller binary without the local model and document preparation, build with `--no-default-features` and use an API provider instead. That build indexes Markdown only.
 
+## Background service
+
+`needle service` prints a definition but never installs, enables, or starts it. The generated definition uses the running executable's path; pass `--exec-path` to use a different path.
+
+### Watch for changes
+
+On Linux, install the systemd user service and follow its logs with journald:
+
+```bash
+needle service watch > ~/.config/systemd/user/needle-watch.service
+systemctl --user daemon-reload
+systemctl --user enable --now needle-watch
+journalctl --user -u needle-watch -f
+```
+
+On macOS, install the launchd agent:
+
+```bash
+needle service watch > ~/Library/LaunchAgents/dev.needle.watch.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.needle.watch.plist
+```
+
+A systemd user service stops at logout and does not start at boot unless you enable lingering:
+
+```bash
+loginctl enable-linger $USER
+```
+
+### Reindex periodically
+
+Prefer a periodic reindex when some staleness is acceptable. Incremental indexing skips unchanged files by hash, so a timer costs less and holds the index lock only while it runs. In return, search results can be stale for up to the interval and each run performs a full in-memory vector rebuild.
+
+On Linux, the timer activates a separate reindex service, so install both files:
+
+```bash
+needle service reindex > ~/.config/systemd/user/needle-reindex.service
+needle service timer > ~/.config/systemd/user/needle-reindex.timer
+systemctl --user daemon-reload
+systemctl --user enable --now needle-reindex.timer
+```
+
+On macOS, one launchd agent performs the periodic reindex:
+
+```bash
+needle service timer > ~/Library/LaunchAgents/dev.needle.timer.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.needle.timer.plist
+```
+
+### Nix with Home Manager
+
+Nix users should prefer the Home Manager module over `needle service`. It references the package derivation rather than a resolved store path, so garbage collection keeps the executable available.
+
+Import the module and use watch mode:
+
+```nix
+{
+  imports = [ inputs.needle.homeModules.needle ];
+
+  services.needle = {
+    enable = true;
+    mode = "watch";
+    serve.enable = true;
+  };
+}
+```
+
+For periodic reindexing, change the mode and optionally set the interval:
+
+```nix
+{
+  imports = [ inputs.needle.homeModules.needle ];
+
+  services.needle = {
+    enable = true;
+    mode = "timer";
+    interval = "15m";
+  };
+}
+```
+
 ## Usage
 
 Index your documents, then search:
