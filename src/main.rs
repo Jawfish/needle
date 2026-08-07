@@ -437,20 +437,21 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
         .await?;
         tracing::info!(%stats, dir = %store.notes_dir.display(), "initial index complete");
 
+        let vector_path = store.db_path.with_extension("usearch");
         let vector = std::sync::Arc::new(
-            vector::VectorIndex::open_or_rebuild(&conn, store.db_path.with_extension("usearch"))
-                .await?,
+            vector::VectorIndex::open_or_rebuild(&conn, vector_path.clone()).await?,
         );
         held_locks.push(lock);
         open_stores.push(watch::OpenStore {
             notes_dir: store.notes_dir.clone(),
             conn,
             fts,
+            vector_path,
             vector,
         });
     }
 
-    watch::run_watcher(watched_roots, open_stores, &embedder, preparer).await
+    watch::run_watcher(watched_roots, open_stores, &embedder, preparer, profile).await
 }
 
 async fn run_reindex_command(
@@ -459,6 +460,17 @@ async fn run_reindex_command(
     retry_failed: bool,
 ) -> anyhow::Result<()> {
     let embedder = embedder.ok_or(NeedleError::NoEmbeddingProvider)?;
+    #[cfg(unix)]
+    {
+        let preparer = document::DefaultPreparer::default();
+        let profile = index_profile(&embedder, &preparer);
+        if let Some(roots) = control::request_reindex(retry_failed, profile).await? {
+            for root in roots {
+                tracing::info!(stats = %root, dir = %root.directory, "reindex complete");
+            }
+            return Ok(());
+        }
+    }
     for store in &config.docs_dirs {
         let _lock = lock::IndexLock::try_acquire(&store.db_path)?;
         let stats = run_reindex_with_retry(

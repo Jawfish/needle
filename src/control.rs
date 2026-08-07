@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{config::DirectoryStore, db};
+use crate::{config::DirectoryStore, db, index};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct StatusRoot {
@@ -10,6 +10,39 @@ pub struct StatusRoot {
     pub documents: usize,
     pub chunks: usize,
     pub preparation_failures: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ReindexRoot {
+    pub directory: String,
+    pub added: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub unchanged: usize,
+    pub failed: usize,
+}
+
+impl From<(String, index::IndexStats)> for ReindexRoot {
+    fn from((directory, stats): (String, index::IndexStats)) -> Self {
+        Self {
+            directory,
+            added: stats.added,
+            updated: stats.updated,
+            deleted: stats.deleted,
+            unchanged: stats.unchanged,
+            failed: stats.failed,
+        }
+    }
+}
+
+impl std::fmt::Display for ReindexRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "added={}, updated={}, deleted={}, unchanged={}, failed={}",
+            self.added, self.updated, self.deleted, self.unchanged, self.failed
+        )
+    }
 }
 
 struct IndexCounts {
@@ -100,8 +133,14 @@ mod socket {
         time::timeout,
     };
 
-    use super::{StatusRoot, index_counts, unavailable_status};
-    use crate::{config, watch::OpenStore};
+    use super::{ReindexRoot, StatusRoot, index_counts, unavailable_status};
+    use crate::{
+        config,
+        document::DocumentPreparer,
+        embed::Embedder,
+        types,
+        watch::{self, OpenStore},
+    };
 
     const PROTOCOL_VERSION: u32 = 1;
     const CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -116,6 +155,10 @@ mod socket {
     #[serde(rename_all = "snake_case")]
     enum RequestType {
         Status,
+        Reindex {
+            retry_failed: bool,
+            profile: types::IndexProfile,
+        },
     }
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -124,6 +167,14 @@ mod socket {
         Status {
             version: u32,
             roots: Vec<StatusRoot>,
+        },
+        Reindex {
+            version: u32,
+            roots: Vec<ReindexRoot>,
+        },
+        Error {
+            version: u32,
+            message: String,
         },
         VersionMismatch {
             version: u32,
@@ -163,31 +214,14 @@ mod socket {
 
         pub async fn serve_next(
             &self,
-            stores: &[OpenStore],
+            stores: &mut [OpenStore],
             started_at: Instant,
+            embedder: &Embedder,
+            preparer: &dyn DocumentPreparer,
+            profile: &types::IndexProfile,
         ) -> anyhow::Result<()> {
             let (stream, _) = self.listener.accept().await?;
-            let uptime_seconds = Some(started_at.elapsed().as_secs());
-            let mut roots = Vec::with_capacity(stores.len());
-            for store in stores {
-                let counts = index_counts(&store.conn).await;
-                let root = match counts {
-                    Ok(counts) => StatusRoot {
-                        directory: store.notes_dir.to_string_lossy().into_owned(),
-                        watcher_live: true,
-                        uptime_seconds,
-                        documents: counts.documents,
-                        chunks: counts.chunks,
-                        preparation_failures: counts.preparation_failures,
-                    },
-                    Err(error) => {
-                        tracing::warn!(directory = %store.notes_dir.display(), error = %error, "failed to read index status");
-                        unavailable_status(&store.notes_dir, true, uptime_seconds)
-                    }
-                };
-                roots.push(root);
-            }
-            serve_connection(stream, roots).await
+            serve_connection(stream, stores, started_at, embedder, preparer, profile).await
         }
     }
 
@@ -203,6 +237,13 @@ mod socket {
 
     pub async fn request_status() -> anyhow::Result<Option<Vec<StatusRoot>>> {
         request_status_at(&socket_path()?).await
+    }
+
+    pub async fn request_reindex(
+        retry_failed: bool,
+        profile: types::IndexProfile,
+    ) -> anyhow::Result<Option<Vec<ReindexRoot>>> {
+        request_reindex_at(&socket_path()?, retry_failed, profile).await
     }
 
     async fn request_status_at(path: &Path) -> anyhow::Result<Option<Vec<StatusRoot>>> {
@@ -246,10 +287,78 @@ mod socket {
                 received_version,
                 ..
             } => protocol_version_mismatch(expected_version, received_version),
+            Response::Error { version, message } => {
+                check_version(version)?;
+                anyhow::bail!(message)
+            }
+            Response::Reindex { .. } => Ok(None),
         }
     }
 
-    async fn serve_connection(stream: UnixStream, roots: Vec<StatusRoot>) -> anyhow::Result<()> {
+    async fn request_reindex_at(
+        path: &Path,
+        retry_failed: bool,
+        profile: types::IndexProfile,
+    ) -> anyhow::Result<Option<Vec<ReindexRoot>>> {
+        let Ok(Ok(stream)) = timeout(CONNECTION_TIMEOUT, UnixStream::connect(path)).await else {
+            return Ok(None);
+        };
+        let request = Request {
+            version: PROTOCOL_VERSION,
+            request: RequestType::Reindex {
+                retry_failed,
+                profile,
+            },
+        };
+        let Ok(request) = serde_json::to_string(&request) else {
+            return Ok(None);
+        };
+        tracing::info!("delegating reindex to the running watcher");
+        let (read, mut write) = stream.into_split();
+        if write.write_all(request.as_bytes()).await.is_err()
+            || write.write_all(b"\n").await.is_err()
+        {
+            return Ok(None);
+        }
+
+        let mut response = String::new();
+        let mut reader = BufReader::new(read);
+        let Ok(bytes_read) = reader.read_line(&mut response).await else {
+            return Ok(None);
+        };
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+        let response: Response = match serde_json::from_str(&response) {
+            Ok(response) => response,
+            Err(_) => return Ok(None),
+        };
+        match response {
+            Response::Reindex { version, roots } => {
+                check_version(version)?;
+                Ok(Some(roots))
+            }
+            Response::VersionMismatch {
+                expected_version,
+                received_version,
+                ..
+            } => protocol_version_mismatch(expected_version, received_version),
+            Response::Error { version, message } => {
+                check_version(version)?;
+                anyhow::bail!(message)
+            }
+            Response::Status { .. } => Ok(None),
+        }
+    }
+
+    async fn serve_connection(
+        stream: UnixStream,
+        stores: &mut [OpenStore],
+        started_at: Instant,
+        embedder: &Embedder,
+        preparer: &dyn DocumentPreparer,
+        profile: &types::IndexProfile,
+    ) -> anyhow::Result<()> {
         let (read, mut write) = stream.into_split();
         let mut request = String::new();
         let mut reader = BufReader::new(read);
@@ -259,9 +368,37 @@ mod socket {
         }
         let request: Request = serde_json::from_str(&request)?;
         let response = if request.version == PROTOCOL_VERSION {
-            Response::Status {
-                version: PROTOCOL_VERSION,
-                roots,
+            match request.request {
+                RequestType::Status => Response::Status {
+                    version: PROTOCOL_VERSION,
+                    roots: status_roots(stores, started_at).await,
+                },
+                RequestType::Reindex {
+                    retry_failed,
+                    profile: client_profile,
+                } => {
+                    if profile == &client_profile {
+                        match watch::reindex_in_place(stores, embedder, preparer, retry_failed)
+                            .await
+                        {
+                            Ok(roots) => Response::Reindex {
+                                version: PROTOCOL_VERSION,
+                                roots: roots.into_iter().map(ReindexRoot::from).collect(),
+                            },
+                            Err(error) => Response::Error {
+                                version: PROTOCOL_VERSION,
+                                message: format!("{error:#}"),
+                            },
+                        }
+                    } else {
+                        Response::Error {
+                            version: PROTOCOL_VERSION,
+                            message: format!(
+                                "index profile differs from the running watcher (watcher: {profile:?}; client: {client_profile:?}); restart the watcher service and rerun needle reindex"
+                            ),
+                        }
+                    }
+                }
             }
         } else {
             Response::VersionMismatch {
@@ -274,6 +411,30 @@ mod socket {
         write.write_all(response.as_bytes()).await?;
         write.write_all(b"\n").await?;
         Ok(())
+    }
+
+    async fn status_roots(stores: &[OpenStore], started_at: Instant) -> Vec<StatusRoot> {
+        let uptime_seconds = Some(started_at.elapsed().as_secs());
+        let mut roots = Vec::with_capacity(stores.len());
+        for store in stores {
+            let counts = index_counts(&store.conn).await;
+            let root = match counts {
+                Ok(counts) => StatusRoot {
+                    directory: store.notes_dir.to_string_lossy().into_owned(),
+                    watcher_live: true,
+                    uptime_seconds,
+                    documents: counts.documents,
+                    chunks: counts.chunks,
+                    preparation_failures: counts.preparation_failures,
+                },
+                Err(error) => {
+                    tracing::warn!(directory = %store.notes_dir.display(), error = %error, "failed to read index status");
+                    unavailable_status(&store.notes_dir, true, uptime_seconds)
+                }
+            };
+            roots.push(root);
+        }
+        roots
     }
 
     fn check_version(version: u32) -> anyhow::Result<()> {
@@ -297,10 +458,13 @@ mod socket {
 
     #[cfg(test)]
     mod tests {
-        use std::os::unix::fs::FileTypeExt as _;
+        use std::{os::unix::fs::FileTypeExt as _, path::Path, sync::Arc, time::Instant};
 
         use super::*;
-        use crate::control::local_status;
+        use crate::{
+            control::local_status, db, document::DefaultPreparer, embed::Embedder, fts::FtsIndex,
+            vector::VectorIndex,
+        };
 
         fn root() -> StatusRoot {
             StatusRoot {
@@ -311,6 +475,36 @@ mod socket {
                 chunks: 7,
                 preparation_failures: 2,
             }
+        }
+
+        fn create_file(dir: &Path, relative: &str, content: &str) {
+            std::fs::write(dir.join(relative), content).expect("write file");
+        }
+
+        async fn open_store(
+            notes_dir: &Path,
+            profile: &types::IndexProfile,
+        ) -> (Vec<tempfile::TempDir>, OpenStore) {
+            let db_dir = tempfile::tempdir().expect("create database directory");
+            let fts_dir = tempfile::tempdir().expect("create FTS directory");
+            let (_db, conn) = db::connect_with_profile(&db_dir.path().join("test.db"), profile)
+                .await
+                .expect("connect database");
+            let fts = FtsIndex::open_or_create(fts_dir.path()).expect("open FTS index");
+            let vector_path = db_dir.path().join("test.usearch");
+            let vector = Arc::new(
+                VectorIndex::rebuild(&conn, vector_path.clone())
+                    .await
+                    .expect("build vector index"),
+            );
+            let store = OpenStore {
+                notes_dir: notes_dir.to_path_buf(),
+                conn,
+                fts,
+                vector_path,
+                vector,
+            };
+            (vec![db_dir, fts_dir], store)
         }
 
         #[test]
@@ -349,16 +543,94 @@ mod socket {
         #[tokio::test]
         async fn a_socket_server_returns_status_counts() {
             let tempdir = tempfile::tempdir().expect("create temp directory");
+            let notes_dir = tempdir.path().join("notes");
+            std::fs::create_dir(&notes_dir).expect("create notes directory");
+            let embedder = Embedder::create_null(4);
+            let preparer = DefaultPreparer::default();
+            let profile = crate::index_profile(&embedder, &preparer);
+            let (_temps, store) = open_store(&notes_dir, &profile).await;
+            let mut stores = vec![store];
             let path = tempdir.path().join("watch.sock");
             let socket = ControlSocket::bind_at(&path).expect("bind socket");
-            let expected = vec![root()];
-            let server = async {
-                let (stream, _) = socket.listener.accept().await?;
-                serve_connection(stream, expected.clone()).await
-            };
+            let server =
+                socket.serve_next(&mut stores, Instant::now(), &embedder, &preparer, &profile);
             let (server, client) = tokio::join!(server, request_status_at(&path));
             server.expect("serve status");
-            assert_eq!(client.expect("request status"), Some(expected));
+            let status = client.expect("request status").expect("status response");
+            assert_eq!(status.len(), 1);
+            assert_eq!(status[0].directory, notes_dir.to_string_lossy());
+            assert!(status[0].watcher_live);
+            assert_eq!(status[0].documents, 0);
+            assert_eq!(status[0].chunks, 0);
+            assert_eq!(status[0].preparation_failures, 0);
+        }
+
+        #[tokio::test]
+        async fn delegated_reindex_returns_statistics_for_each_root() {
+            let tempdir = tempfile::tempdir().expect("create temp directory");
+            let notes_dir = tempdir.path().join("notes");
+            std::fs::create_dir(&notes_dir).expect("create notes directory");
+            create_file(&notes_dir, "note.md", "indexed content");
+            let embedder = Embedder::create_null(4);
+            let preparer = DefaultPreparer::default();
+            let profile = crate::index_profile(&embedder, &preparer);
+            let (_temps, store) = open_store(&notes_dir, &profile).await;
+            let mut stores = vec![store];
+            let path = tempdir.path().join("watch.sock");
+            let socket = ControlSocket::bind_at(&path).expect("bind socket");
+            let server =
+                socket.serve_next(&mut stores, Instant::now(), &embedder, &preparer, &profile);
+            let (server, client) =
+                tokio::join!(server, request_reindex_at(&path, false, profile.clone()));
+            server.expect("serve reindex");
+            let roots = client.expect("request reindex").expect("reindex response");
+
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].directory, notes_dir.to_string_lossy());
+            assert_eq!(roots[0].added, 1);
+            assert_eq!(roots[0].updated, 0);
+            assert_eq!(roots[0].deleted, 0);
+            assert_eq!(roots[0].failed, 0);
+        }
+
+        #[tokio::test]
+        async fn a_mismatched_profile_refuses_delegated_reindexing() {
+            let tempdir = tempfile::tempdir().expect("create temp directory");
+            let notes_dir = tempdir.path().join("notes");
+            std::fs::create_dir(&notes_dir).expect("create notes directory");
+            create_file(&notes_dir, "note.md", "not indexed");
+            let embedder = Embedder::create_null(4);
+            let preparer = DefaultPreparer::default();
+            let profile = crate::index_profile(&embedder, &preparer);
+            let mismatched_profile = types::IndexProfile {
+                embedder: profile.embedder.clone(),
+                preparer: "different-preparer".to_owned(),
+            };
+            let (_temps, store) = open_store(&notes_dir, &profile).await;
+            let mut stores = vec![store];
+            let path = tempdir.path().join("watch.sock");
+            let socket = ControlSocket::bind_at(&path).expect("bind socket");
+            let server =
+                socket.serve_next(&mut stores, Instant::now(), &embedder, &preparer, &profile);
+            let (server, client) =
+                tokio::join!(server, request_reindex_at(&path, false, mismatched_profile));
+            server.expect("serve refusal");
+            let error = client
+                .expect_err("mismatched profile must fail")
+                .to_string();
+
+            assert!(error.contains("watcher:"), "error: {error}");
+            assert!(error.contains("client:"), "error: {error}");
+            assert!(
+                error.contains("restart the watcher service and rerun"),
+                "error: {error}"
+            );
+            assert!(
+                db::all_note_hashes(&stores[0].conn)
+                    .await
+                    .expect("note hashes")
+                    .is_empty()
+            );
         }
 
         #[tokio::test]
@@ -412,7 +684,7 @@ mod socket {
 }
 
 #[cfg(unix)]
-pub use socket::{ControlSocket, request_status};
+pub use socket::{ControlSocket, request_reindex, request_status};
 
 #[cfg(not(unix))]
 pub struct ControlSocket;
@@ -425,8 +697,11 @@ impl ControlSocket {
 
     pub async fn serve_next(
         &self,
-        _stores: &[crate::watch::OpenStore],
+        _stores: &mut [crate::watch::OpenStore],
         _started_at: std::time::Instant,
+        _embedder: &crate::embed::Embedder,
+        _preparer: &dyn crate::document::DocumentPreparer,
+        _profile: &crate::types::IndexProfile,
     ) -> anyhow::Result<()> {
         std::future::pending().await
     }

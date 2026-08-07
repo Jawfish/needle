@@ -28,6 +28,7 @@ pub struct OpenStore {
     pub notes_dir: PathBuf,
     pub conn: libsql::Connection,
     pub fts: FtsIndex,
+    pub vector_path: PathBuf,
     pub vector: Arc<VectorIndex>,
 }
 
@@ -78,9 +79,10 @@ pub fn arm(
 /// initial indexing pass, lock acquisition) before calling this function.
 pub async fn run_watcher(
     watched_roots: WatchedRoots,
-    stores: Vec<OpenStore>,
+    mut stores: Vec<OpenStore>,
     embedder: &Embedder,
     preparer: Arc<dyn DocumentPreparer>,
+    profile: crate::types::IndexProfile,
 ) -> anyhow::Result<()> {
     let started_at = Instant::now();
 
@@ -113,7 +115,13 @@ pub async fn run_watcher(
                 tracing::info!("shutting down");
                 break;
             },
-            result = control.serve_next(&stores, started_at) => {
+            result = control.serve_next(
+                &mut stores,
+                started_at,
+                embedder,
+                preparer.as_ref(),
+                &profile,
+            ) => {
                 if let Err(error) = result {
                     tracing::warn!(error = %error, "failed to serve control request");
                 }
@@ -150,6 +158,47 @@ async fn index_pending(
         dispatch_changes_with_preparer(stores, notes_dirs, embedder, &changed, preparer.as_ref())
             .await;
     }
+}
+
+pub async fn reindex_in_place(
+    stores: &mut [OpenStore],
+    embedder: &Embedder,
+    preparer: &dyn DocumentPreparer,
+    retry_failed: bool,
+) -> anyhow::Result<Vec<(String, index::IndexStats)>> {
+    let mut results = Vec::with_capacity(stores.len());
+    for store in stores {
+        if retry_failed {
+            db::clear_failed_files(&store.conn).await?;
+        }
+        let indexed = index::index_directory_with_preparer(
+            &store.conn,
+            &store.fts,
+            embedder,
+            &store.notes_dir,
+            preparer,
+        )
+        .await;
+        let refreshed = VectorIndex::open_or_rebuild(&store.conn, store.vector_path.clone()).await;
+        match (indexed, refreshed) {
+            (Ok(stats), Ok(vector)) => {
+                store.vector = Arc::new(vector);
+                tracing::info!(%stats, dir = %store.notes_dir.display(), "reindex complete");
+                results.push((store.notes_dir.to_string_lossy().into_owned(), stats));
+            }
+            (Err(index_error), Ok(vector)) => {
+                store.vector = Arc::new(vector);
+                return Err(index_error);
+            }
+            (Ok(_), Err(vector_error)) => return Err(vector_error),
+            (Err(index_error), Err(vector_error)) => {
+                return Err(anyhow::anyhow!(
+                    "reindex failed: {index_error:#}; vector refresh failed: {vector_error:#}"
+                ));
+            }
+        }
+    }
+    Ok(results)
 }
 
 /// Route each changed path to its owning store and process it.
@@ -474,8 +523,9 @@ mod tests {
             .await
             .expect("connect");
         let fts = FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        let vector_path = db_dir.path().join("test.usearch");
         let vector = Arc::new(
-            VectorIndex::rebuild(&conn, db_dir.path().join("test.usearch"))
+            VectorIndex::rebuild(&conn, vector_path.clone())
                 .await
                 .expect("vector"),
         );
@@ -483,6 +533,7 @@ mod tests {
             notes_dir: notes_dir.to_path_buf(),
             conn,
             fts,
+            vector_path,
             vector,
         };
         (vec![db_dir, fts_dir], store)
@@ -1047,6 +1098,71 @@ mod tests {
                 .expect("note hash")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn retrying_failed_reindex_indexes_the_fixed_file() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        create_file(notes_dir.path(), "fixed.md", "fixed");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        db::record_failed_file(
+            &store.conn,
+            "fixed.md",
+            &crate::hash::content_hash("fixed"),
+            "embedder outage",
+        )
+        .await
+        .expect("record failure");
+        let mut stores = vec![store];
+
+        let stats = reindex_in_place(
+            &mut stores,
+            &embed::Embedder::create_null(1024),
+            &DefaultPreparer::default(),
+            true,
+        )
+        .await
+        .expect("retry reindex");
+
+        assert_eq!(stats[0].1.added, 1);
+        assert!(
+            db::failed_files(&stores[0].conn)
+                .await
+                .expect("failures")
+                .is_empty()
+        );
+        assert!(
+            db::note_hash(&stores[0].conn, "fixed.md")
+                .await
+                .expect("note hash")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn reindexing_in_place_refreshes_the_vector_for_new_files() {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let (_temps, store) = open_store(notes_dir.path()).await;
+        let mut stores = vec![store];
+        create_file(notes_dir.path(), "new.md", "new content");
+
+        let stats = reindex_in_place(
+            &mut stores,
+            &embed::Embedder::create_null(1024),
+            &DefaultPreparer::default(),
+            false,
+        )
+        .await
+        .expect("reindex");
+
+        assert_eq!(stats[0].1.added, 1);
+        assert!(
+            db::note_hash(&stores[0].conn, "new.md")
+                .await
+                .expect("note hash")
+                .is_some()
+        );
+        assert_vector_matches_chunks(&stores[0]).await;
     }
 
     async fn assert_vector_matches_chunks(store: &OpenStore) {

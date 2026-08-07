@@ -269,6 +269,64 @@ paths = ["{notes_path}"]
     }
 
     #[test]
+    fn reindex_delegates_to_the_running_watcher_and_works_after_it_stops() {
+        let environment = ServiceEnvironment::new();
+        let mut process = ServiceProcess::spawn(&environment, &["watch"]);
+        process
+            .wait_for_marker("watching for changes")
+            .expect("observe watch readiness");
+
+        let delegated = environment
+            .command(&["reindex"])
+            .output()
+            .expect("run delegated reindex");
+        assert!(
+            delegated.status.success(),
+            "delegated reindex failed: {}",
+            String::from_utf8_lossy(&delegated.stderr)
+        );
+        let delegated_logs = String::from_utf8_lossy(&delegated.stderr);
+        assert!(
+            delegated_logs.contains("delegating reindex to the running watcher"),
+            "delegated reindex did not log delegation: {delegated_logs}"
+        );
+        assert!(
+            delegated_logs.contains("reindex complete"),
+            "delegated reindex did not log completion: {delegated_logs}"
+        );
+
+        let live = environment
+            .command(&["status", "--json"])
+            .output()
+            .expect("read live status");
+        assert!(
+            live.status.success(),
+            "status failed while watcher ran: {}",
+            String::from_utf8_lossy(&live.stderr)
+        );
+        let live_status: serde_json::Value =
+            serde_json::from_slice(&live.stdout).expect("parse live status JSON");
+        assert_eq!(live_status[0]["watcher_live"], true);
+
+        stop_and_assert_successfully(&mut process, "-TERM");
+
+        let local = environment
+            .command(&["reindex"])
+            .output()
+            .expect("run local reindex");
+        assert!(
+            local.status.success(),
+            "local reindex failed: {}",
+            String::from_utf8_lossy(&local.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&local.stderr).contains("reindex complete"),
+            "local reindex did not log completion: {}",
+            String::from_utf8_lossy(&local.stderr)
+        );
+    }
+
+    #[test]
     fn watch_exits_successfully_on_sigint() {
         let environment = ServiceEnvironment::new();
         let mut process = ServiceProcess::spawn(&environment, &["watch"]);
