@@ -446,6 +446,7 @@ async fn run_watch(config: &config::Config, embedder: Option<Embedder>) -> anyho
             notes_dir: store.notes_dir.clone(),
             conn,
             fts,
+            #[cfg(unix)]
             vector_path,
             vector,
         });

@@ -28,6 +28,7 @@ pub struct OpenStore {
     pub notes_dir: PathBuf,
     pub conn: libsql::Connection,
     pub fts: FtsIndex,
+    #[cfg(unix)]
     pub vector_path: PathBuf,
     pub vector: Arc<VectorIndex>,
 }
@@ -160,6 +161,7 @@ async fn index_pending(
     }
 }
 
+#[cfg(unix)]
 pub async fn reindex_in_place(
     stores: &mut [OpenStore],
     embedder: &Embedder,
@@ -533,6 +535,7 @@ mod tests {
             notes_dir: notes_dir.to_path_buf(),
             conn,
             fts,
+            #[cfg(unix)]
             vector_path,
             vector,
         };
@@ -1100,6 +1103,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn retrying_failed_reindex_indexes_the_fixed_file() {
         let notes_dir = tempfile::tempdir().expect("tempdir");
@@ -1139,6 +1143,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn reindexing_in_place_refreshes_the_vector_for_new_files() {
         let notes_dir = tempfile::tempdir().expect("tempdir");

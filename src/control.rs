@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{config::DirectoryStore, db, index};
+#[cfg(unix)]
+use crate::index;
+use crate::{config::DirectoryStore, db};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct StatusRoot {
@@ -12,6 +14,7 @@ pub struct StatusRoot {
     pub preparation_failures: usize,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ReindexRoot {
     pub directory: String,
@@ -22,6 +25,7 @@ pub struct ReindexRoot {
     pub failed: usize,
 }
 
+#[cfg(unix)]
 impl From<(String, index::IndexStats)> for ReindexRoot {
     fn from((directory, stats): (String, index::IndexStats)) -> Self {
         Self {
@@ -35,6 +39,7 @@ impl From<(String, index::IndexStats)> for ReindexRoot {
     }
 }
 
+#[cfg(unix)]
 impl std::fmt::Display for ReindexRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
