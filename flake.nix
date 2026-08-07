@@ -127,7 +127,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "xberg-1.0.14" = "sha256-9WINAtQs74zRpCWGjB6lLDZDXIsXlIBLyqQJ+C0wKLU=";
+              "xberg-1.0.14" = "sha256-dsGUboWzcU8F+06tVVi760607bx9YWwZRevu1Ik2/A8=";
             };
           };
           nativeBuildInputs = [ pkgs.pkg-config ];
