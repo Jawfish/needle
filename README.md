@@ -101,6 +101,16 @@ For periodic reindexing, change the mode and optionally set the interval:
 }
 ```
 
+### Status and reindex
+
+`needle status` reports each configured directory, whether a watcher is live, and what is indexed. Pass `--json` for scripting. Without a running watcher it reads the index directly and reports the watcher as stopped.
+
+```bash
+needle status
+```
+
+A running watcher holds the index lock, so `needle reindex` hands the work to it and prints the same statistics as a local run. Changing the embedding provider, model, or dimensions requires a restart instead: stop the service, run `needle reindex`, and start it again.
+
 ## Usage
 
 Index your documents, then search:
