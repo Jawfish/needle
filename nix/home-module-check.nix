@@ -10,39 +10,34 @@ let
   command = "${self.packages.${system}.needle}/bin/needle";
   toJson = value: builtins.unsafeDiscardStringContext (builtins.toJSON value);
 
-  platformOptions =
-    if isLinux then
-      {
-        options.systemd.user = {
-          services = lib.mkOption {
-            type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
-            default = { };
-          };
-          timers = lib.mkOption {
-            type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
-            default = { };
-          };
-        };
-      }
-    else
-      {
-        options.home.homeDirectory = lib.mkOption {
-          type = lib.types.str;
-          default = "/Users/test";
-        };
-        options.launchd.agents = lib.mkOption {
-          type = lib.types.attrsOf lib.types.anything;
-          default = { };
-        };
+  platformOptions = {
+    options.systemd.user = {
+      services = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
+        default = { };
       };
+      timers = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
+        default = { };
+      };
+    };
+    options.home.homeDirectory = lib.mkOption {
+      type = lib.types.str;
+      default = "/Users/test";
+    };
+    options.launchd.agents = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+  };
 
   evaluate =
     mode: enable: serve:
     (lib.evalModules {
-      specialArgs = { inherit pkgs; };
       modules = [
         self.homeModules.needle
         platformOptions
+        { _module.args.pkgs = pkgs; }
         {
           services.needle = {
             inherit enable mode;

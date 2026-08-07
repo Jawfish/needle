@@ -15,6 +15,7 @@ let
     ;
 
   cfg = config.services.needle;
+  isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   command = "${cfg.package}/bin/needle";
   intervalParts = builtins.match "([1-9][0-9]*)([smh])" cfg.interval;
   intervalSeconds =
@@ -142,38 +143,33 @@ in
     };
   };
 
-  config =
-    if pkgs.stdenv.hostPlatform.isDarwin then
-      mkMerge [
-        (mkIf (cfg.enable && cfg.mode == "watch") {
-          launchd.agents.needle-watch = launchdAgent "dev.needle.watch" [ "watch" ] launchdKeepAlive { };
-        })
-        (mkIf (cfg.enable && cfg.mode == "timer") {
-          launchd.agents.needle-reindex = launchdAgent "dev.needle.timer" [ "reindex" ] { } {
-            StartInterval = intervalSeconds;
-          };
-        })
-        (mkIf cfg.serve.enable {
-          launchd.agents.needle-serve = launchdAgent "dev.needle.serve" [
-            "serve"
-            "--host"
-            cfg.serve.host
-            "--port"
-            (toString cfg.serve.port)
-          ] launchdKeepAlive { };
-        })
-      ]
-    else
-      mkMerge [
-        (mkIf (cfg.enable && cfg.mode == "watch") {
-          systemd.user.services.needle-watch = watchService;
-        })
-        (mkIf (cfg.enable && cfg.mode == "timer") {
-          systemd.user.services.needle-reindex = reindexService;
-          systemd.user.timers.needle-reindex = reindexTimer;
-        })
-        (mkIf cfg.serve.enable {
-          systemd.user.services.needle-serve = serveService;
-        })
-      ];
+  config = mkMerge [
+    (mkIf (cfg.enable && cfg.mode == "watch" && isDarwin) {
+      launchd.agents.needle-watch = launchdAgent "dev.needle.watch" [ "watch" ] launchdKeepAlive { };
+    })
+    (mkIf (cfg.enable && cfg.mode == "watch" && !isDarwin) {
+      systemd.user.services.needle-watch = watchService;
+    })
+    (mkIf (cfg.enable && cfg.mode == "timer" && isDarwin) {
+      launchd.agents.needle-reindex = launchdAgent "dev.needle.timer" [ "reindex" ] { } {
+        StartInterval = intervalSeconds;
+      };
+    })
+    (mkIf (cfg.enable && cfg.mode == "timer" && !isDarwin) {
+      systemd.user.services.needle-reindex = reindexService;
+      systemd.user.timers.needle-reindex = reindexTimer;
+    })
+    (mkIf (cfg.serve.enable && isDarwin) {
+      launchd.agents.needle-serve = launchdAgent "dev.needle.serve" [
+        "serve"
+        "--host"
+        cfg.serve.host
+        "--port"
+        (toString cfg.serve.port)
+      ] launchdKeepAlive { };
+    })
+    (mkIf (cfg.serve.enable && !isDarwin) {
+      systemd.user.services.needle-serve = serveService;
+    })
+  ];
 }
