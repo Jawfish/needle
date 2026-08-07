@@ -7,7 +7,7 @@ use anyhow::Context;
 use libsql::Connection;
 
 use crate::{
-    db,
+    archive, db,
     document::{DocumentPreparer, PreparedChunk},
     embed::Embedder,
     fts::FtsIndex,
@@ -63,10 +63,53 @@ pub struct DirectoryIndexPlan {
     pub failed_count: usize,
 }
 
-struct SourceFile {
-    abs_path: std::path::PathBuf,
+enum SourceOrigin {
+    File(std::path::PathBuf),
+    ArchiveMember {
+        archive: std::path::PathBuf,
+        index: usize,
+        name: String,
+    },
+}
+
+struct SourceRef {
+    origin: SourceOrigin,
+    prepare_path: std::path::PathBuf,
     content_hash: String,
-    source: Vec<u8>,
+}
+
+impl SourceRef {
+    fn load(&self) -> anyhow::Result<Vec<u8>> {
+        match &self.origin {
+            SourceOrigin::File(abs_path) => std::fs::read(abs_path)
+                .with_context(|| format!("failed to read {}", abs_path.display())),
+            SourceOrigin::ArchiveMember {
+                archive,
+                index,
+                name,
+            } => archive::read_member(archive, *index, name),
+        }
+    }
+}
+
+struct RejectedSource {
+    rel_path: String,
+    content_hash: String,
+    reason: String,
+}
+
+#[derive(Default)]
+struct DiskScan {
+    sources: HashMap<String, SourceRef>,
+    unreadable: HashSet<String>,
+    unreadable_archives: Vec<String>,
+    rejected: Vec<RejectedSource>,
+}
+
+#[derive(Default)]
+struct DiscoveredPaths {
+    files: HashMap<String, std::path::PathBuf>,
+    archives: Vec<(String, std::path::PathBuf)>,
 }
 
 pub enum SingleFilePlan {
@@ -338,21 +381,130 @@ pub async fn index_directory_with_preparer(
 ) -> anyhow::Result<IndexStats> {
     let existing_hashes = db::all_note_hashes(conn).await?;
     let failed_hashes = db::all_failed_file_hashes(conn).await?;
-    let (source_files, mut failed_paths) = read_disk_sources(notes_dir, preparer).await?;
-    let mut disk_files = HashMap::with_capacity(source_files.len());
-    for (rel_path, source_file) in source_files {
-        if existing_hashes.get(&rel_path) == Some(&source_file.content_hash) {
+    let scan = scan_sources(notes_dir, preparer)?;
+    let plan = plan_from_scan(conn, preparer, &existing_hashes, &failed_hashes, scan).await?;
+    execute_directory_plan(conn, fts, embedder, plan).await
+}
+
+pub async fn index_archive_with_preparer(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    notes_dir: &Path,
+    archive_path: &Path,
+    preparer: &dyn DocumentPreparer,
+    vector: Option<&VectorIndex>,
+) -> anyhow::Result<IndexStatus> {
+    let archive_rel = relative_path(notes_dir, archive_path);
+    let prefix = archive::archive_prefix(&archive_rel);
+    let existing_hashes = hashes_under_prefix(db::all_note_hashes(conn).await?, &prefix);
+    let failed_hashes = hashes_under_prefix(db::all_failed_file_hashes(conn).await?, &prefix);
+
+    let mut scan = DiskScan::default();
+    match archive::scan(archive_path, &|path| preparer.supports_path(path)) {
+        Ok(members) => merge_archive_scan(&mut scan, &archive_rel, archive_path, members),
+        Err(error) => {
+            tracing::warn!(path = archive_rel, error = %error, "failed to read archive");
+            return Ok(IndexStatus::Current {
+                vector_mutated: false,
+            });
+        }
+    }
+
+    let plan = plan_from_scan(conn, preparer, &existing_hashes, &failed_hashes, scan).await?;
+    if plan.to_add.is_empty() && plan.to_update.is_empty() && plan.to_delete.is_empty() {
+        return Ok(IndexStatus::Current {
+            vector_mutated: false,
+        });
+    }
+    execute_directory_plan_with_vector(conn, fts, embedder, plan, vector).await?;
+    Ok(IndexStatus::Current {
+        vector_mutated: false,
+    })
+}
+
+pub async fn delete_archive_members(
+    conn: &Connection,
+    fts: &FtsIndex,
+    embedder: &Embedder,
+    notes_dir: &Path,
+    archive_path: &Path,
+    vector: Option<&VectorIndex>,
+) -> anyhow::Result<()> {
+    let prefix = archive::archive_prefix(&relative_path(notes_dir, archive_path));
+    let to_delete: Vec<String> = hashes_under_prefix(db::all_note_hashes(conn).await?, &prefix)
+        .into_keys()
+        .collect();
+    if to_delete.is_empty() {
+        return Ok(());
+    }
+    let plan = DirectoryIndexPlan {
+        to_add: Vec::new(),
+        to_update: Vec::new(),
+        to_delete,
+        unchanged_count: 0,
+        failed_count: 0,
+    };
+    execute_directory_plan_with_vector(conn, fts, embedder, plan, vector).await?;
+    Ok(())
+}
+
+fn hashes_under_prefix(hashes: HashMap<String, String>, prefix: &str) -> HashMap<String, String> {
+    hashes
+        .into_iter()
+        .filter(|(path, _)| path.starts_with(prefix))
+        .collect()
+}
+
+async fn plan_from_scan(
+    conn: &Connection,
+    preparer: &dyn DocumentPreparer,
+    existing_hashes: &HashMap<String, String>,
+    failed_hashes: &HashMap<String, String>,
+    scan: DiskScan,
+) -> anyhow::Result<DirectoryIndexPlan> {
+    let mut failed_paths = scan.unreadable;
+    for archive_rel in &scan.unreadable_archives {
+        let prefix = archive::archive_prefix(archive_rel);
+        failed_paths.extend(
+            existing_hashes
+                .keys()
+                .filter(|path| path.starts_with(&prefix))
+                .cloned(),
+        );
+    }
+    for rejected in scan.rejected {
+        if failed_hashes.get(&rejected.rel_path) != Some(&rejected.content_hash) {
+            db::record_failed_file(
+                conn,
+                &rejected.rel_path,
+                &rejected.content_hash,
+                &rejected.reason,
+            )
+            .await?;
+            tracing::warn!(
+                path = rejected.rel_path,
+                reason = rejected.reason,
+                "skipping archive member"
+            );
+        }
+        failed_paths.insert(rejected.rel_path);
+    }
+
+    let mut disk_files = HashMap::with_capacity(scan.sources.len());
+    for (rel_path, source) in scan.sources {
+        if existing_hashes.get(&rel_path) == Some(&source.content_hash) {
             db::clear_failed_file(conn, &rel_path).await?;
             disk_files.insert(
                 rel_path,
                 DiskFile {
-                    content_hash: source_file.content_hash,
+                    content_hash: source.content_hash,
                     chunks: Vec::new(),
                 },
             );
             continue;
         }
-        if failed_hashes.get(&rel_path) == Some(&source_file.content_hash) {
+        if failed_hashes.get(&rel_path) == Some(&source.content_hash) {
             tracing::warn!(
                 path = rel_path,
                 "skipping file with unchanged preparation failure"
@@ -360,12 +512,20 @@ pub async fn index_directory_with_preparer(
             failed_paths.insert(rel_path);
             continue;
         }
-        match preparer.prepare(&source_file.abs_path, &source_file.source) {
+        let source_bytes = match source.load() {
+            Ok(source_bytes) => source_bytes,
+            Err(error) => {
+                tracing::warn!(path = rel_path, error = %error, "failed to read file");
+                failed_paths.insert(rel_path);
+                continue;
+            }
+        };
+        match preparer.prepare(&source.prepare_path, &source_bytes) {
             Ok(chunks) => {
                 disk_files.insert(
                     rel_path,
                     DiskFile {
-                        content_hash: source_file.content_hash,
+                        content_hash: source.content_hash,
                         chunks,
                     },
                 );
@@ -374,7 +534,7 @@ pub async fn index_directory_with_preparer(
                 db::record_failed_file(
                     conn,
                     &rel_path,
-                    &source_file.content_hash,
+                    &source.content_hash,
                     &format!("{error:#}"),
                 )
                 .await?;
@@ -383,8 +543,12 @@ pub async fn index_directory_with_preparer(
             }
         }
     }
-    let plan = plan_directory_index(&existing_hashes, &failed_hashes, &disk_files, &failed_paths);
-    execute_directory_plan(conn, fts, embedder, plan).await
+    Ok(plan_directory_index(
+        existing_hashes,
+        failed_hashes,
+        &disk_files,
+        &failed_paths,
+    ))
 }
 
 pub async fn index_single_file_with_preparer(
@@ -402,10 +566,7 @@ pub async fn index_single_file_with_preparer(
         });
     }
 
-    let rel_path = abs_path.strip_prefix(notes_dir).map_or_else(
-        |_| abs_path.to_string_lossy().to_string(),
-        |p| p.to_string_lossy().to_string(),
-    );
+    let rel_path = relative_path(notes_dir, abs_path);
     let source = match tokio::fs::read(abs_path).await {
         Ok(source) => source,
         Err(error) => {
@@ -444,32 +605,67 @@ pub async fn index_single_file_with_preparer(
     execute_single_file_plan_with_vector(conn, fts, embedder, plan, vector).await
 }
 
-async fn read_disk_sources(
-    dir: &Path,
-    preparer: &dyn DocumentPreparer,
-) -> anyhow::Result<(HashMap<String, SourceFile>, HashSet<String>)> {
-    let files = collect_supported_files(dir, preparer)?;
-    let mut sources = HashMap::with_capacity(files.len());
-    let mut failed_paths = HashSet::new();
-    for (rel_path, abs_path) in files {
-        match tokio::fs::read(&abs_path).await {
+fn scan_sources(dir: &Path, preparer: &dyn DocumentPreparer) -> anyhow::Result<DiskScan> {
+    let discovered = collect_paths(dir, preparer)?;
+    let mut scan = DiskScan::default();
+    for (rel_path, abs_path) in discovered.files {
+        match std::fs::read(&abs_path) {
             Ok(source) => {
-                sources.insert(
+                scan.sources.insert(
                     rel_path,
-                    SourceFile {
-                        abs_path,
+                    SourceRef {
                         content_hash: hash::content_hash_bytes(&source),
-                        source,
+                        prepare_path: abs_path.clone(),
+                        origin: SourceOrigin::File(abs_path),
                     },
                 );
             }
             Err(error) => {
                 tracing::warn!(path = rel_path, error = %error, "failed to read file");
-                failed_paths.insert(rel_path);
+                scan.unreadable.insert(rel_path);
             }
         }
     }
-    Ok((sources, failed_paths))
+    for (rel_path, abs_path) in discovered.archives {
+        match archive::scan(&abs_path, &|path| preparer.supports_path(path)) {
+            Ok(members) => merge_archive_scan(&mut scan, &rel_path, &abs_path, members),
+            Err(error) => {
+                tracing::warn!(path = rel_path, error = %error, "failed to read archive");
+                scan.unreadable_archives.push(rel_path);
+            }
+        }
+    }
+    Ok(scan)
+}
+
+fn merge_archive_scan(
+    scan: &mut DiskScan,
+    archive_rel: &str,
+    archive_abs: &Path,
+    members: archive::Scan,
+) {
+    for member in members.members {
+        let name = member.name;
+        scan.sources.insert(
+            archive::member_path(archive_rel, &name),
+            SourceRef {
+                prepare_path: std::path::PathBuf::from(&name),
+                origin: SourceOrigin::ArchiveMember {
+                    archive: archive_abs.to_path_buf(),
+                    index: member.index,
+                    name,
+                },
+                content_hash: member.content_hash,
+            },
+        );
+    }
+    for rejected in members.rejected {
+        scan.rejected.push(RejectedSource {
+            rel_path: archive::member_path(archive_rel, &rejected.name),
+            content_hash: rejected.content_hash,
+            reason: rejected.reason,
+        });
+    }
 }
 
 async fn update_vector(
@@ -546,25 +742,29 @@ pub fn is_in_hidden_dir(path: &Path, root: &Path) -> bool {
         .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
 }
 
-fn collect_supported_files(
-    dir: &Path,
-    preparer: &dyn DocumentPreparer,
-) -> anyhow::Result<HashMap<String, std::path::PathBuf>> {
-    let mut files = HashMap::new();
-    collect_recursive(dir, dir, preparer, &mut files)?;
-    Ok(files)
+fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).map_or_else(
+        |_| path.to_string_lossy().to_string(),
+        |rel| rel.to_string_lossy().to_string(),
+    )
+}
+
+fn collect_paths(dir: &Path, preparer: &dyn DocumentPreparer) -> anyhow::Result<DiscoveredPaths> {
+    let mut discovered = DiscoveredPaths::default();
+    collect_recursive(dir, dir, preparer, &mut discovered)?;
+    Ok(discovered)
 }
 
 #[cfg(test)]
 fn collect_markdown_files(dir: &Path) -> anyhow::Result<HashMap<String, std::path::PathBuf>> {
-    collect_supported_files(dir, &crate::document::DefaultPreparer::default())
+    Ok(collect_paths(dir, &crate::document::DefaultPreparer::default())?.files)
 }
 
 fn collect_recursive(
     root: &Path,
     dir: &Path,
     preparer: &dyn DocumentPreparer,
-    files: &mut HashMap<String, std::path::PathBuf>,
+    discovered: &mut DiscoveredPaths,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -577,13 +777,11 @@ fn collect_recursive(
             {
                 continue;
             }
-            collect_recursive(root, &path, preparer, files)?;
+            collect_recursive(root, &path, preparer, discovered)?;
         } else if preparer.supports_path(&path) {
-            let rel = path.strip_prefix(root).map_or_else(
-                |_| path.to_string_lossy().to_string(),
-                |p| p.to_string_lossy().to_string(),
-            );
-            files.insert(rel, path);
+            discovered.files.insert(relative_path(root, &path), path);
+        } else if archive::is_archive(&path) {
+            discovered.archives.push((relative_path(root, &path), path));
         }
     }
     Ok(())
@@ -1662,6 +1860,221 @@ mod tests {
         assert_eq!(
             db::all_chunks(&conn).await.expect("chunks")[0].1,
             PreparedChunk::from("after token".to_string())
+        );
+    }
+
+    fn write_archive(path: &Path, entries: &[(&str, &str)]) {
+        use std::io::Write as _;
+
+        let file = std::fs::File::create(path).expect("create archive");
+        let mut writer = zip::write::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(*name, options).expect("start entry");
+            writer.write_all(content.as_bytes()).expect("write entry");
+        }
+        writer.finish().expect("finish archive");
+    }
+
+    struct TestStore {
+        notes_dir: tempfile::TempDir,
+        conn: Connection,
+        fts: crate::fts::FtsIndex,
+        _db: libsql::Database,
+        _db_dir: tempfile::TempDir,
+        _fts_dir: tempfile::TempDir,
+    }
+
+    async fn archive_test_store() -> TestStore {
+        let notes_dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let (db, conn) = db::connect(&db_dir.path().join("test.db"), Some(1024))
+            .await
+            .expect("connect");
+        let fts_dir = tempfile::tempdir().expect("tempdir");
+        let fts = crate::fts::FtsIndex::open_or_create(fts_dir.path()).expect("fts");
+        TestStore {
+            notes_dir,
+            conn,
+            fts,
+            _db: db,
+            _db_dir: db_dir,
+            _fts_dir: fts_dir,
+        }
+    }
+
+    async fn index_with_counting(
+        conn: &Connection,
+        fts: &crate::fts::FtsIndex,
+        notes_dir: &Path,
+        calls: &Arc<AtomicUsize>,
+    ) -> IndexStats {
+        let preparer = CountingPreparer {
+            calls: Arc::clone(calls),
+            fails: false,
+        };
+        index_directory_with_preparer(
+            conn,
+            fts,
+            &Embedder::create_null(1024),
+            notes_dir,
+            &preparer,
+        )
+        .await
+        .expect("index")
+    }
+
+    #[tokio::test]
+    async fn each_document_inside_an_archive_becomes_its_own_note() {
+        let store = archive_test_store().await;
+        let (notes_dir, conn, fts) = (&store.notes_dir, &store.conn, &store.fts);
+        write_archive(
+            &notes_dir.path().join("docs.zip"),
+            &[
+                ("guide.md", "archive guide body"),
+                ("nested/reference.md", "archive reference body"),
+                ("picture.png", "not a document"),
+            ],
+        );
+
+        let stats =
+            index_with_counting(conn, fts, notes_dir.path(), &Arc::new(AtomicUsize::new(0))).await;
+
+        assert_eq!(stats.added, 2, "only supported members are indexed");
+        let mut paths: Vec<String> = db::all_note_hashes(conn)
+            .await
+            .expect("hashes")
+            .into_keys()
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["docs.zip!guide.md", "docs.zip!nested/reference.md"]
+        );
+        assert!(
+            db::all_chunks(conn)
+                .await
+                .expect("chunks")
+                .iter()
+                .any(|(path, chunk)| path == "docs.zip!guide.md"
+                    && chunk.content == "archive guide body")
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_archive_members_are_never_extracted_again() {
+        let store = archive_test_store().await;
+        let (notes_dir, conn, fts) = (&store.notes_dir, &store.conn, &store.fts);
+        write_archive(
+            &notes_dir.path().join("docs.zip"),
+            &[("one.md", "one"), ("two.md", "two")],
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+        let after_first = calls.load(Ordering::SeqCst);
+        let stats = index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+
+        assert_eq!(after_first, 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_first,
+            "a second pass must not extract or prepare unchanged members"
+        );
+        assert_eq!(stats.unchanged, 2);
+    }
+
+    #[tokio::test]
+    async fn editing_one_member_reindexes_only_that_member() {
+        let store = archive_test_store().await;
+        let (notes_dir, conn, fts) = (&store.notes_dir, &store.conn, &store.fts);
+        let archive_path = notes_dir.path().join("docs.zip");
+        write_archive(&archive_path, &[("one.md", "one"), ("two.md", "two")]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+
+        write_archive(
+            &archive_path,
+            &[("one.md", "one"), ("two.md", "two edited")],
+        );
+        let stats = index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+
+        assert_eq!(stats.updated, 1);
+        assert_eq!(stats.unchanged, 1);
+        assert!(
+            db::all_chunks(conn)
+                .await
+                .expect("chunks")
+                .iter()
+                .any(|(path, chunk)| path == "docs.zip!two.md" && chunk.content == "two edited")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_removed_from_the_archive_is_removed_from_the_index() {
+        let store = archive_test_store().await;
+        let (notes_dir, conn, fts) = (&store.notes_dir, &store.conn, &store.fts);
+        let archive_path = notes_dir.path().join("docs.zip");
+        write_archive(&archive_path, &[("one.md", "one"), ("two.md", "two")]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+
+        write_archive(&archive_path, &[("one.md", "one")]);
+        let stats = index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(
+            db::all_note_hashes(conn)
+                .await
+                .expect("hashes")
+                .into_keys()
+                .collect::<Vec<String>>(),
+            vec!["docs.zip!one.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_that_cannot_be_read_keeps_its_indexed_members() {
+        let store = archive_test_store().await;
+        let (notes_dir, conn, fts) = (&store.notes_dir, &store.conn, &store.fts);
+        let archive_path = notes_dir.path().join("docs.zip");
+        write_archive(&archive_path, &[("one.md", "one"), ("two.md", "two")]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+
+        std::fs::write(&archive_path, b"truncated garbage").expect("corrupt archive");
+        let stats = index_with_counting(conn, fts, notes_dir.path(), &calls).await;
+
+        assert_eq!(
+            stats.deleted, 0,
+            "a broken archive must not wipe its members"
+        );
+        assert_eq!(db::all_note_hashes(conn).await.expect("hashes").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_member_that_expands_too_far_is_reported_as_a_failure() {
+        let store = archive_test_store().await;
+        let (notes_dir, conn, fts) = (&store.notes_dir, &store.conn, &store.fts);
+        let bomb = "a".repeat(2 * 1024 * 1024);
+        write_archive(
+            &notes_dir.path().join("docs.zip"),
+            &[("one.md", "one"), ("bomb.md", &bomb)],
+        );
+
+        let stats =
+            index_with_counting(conn, fts, notes_dir.path(), &Arc::new(AtomicUsize::new(0))).await;
+
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.failed, 1);
+        let failures = db::failed_files(conn).await.expect("failures");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "docs.zip!bomb.md");
+        assert!(
+            failures[0].1.contains("expands"),
+            "the failure should explain itself: {}",
+            failures[0].1
         );
     }
 
