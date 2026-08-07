@@ -75,11 +75,11 @@
           releases = {
             x86_64-linux = {
               platform = "linux-x86_64";
-              hash = "sha256-a99nYp14m95f/pS85xNYrz0sazU/67lehIXelnt3YYg=";
+              hash = "sha256-zjK1IltD219ney3p0aHf4w9JsEzjtQ1TLXKoqGXGlCA=";
             };
             aarch64-darwin = {
               platform = "macos-aarch64";
-              hash = "sha256-WDCmg604RoyhuED3UmVOMrRZ+MCxHgNFORKXB3Kphqo=";
+              hash = "sha256-CDsC6PdBT9cF8qUwJK9aQ/PXJd/62pJnbkeUg9jnnbk=";
             };
           };
           release = releases.${system} or null;
