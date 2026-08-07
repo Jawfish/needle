@@ -154,6 +154,15 @@
         };
     in
     {
+      homeModules.needle = import ./nix/home-module.nix { inherit self; };
+      homeManagerModules.needle = self.homeModules.needle;
+
+      checks = forAllSystems (system: {
+        home-module = import ./nix/home-module-check.nix {
+          inherit self nixpkgs system;
+        };
+      });
+
       packages = forAllSystems (
         system:
         let

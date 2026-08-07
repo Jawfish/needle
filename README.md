@@ -69,7 +69,37 @@ needle service timer > ~/Library/LaunchAgents/dev.needle.timer.plist
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.needle.timer.plist
 ```
 
-Nix users should not paste a `/nix/store` path into a unit. `current_exe()` resolves profile symlinks to a store path that garbage collection can remove; wait for the Home Manager module.
+### Nix with Home Manager
+
+Nix users should prefer the Home Manager module over `needle service`. It references the package derivation rather than a resolved store path, so garbage collection keeps the executable available.
+
+Import the module and use watch mode:
+
+```nix
+{
+  imports = [ inputs.needle.homeModules.needle ];
+
+  services.needle = {
+    enable = true;
+    mode = "watch";
+    serve.enable = true;
+  };
+}
+```
+
+For periodic reindexing, change the mode and optionally set the interval:
+
+```nix
+{
+  imports = [ inputs.needle.homeModules.needle ];
+
+  services.needle = {
+    enable = true;
+    mode = "timer";
+    interval = "15m";
+  };
+}
+```
 
 ## Usage
 
