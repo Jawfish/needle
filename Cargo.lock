@@ -7375,7 +7375,7 @@ dependencies = [
 [[package]]
 name = "xberg"
 version = "1.0.14"
-source = "git+https://github.com/Jawfish/xberg?rev=2bc38b06a72a61f349639178166fc888677fb67e#2bc38b06a72a61f349639178166fc888677fb67e"
+source = "git+https://github.com/Jawfish/xberg?rev=78c11c98f1606de10d1f40db04aec2e7149bde17#78c11c98f1606de10d1f40db04aec2e7149bde17"
 dependencies = [
  "ahash",
  "async-trait",

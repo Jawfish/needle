@@ -36,7 +36,7 @@ percent-encoding = "2.3"
 usearch = "2"
 
 [patch.crates-io]
-xberg = { git = "https://github.com/Jawfish/xberg", rev = "2bc38b06a72a61f349639178166fc888677fb67e" }
+xberg = { git = "https://github.com/Jawfish/xberg", rev = "78c11c98f1606de10d1f40db04aec2e7149bde17" }
 
 [dev-dependencies]
 tempfile = "3"
